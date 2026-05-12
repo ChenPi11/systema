@@ -176,6 +176,9 @@ pub struct AllocatorState {
     pub jobs: HashMap<u64, Job>,
     /// Registered workers keyed by worker_id.
     pub workers: HashMap<String, WorkerEntry>,
+    /// Maps task_id (IPC level) → JobKind so we can correctly update state
+    /// when a TaskResult arrives.
+    pub task_kinds: HashMap<u64, JobKind>,
 }
 
 impl AllocatorState {
@@ -186,6 +189,7 @@ impl AllocatorState {
             runtime: HashMap::new(),
             jobs: HashMap::new(),
             workers: HashMap::new(),
+            task_kinds: HashMap::new(),
         }
     }
 }

@@ -258,7 +258,7 @@ async fn monitor_service(registry: ServiceRegistry, unit_name: String) {
         }
 
         if let Some(pid) = pid {
-            if !crate::process::check_alive(pid) {
+            if !crate::process::is_alive(pid) {
                 info!("Service {} (PID {}) exited", unit_name, pid);
                 let mut reg = registry.lock();
                 if let Some(inst) = reg.get_mut(&unit_name) {

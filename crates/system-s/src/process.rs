@@ -230,18 +230,7 @@ pub fn is_alive(pid: u32) -> bool {
     signal::kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
-/// Public alias for use from the IPC module.
-#[cfg(unix)]
-pub fn check_alive(pid: u32) -> bool {
-    is_alive(pid)
-}
-
 #[cfg(not(unix))]
 pub fn is_alive(_pid: u32) -> bool {
-    false
-}
-
-#[cfg(not(unix))]
-pub fn check_alive(_pid: u32) -> bool {
     false
 }

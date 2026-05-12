@@ -378,7 +378,9 @@ impl ManagerInterface {
 
     #[zbus(property)]
     fn version(&self) -> &str {
-        "255" // Claim systemd 255 compatibility
+        // Claim compatibility with systemd 255 for tooling that version-checks.
+        // Actual feature support depends on what System Alphabet implements.
+        "255"
     }
 
     #[zbus(property)]

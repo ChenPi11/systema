@@ -220,11 +220,14 @@ async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<
     Ok(())
 }
 
-/// Look up what kind of task a task_id corresponds to (best-effort).
-fn parse_task_kind_from_context(_allocator: &AllocatorHandle, _task_id: u64) -> JobKind {
-    // In Phase 1, we don't cross-index task_id → job_kind in state.
-    // Returning Start covers most cases; extended state tracking in Phase 2.
-    JobKind::Start
+/// Look up what kind of task a task_id corresponds to using the tracked mapping.
+fn parse_task_kind_from_context(allocator: &AllocatorHandle, task_id: u64) -> JobKind {
+    allocator
+        .read()
+        .task_kinds
+        .get(&task_id)
+        .copied()
+        .unwrap_or(JobKind::Start)
 }
 
 /// Handle an event published by a worker.

@@ -101,7 +101,7 @@ pub async fn enqueue_job(
             state.units.get(name.as_str()).cloned()
         };
 
-        // Record the job.
+        // Record the job and the task_id → job_kind mapping.
         {
             let mut state = allocator.write();
             state.runtime.entry(name.clone()).or_default().load_state = "loaded".to_string();
@@ -115,6 +115,7 @@ pub async fn enqueue_job(
                     completion_tx: None, // set by D-Bus layer if waiting
                 },
             );
+            state.task_kinds.insert(task_id, kind);
         }
 
         let task = WorkerTask {
@@ -210,13 +211,16 @@ fn activate_target_internally(allocator: AllocatorHandle, name: &str) {
 /// Update unit runtime state from a task result received from a worker.
 pub fn handle_task_result(
     allocator: AllocatorHandle,
-    _task_id: u64,
+    task_id: u64,
     success: bool,
     message: &str,
     unit_name: &str,
     kind: JobKind,
 ) {
     let mut state = allocator.write();
+
+    // Clean up the task_id → kind mapping.
+    state.task_kinds.remove(&task_id);
 
     // Update active state based on task kind and success.
     let rt = state.runtime.entry(unit_name.to_string()).or_default();
@@ -226,7 +230,11 @@ pub fn handle_task_result(
             JobKind::Stop => ActiveState::Inactive,
             JobKind::Reload => ActiveState::Active,
         };
-        rt.sub_state = "running".to_string();
+        rt.sub_state = if kind == JobKind::Stop {
+            "dead".to_string()
+        } else {
+            "running".to_string()
+        };
     } else {
         rt.active_state = ActiveState::Failed;
         rt.sub_state = "failed".to_string();
@@ -295,6 +303,8 @@ fn task_kind_to_proto(kind: JobKind) -> TaskKind {
 
 fn build_unit_config(uf: &UnitFile) -> UnitConfig {
     let service = uf.service.as_ref().map(|svc| ServiceConfig {
+        // Only the first ExecStart command is sent to the worker.
+        // Multiple ExecStart directives (Type=oneshot) will be supported in Phase 2.
         exec_start: svc.exec_start.first().cloned().unwrap_or_default(),
         exec_stop: svc.exec_stop.first().cloned().unwrap_or_default(),
         exec_reload: svc.exec_reload.first().cloned().unwrap_or_default(),

@@ -203,8 +203,7 @@ fn parse_service_section(config: &Ini, svc: &mut ServiceSection) -> Result<()> {
     let restart = get_str(config, "service", "restart");
     svc.restart = RestartPolicy::from(restart.as_str());
 
-    svc.restart_sec = get_u32(config, "service", "restartsec", 100) / 1000; // ms->s approx
-    // restartsec is in seconds by default
+    // restartsec is in seconds by default; parse_time_secs handles suffixes.
     svc.restart_sec = {
         let raw = get_str(config, "service", "restartsec");
         if raw.is_empty() {
