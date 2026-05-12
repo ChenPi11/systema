@@ -1,0 +1,19 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
