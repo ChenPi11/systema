@@ -64,6 +64,18 @@ pub async fn enqueue_job(
     for (i, name) in units_to_process.iter().enumerate() {
         let job_id = if i == 0 { primary_job_id } else { next_job_id() };
 
+        // Target units are handled internally (no external worker needed).
+        // Check under a short-lived read lock and drop it before calling
+        // activate_target_internally, which needs a write lock on the same handle.
+        let is_target = {
+            let state = allocator.read();
+            state.units.get(name.as_str()).map(|u| &u.kind) == Some(&UnitKind::Target)
+        };
+        if is_target {
+            activate_target_internally(allocator.clone(), name);
+            continue;
+        }
+
         // Find the appropriate worker.
         let (worker_task_tx, task_id, unit_type) = {
             let state = allocator.read();
@@ -71,12 +83,6 @@ pub async fn enqueue_job(
             let unit_type = unit
                 .map(|u| u.kind.worker_type().to_string())
                 .unwrap_or_else(|| "service".to_string());
-
-            // Target units are handled internally (no external worker needed).
-            if unit.map(|u| &u.kind) == Some(&UnitKind::Target) {
-                activate_target_internally(allocator.clone(), name);
-                continue;
-            }
 
             let worker = state
                 .workers
