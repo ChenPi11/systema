@@ -77,6 +77,15 @@ pub struct JobResult {
     pub result: JobResultKind,
 }
 
+/// Notification sent over an internal channel so the D-Bus layer can emit
+/// the `JobRemoved` signal when a job finishes.
+#[derive(Debug)]
+pub struct JobCompletion {
+    pub job_id: u64,
+    pub unit_name: String,
+    pub result: JobResultKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobResultKind {
     Done,
@@ -179,6 +188,9 @@ pub struct AllocatorState {
     /// Maps task_id (IPC level) → JobKind so we can correctly update state
     /// when a TaskResult arrives.
     pub task_kinds: HashMap<u64, JobKind>,
+    /// Channel to notify the D-Bus layer when a job completes so it can emit
+    /// the `JobRemoved` signal.  Set by the D-Bus server at startup.
+    pub job_completion_tx: Option<tokio::sync::mpsc::UnboundedSender<JobCompletion>>,
 }
 
 impl AllocatorState {
@@ -190,6 +202,7 @@ impl AllocatorState {
             jobs: HashMap::new(),
             workers: HashMap::new(),
             task_kinds: HashMap::new(),
+            job_completion_tx: None,
         }
     }
 }

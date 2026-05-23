@@ -85,6 +85,20 @@ type UnitFileInfo = (String, String);
 #[interface(name = "org.freedesktop.systemd1.Manager")]
 impl ManagerInterface {
     // ------------------------------------------------------------------
+    // D-Bus signals
+    // ------------------------------------------------------------------
+
+    /// Emitted when a new job is queued.
+    #[zbus(signal)]
+    pub async fn job_new(ctxt: &zbus::SignalContext<'_>, id: u32, job: OwnedObjectPath, unit: String) -> zbus::Result<()>;
+
+    /// Emitted when a job finishes (done, failed, cancelled, …).
+    /// `result` is one of: "done", "failed", "cancelled", "timeout",
+    /// "dependency", "skipped".
+    #[zbus(signal)]
+    pub async fn job_removed(ctxt: &zbus::SignalContext<'_>, id: u32, job: OwnedObjectPath, unit: String, result: String) -> zbus::Result<()>;
+
+    // ------------------------------------------------------------------
     // Unit lookup methods
     // ------------------------------------------------------------------
 

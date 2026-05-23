@@ -11,7 +11,8 @@ use tracing::{debug, info, warn};
 
 use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 use crate::state::{
-    ActiveState, AllocatorHandle, Job, JobKind, JobResult, JobResultKind, JobStatus, WorkerTask, next_job_id, next_task_id,
+    ActiveState, AllocatorHandle, Job, JobCompletion, JobKind, JobResult, JobResultKind,
+    JobStatus, WorkerTask, next_job_id, next_task_id,
 };
 use crate::unit::types::{UnitFile, UnitKind};
 
@@ -61,8 +62,10 @@ pub async fn enqueue_job(
     let primary_job_id = next_job_id();
 
     // Create job records and dispatch tasks.
-    for (i, name) in units_to_process.iter().enumerate() {
-        let job_id = if i == 0 { primary_job_id } else { next_job_id() };
+    for name in units_to_process.iter() {
+        // The primary job ID belongs to the unit that was directly requested.
+        let is_root = name.as_str() == unit_name;
+        let job_id = if is_root { primary_job_id } else { next_job_id() };
 
         // Target units are handled internally (no external worker needed).
         // Check under a short-lived read lock and drop it before calling
@@ -73,6 +76,17 @@ pub async fn enqueue_job(
         };
         if is_target {
             activate_target_internally(allocator.clone(), name);
+            // If this is the directly-requested unit, immediately notify the D-Bus
+            // layer so callers (e.g. systemctl) receive JobRemoved and don't hang.
+            if is_root {
+                if let Some(ref tx) = allocator.read().job_completion_tx {
+                    let _ = tx.send(JobCompletion {
+                        job_id: primary_job_id,
+                        unit_name: unit_name.to_string(),
+                        result: JobResultKind::Done,
+                    });
+                }
+            }
             continue;
         }
 
@@ -274,6 +288,15 @@ pub fn handle_task_result(
             if let Some(tx) = job.completion_tx.take() {
                 let _ = tx.send(result);
             }
+        }
+        // Notify the D-Bus signal emitter so it can send JobRemoved to subscribers
+        // (e.g. systemctl waits for this signal before returning to the user).
+        if let Some(ref tx) = state.job_completion_tx {
+            let _ = tx.send(JobCompletion {
+                job_id: jid,
+                unit_name: unit_name.to_string(),
+                result: result_kind,
+            });
         }
     }
 }
