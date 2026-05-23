@@ -67,6 +67,44 @@ pub async fn enqueue_job(
         let is_root = name.as_str() == unit_name;
         let job_id = if is_root { primary_job_id } else { next_job_id() };
 
+        // Idempotency: skip if the unit is already in the desired state,
+        // or if there is already an in-flight job of the same kind for it.
+        {
+            let state = allocator.read();
+            let already_in_desired_state = match kind {
+                JobKind::Start | JobKind::Restart => {
+                    state.runtime.get(name.as_str())
+                        .map(|rt| rt.active_state == ActiveState::Active)
+                        .unwrap_or(false)
+                }
+                JobKind::Stop => {
+                    state.runtime.get(name.as_str())
+                        .map(|rt| rt.active_state == ActiveState::Inactive)
+                        .unwrap_or(true) // treat unknown as inactive for stop
+                }
+                JobKind::Reload => false,
+            };
+            let has_running_job = state.jobs.values().any(|j| {
+                j.unit_name == *name
+                    && j.kind == kind
+                    && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+            });
+            if already_in_desired_state || has_running_job {
+                let reason = if already_in_desired_state { "already in desired state" } else { "existing job running" };
+                debug!("Skipping {:?} for {} ({})", kind, name, reason);
+                if is_root {
+                    if let Some(ref tx) = state.job_completion_tx {
+                        let _ = tx.send(JobCompletion {
+                            job_id: primary_job_id,
+                            unit_name: unit_name.to_string(),
+                            result: JobResultKind::Done,
+                        });
+                    }
+                }
+                continue;
+            }
+        }
+
         // Target units are handled internally (no external worker needed).
         // Check under a short-lived read lock and drop it before calling
         // activate_target_internally, which needs a write lock on the same handle.
