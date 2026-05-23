@@ -69,7 +69,7 @@ pub async fn enqueue_job(
         // activate_target_internally, which needs a write lock on the same handle.
         let is_target = {
             let state = allocator.read();
-            state.units.get(name.as_str()).map(|u| &u.kind) == Some(&UnitKind::Target)
+            state.units.get(name.as_str()).map_or(false, |u| matches!(u.kind, UnitKind::Target))
         };
         if is_target {
             activate_target_internally(allocator.clone(), name);
