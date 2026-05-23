@@ -136,17 +136,23 @@ pub async fn stop_service(
             let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
             info!("Sent SIGTERM to PID {} ({})", pid, unit_name);
 
-            // Wait up to timeout_secs for the process to exit.
-            let deadline = tokio::time::Duration::from_secs(timeout_secs.max(1) as u64);
-            tokio::time::sleep(deadline).await;
-
-            // Check if still alive; if so, SIGKILL.
-            if is_alive(pid) {
-                warn!(
-                    "Service {} (PID {}) did not exit; sending SIGKILL",
-                    unit_name, pid
-                );
-                let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            // Poll every 100 ms until the process exits or the timeout elapses.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(timeout_secs.max(1) as u64);
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                if !is_alive(pid) {
+                    info!("Service {} (PID {}) exited after SIGTERM", unit_name, pid);
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    warn!(
+                        "Service {} (PID {}) did not exit in {}s; sending SIGKILL",
+                        unit_name, pid, timeout_secs
+                    );
+                    let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                    break;
+                }
             }
         }
         #[cfg(not(unix))]

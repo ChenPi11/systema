@@ -3,21 +3,43 @@
 //! Implements the `org.freedesktop.systemd1` bus name with:
 //! - `org.freedesktop.systemd1.Manager` on `/org/freedesktop/systemd1`
 //! - `org.freedesktop.systemd1.Unit` on each unit's object path
-//! - `org.freedesktop.systemd1.Service` on service unit object paths
-//! - `org.freedesktop.systemd1.Target` on target unit object paths
-//! - `org.freedesktop.systemd1.Job` on each in-flight job's object path
 
 pub mod manager;
 pub mod unit_obj;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 use zbus::connection::Builder;
 
 use crate::state::AllocatorHandle;
 
 /// The well-known D-Bus bus name we claim.
 pub const BUS_NAME: &str = "org.freedesktop.systemd1";
+
+/// Register a per-unit D-Bus object for `unit_name` on the connection's
+/// object server.  Silently skips if the object is already registered.
+async fn register_unit_object(
+    conn: &zbus::Connection,
+    allocator: AllocatorHandle,
+    unit_name: &str,
+) {
+    let path = manager::unit_object_path(unit_name);
+    let obj = unit_obj::UnitObject {
+        allocator,
+        unit_name: unit_name.to_string(),
+    };
+    match conn.object_server().at(path.clone(), obj).await {
+        Ok(true) => {
+            info!("Registered D-Bus unit object for {}", unit_name);
+        }
+        Ok(false) => {
+            // Already registered — fine.
+        }
+        Err(e) => {
+            warn!("Failed to register D-Bus object for {}: {}", unit_name, e);
+        }
+    }
+}
 
 /// Run the D-Bus server.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
@@ -33,13 +55,32 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
 
     info!("D-Bus server running");
 
-    // Set up the job-completion → JobRemoved signal pipeline.
-    // The scheduler writes JobCompletion values to `completion_tx`; we read
-    // them here and emit the D-Bus signal so tools like `systemctl` unblock.
+    // ----------------------------------------------------------------
+    // Register per-unit objects for all units already loaded.
+    // ----------------------------------------------------------------
+    let initial_units: Vec<String> = allocator.read().units.keys().cloned().collect();
+    for unit_name in initial_units {
+        register_unit_object(&conn, allocator.clone(), &unit_name).await;
+    }
+
+    // ----------------------------------------------------------------
+    // Set up channels.
+    // ----------------------------------------------------------------
+
+    // job-completion → JobRemoved signal
     let (completion_tx, mut completion_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::state::JobCompletion>();
-    allocator.write().job_completion_tx = Some(completion_tx);
+    // unit-loaded → register per-unit object
+    let (unit_loaded_tx, mut unit_loaded_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
 
+    {
+        let mut state = allocator.write();
+        state.job_completion_tx = Some(completion_tx);
+        state.unit_loaded_tx = Some(unit_loaded_tx);
+    }
+
+    // Spawn task: emit JobRemoved when a job finishes.
     let conn_for_signals = conn.clone();
     tokio::spawn(async move {
         while let Some(completion) = completion_rx.recv().await {
@@ -55,13 +96,22 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
                     )
                     .await
                     {
-                        tracing::warn!("Failed to emit JobRemoved signal: {}", e);
+                        warn!("Failed to emit JobRemoved signal: {}", e);
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to create signal context: {}", e);
+                    warn!("Failed to create signal context: {}", e);
                 }
             }
+        }
+    });
+
+    // Spawn task: register per-unit D-Bus objects as units are loaded.
+    let conn_for_units = conn.clone();
+    let alloc_for_units = allocator.clone();
+    tokio::spawn(async move {
+        while let Some(unit_name) = unit_loaded_rx.recv().await {
+            register_unit_object(&conn_for_units, alloc_for_units.clone(), &unit_name).await;
         }
     });
 

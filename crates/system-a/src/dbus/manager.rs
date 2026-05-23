@@ -673,7 +673,7 @@ impl ManagerInterface {
 // --------------------------------------------------------------------------
 
 /// Synchronously load a unit into the allocator state (for use from blocking tasks).
-fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<()> {
+pub(super) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<()> {
     use crate::unit::parser::parse_unit;
 
     // Check all search paths.
@@ -682,7 +682,12 @@ fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<()> {
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let unit = parse_unit(name, &content)?;
-            allocator.write().units.insert(name.to_string(), unit);
+            let mut state = allocator.write();
+            state.units.insert(name.to_string(), unit);
+            // Notify the D-Bus layer so it can register a per-unit object.
+            if let Some(ref tx) = state.unit_loaded_tx {
+                let _ = tx.send(name.to_string());
+            }
             return Ok(());
         }
     }

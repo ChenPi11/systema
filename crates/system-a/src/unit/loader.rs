@@ -76,7 +76,12 @@ pub async fn load_named_unit(
             match load_unit_file(&path) {
                 Ok(unit) => {
                     let unit_clone = unit.clone();
-                    allocator.write().units.insert(name.to_string(), unit);
+                    let mut state = allocator.write();
+                    state.units.insert(name.to_string(), unit);
+                    // Notify the D-Bus layer if it's already running.
+                    if let Some(ref tx) = state.unit_loaded_tx {
+                        let _ = tx.send(name.to_string());
+                    }
                     return Ok(Some(unit_clone));
                 }
                 Err(e) => {
@@ -114,7 +119,13 @@ async fn load_units_from_dir(dir: &Path, allocator: AllocatorHandle) -> Result<u
 
         match load_unit_file(&path) {
             Ok(unit) => {
-                allocator.write().units.insert(unit.name.clone(), unit);
+                let unit_name = unit.name.clone();
+                let mut state = allocator.write();
+                state.units.insert(unit_name.clone(), unit);
+                // Notify the D-Bus layer if it's already running.
+                if let Some(ref tx) = state.unit_loaded_tx {
+                    let _ = tx.send(unit_name);
+                }
                 count += 1;
             }
             Err(e) => {

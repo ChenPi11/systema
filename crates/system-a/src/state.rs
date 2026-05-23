@@ -191,6 +191,9 @@ pub struct AllocatorState {
     /// Channel to notify the D-Bus layer when a job completes so it can emit
     /// the `JobRemoved` signal.  Set by the D-Bus server at startup.
     pub job_completion_tx: Option<tokio::sync::mpsc::UnboundedSender<JobCompletion>>,
+    /// Channel to notify the D-Bus layer when a new unit is loaded so it can
+    /// register a per-unit D-Bus object.  Set by the D-Bus server at startup.
+    pub unit_loaded_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AllocatorState {
@@ -203,6 +206,7 @@ impl AllocatorState {
             workers: HashMap::new(),
             task_kinds: HashMap::new(),
             job_completion_tx: None,
+            unit_loaded_tx: None,
         }
     }
 }
