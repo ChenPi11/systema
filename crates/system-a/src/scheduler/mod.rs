@@ -74,12 +74,12 @@ pub async fn enqueue_job(
             let already_in_desired_state = match kind {
                 JobKind::Start | JobKind::Restart => {
                     state.runtime.get(name.as_str())
-                        .map(|rt| rt.active_state == ActiveState::Active)
+                        .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
                         .unwrap_or(false)
                 }
                 JobKind::Stop => {
                     state.runtime.get(name.as_str())
-                        .map(|rt| rt.active_state == ActiveState::Inactive)
+                        .map(|rt| matches!(rt.active_state, ActiveState::Inactive | ActiveState::Deactivating))
                         .unwrap_or(true) // treat unknown as inactive for stop
                 }
                 JobKind::Reload => false,
