@@ -9,7 +9,7 @@ use anyhow::Result;
 use prost::Message as ProstMessage;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use common::proto::{
@@ -166,6 +166,10 @@ async fn handle_worker(
                             continue;
                         }
                     };
+                    debug!(
+                        "IPC envelope received from worker '{}': method={} source={} target={} payload_len={}",
+                        worker_id_recv, env.method, env.source, env.target, env.payload.len()
+                    );
                     if let Err(e) = dispatch_incoming(env, alloc_for_recv.clone()).await {
                         warn!("Error handling worker message: {}", e);
                     }
@@ -235,6 +239,10 @@ async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<
     match env.method.as_str() {
         "task.result" => {
             let result = TaskResult::decode(env.payload.as_slice())?;
+            debug!(
+                "IPC task.result: task_id={} unit={} success={} message={:?}",
+                result.task_id, result.unit_name, result.success, result.message
+            );
             let kind = parse_task_kind_from_context(&allocator, result.task_id);
             scheduler::handle_task_result(
                 allocator,
@@ -247,6 +255,10 @@ async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<
         }
         "event.publish" => {
             let event = EventPublish::decode(env.payload.as_slice())?;
+            debug!(
+                "IPC event.publish: event_type={} unit={} data_len={}",
+                event.event_type, event.unit_name, event.event_data.len()
+            );
             handle_event(allocator, event).await?;
         }
         other => {

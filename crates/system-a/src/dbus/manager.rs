@@ -7,7 +7,7 @@
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 use zbus::interface;
 use zvariant::OwnedObjectPath;
 
@@ -119,6 +119,7 @@ impl ManagerInterface {
 
     /// Get the D-Bus object path of a loaded unit.
     async fn get_unit(&self, name: &str) -> zbus::fdo::Result<OwnedObjectPath> {
+        debug!("D-Bus GetUnit: name={}", name);
         let state = self.allocator.read();
         if state.units.contains_key(name) {
             Ok(unit_object_path(name))
@@ -134,6 +135,7 @@ impl ManagerInterface {
 
     /// Load a unit (if not already loaded) and return its object path.
     async fn load_unit(&self, name: &str) -> zbus::fdo::Result<OwnedObjectPath> {
+        debug!("D-Bus LoadUnit: name={}", name);
         // Try to load from disk.
         let alloc = self.allocator.clone();
         let name_owned = name.to_string();
@@ -161,6 +163,7 @@ impl ManagerInterface {
     /// Start a unit. Equivalent to `systemctl start <name>`.
     async fn start_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus StartUnit: {} (mode={})", name, mode);
+        debug!("D-Bus StartUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
@@ -192,6 +195,7 @@ impl ManagerInterface {
     /// Stop a unit. Equivalent to `systemctl stop <name>`.
     async fn stop_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus StopUnit: {} (mode={})", name, mode);
+        debug!("D-Bus StopUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
@@ -207,6 +211,7 @@ impl ManagerInterface {
     /// Restart a unit. Equivalent to `systemctl restart <name>`.
     async fn restart_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus RestartUnit: {} (mode={})", name, mode);
+        debug!("D-Bus RestartUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
@@ -222,6 +227,7 @@ impl ManagerInterface {
     /// Reload a unit's configuration. Equivalent to `systemctl reload <name>`.
     async fn reload_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus ReloadUnit: {} (mode={})", name, mode);
+        debug!("D-Bus ReloadUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
@@ -238,6 +244,7 @@ impl ManagerInterface {
         name: &str,
         mode: &str,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
+        debug!("D-Bus TryRestartUnit: name={} mode={}", name, mode);
         let is_active = self
             .allocator
             .read()
@@ -258,6 +265,7 @@ impl ManagerInterface {
         name: &str,
         mode: &str,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
+        debug!("D-Bus ReloadOrRestartUnit: name={} mode={}", name, mode);
         let can_reload = self
             .allocator
             .read()
@@ -279,8 +287,11 @@ impl ManagerInterface {
 
     /// List all loaded units.
     async fn list_units(&self) -> zbus::fdo::Result<Vec<UnitInfo>> {
+        debug!("D-Bus ListUnits");
         let state = self.allocator.read();
-        Ok(build_unit_list(&state, |_, _| true))
+        let result = build_unit_list(&state, |_, _| true);
+        debug!("D-Bus ListUnits: returning {} unit(s)", result.len());
+        Ok(result)
     }
 
     /// List loaded units filtered by active state(s).
@@ -289,8 +300,9 @@ impl ManagerInterface {
         &self,
         states: Vec<String>,
     ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+        debug!("D-Bus ListUnitsFiltered: states={:?}", states);
         let state = self.allocator.read();
-        Ok(build_unit_list(&state, |name, s| {
+        let result = build_unit_list(&state, |name, s| {
             if states.is_empty() {
                 return true;
             }
@@ -298,7 +310,9 @@ impl ManagerInterface {
                 .map(|rt| rt.active_state.as_str())
                 .unwrap_or("inactive");
             states.iter().any(|f| f == active)
-        }))
+        });
+        debug!("D-Bus ListUnitsFiltered: returning {} unit(s)", result.len());
+        Ok(result)
     }
 
     /// List loaded units filtered by active state(s) and name glob patterns.
@@ -309,8 +323,9 @@ impl ManagerInterface {
         states: Vec<String>,
         patterns: Vec<String>,
     ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+        debug!("D-Bus ListUnitsByPatterns: states={:?} patterns={:?}", states, patterns);
         let state = self.allocator.read();
-        Ok(build_unit_list(&state, |name, s| {
+        let result = build_unit_list(&state, |name, s| {
             // State filter.
             if !states.is_empty() {
                 let active = s.runtime.get(*name)
@@ -327,7 +342,9 @@ impl ManagerInterface {
                 }
             }
             true
-        }))
+        });
+        debug!("D-Bus ListUnitsByPatterns: returning {} unit(s)", result.len());
+        Ok(result)
     }
 
     /// Return unit info for specific named units, loading them from disk if
@@ -336,6 +353,7 @@ impl ManagerInterface {
         &self,
         names: Vec<String>,
     ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+        debug!("D-Bus ListUnitsByNames: names={:?}", names);
         // Load any units that aren't already in memory.
         let to_load: Vec<String> = {
             let state = self.allocator.read();
@@ -363,6 +381,7 @@ impl ManagerInterface {
 
     /// List all in-flight jobs.
     async fn list_jobs(&self) -> zbus::fdo::Result<Vec<JobInfo>> {
+        debug!("D-Bus ListJobs");
         let state = self.allocator.read();
         let result = state
             .jobs
@@ -389,6 +408,7 @@ impl ManagerInterface {
 
     /// List unit files (enabled/disabled status).
     async fn list_unit_files(&self) -> zbus::fdo::Result<Vec<UnitFileInfo>> {
+        debug!("D-Bus ListUnitFiles");
         let state = self.allocator.read();
         Ok(build_unit_file_list(&state, |_, _| true))
     }
@@ -401,6 +421,7 @@ impl ManagerInterface {
         states: Vec<String>,
         patterns: Vec<String>,
     ) -> zbus::fdo::Result<Vec<UnitFileInfo>> {
+        debug!("D-Bus ListUnitFilesByPatterns: states={:?} patterns={:?}", states, patterns);
         let state = self.allocator.read();
         Ok(build_unit_file_list(&state, |name, file_state| {
             if !states.is_empty() && !states.iter().any(|s| s == file_state) {
@@ -416,6 +437,7 @@ impl ManagerInterface {
     /// Return the enablement state of a specific unit file.
     /// `file` may be a unit name (e.g. "sshd.service") or an absolute path.
     async fn get_unit_file_state(&self, file: &str) -> zbus::fdo::Result<String> {
+        debug!("D-Bus GetUnitFileState: file={}", file);
         // Normalise: strip leading path components if the caller passed a full path.
         let name = std::path::Path::new(file)
             .file_name()
@@ -452,6 +474,7 @@ impl ManagerInterface {
         &self,
         unit_name: &str,
     ) -> zbus::fdo::Result<Vec<(String, u32, String)>> {
+        debug!("D-Bus GetUnitProcesses: unit={}", unit_name);
         let state = self.allocator.read();
         let main_pid = state
             .runtime
@@ -474,6 +497,7 @@ impl ManagerInterface {
     /// Reload systemd configuration (re-scan unit files).
     async fn reload(&self) -> zbus::fdo::Result<()> {
         info!("D-Bus Reload: reloading unit files");
+        debug!("D-Bus Reload: triggering full unit file rescan");
         let alloc = self.allocator.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::unit::loader::load_default_units(alloc).await {
@@ -485,6 +509,7 @@ impl ManagerInterface {
 
     /// Reset the failed state of a unit.
     async fn reset_failed_unit(&self, name: &str) -> zbus::fdo::Result<()> {
+        debug!("D-Bus ResetFailedUnit: name={}", name);
         let mut state = self.allocator.write();
         if let Some(rt) = state.runtime.get_mut(name) {
             if rt.active_state == ActiveState::Failed {
@@ -497,6 +522,7 @@ impl ManagerInterface {
 
     /// Reset all failed units.
     async fn reset_failed(&self) -> zbus::fdo::Result<()> {
+        debug!("D-Bus ResetFailed");
         let mut state = self.allocator.write();
         for rt in state.runtime.values_mut() {
             if rt.active_state == ActiveState::Failed {
