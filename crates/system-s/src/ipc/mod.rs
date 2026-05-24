@@ -349,7 +349,12 @@ async fn execute_task(
                     info!("Sent SIGHUP to PID {} ({})", pid, task.unit_name);
                 }
             } else {
-                warn!("Reload requested for {} but no PID found", task.unit_name);
+                // systemctl reload behaviour: if the service is not running, return an
+                // error instead of silently succeeding.
+                anyhow::bail!(
+                    "Reload of {} failed: service is not running",
+                    task.unit_name
+                );
             }
         }
     }

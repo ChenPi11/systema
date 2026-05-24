@@ -72,11 +72,13 @@ pub async fn enqueue_job(
         {
             let state = allocator.read();
             let already_in_desired_state = match kind {
-                JobKind::Start | JobKind::Restart => {
+                JobKind::Start => {
                     state.runtime.get(name.as_str())
                         .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
                         .unwrap_or(false)
                 }
+                // Restart always re-executes: stop then start, regardless of current state.
+                JobKind::Restart => false,
                 JobKind::Stop => {
                     state.runtime.get(name.as_str())
                         .map(|rt| matches!(rt.active_state, ActiveState::Inactive | ActiveState::Deactivating))
