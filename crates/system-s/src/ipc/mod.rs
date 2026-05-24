@@ -1,28 +1,71 @@
 //! IPC client for System S.
 //!
 //! Connects to System A's Unix socket, registers as a "service" worker, then
-//! enters a loop that:
-//! 1. Receives `TaskDispatch` messages from System A.
-//! 2. Executes the requested operation (start/stop/restart).
-//! 3. Sends `TaskResult` back.
-//! 4. Publishes `EventPublish` for interesting lifecycle events.
+//! enters a pair of concurrent tasks:
+//!
+//! * **reader task**: receives `TaskDispatch` messages, executes them, and
+//!   queues `TaskResult` messages onto an outgoing channel.
+//! * **writer task**: drains the outgoing channel and sends messages to
+//!   System A.
+//!
+//! Background monitor tasks (spawned after each `Start`) also push
+//! `EventPublish` messages onto the same outgoing channel so that unexpected
+//! service exits are reported to System A without requiring the reader task to
+//! be idle.
 
 use anyhow::{Context, Result};
+use bytes::BytesMut;
 use prost::Message as ProstMessage;
+use tokio::sync::mpsc;
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
 use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use common::proto::{
-    EventPublish, RegisterAck, TaskDispatch, TaskKind, TaskResult, TaskResultKind,
+    Envelope, EventPublish, RegisterAck, TaskDispatch, TaskKind, TaskResult, TaskResultKind,
     UnitConfig, WorkerRegistration,
 };
 
-use crate::process::{start_service, stop_service};
+use crate::process::{is_alive, start_service, stop_service};
 use crate::state::{ServiceRegistry, ServiceState, new_registry};
 
 const ALLOCATOR_SOCKET: &str = "/run/system-alphabet/allocator.sock";
 const WORKER_ID: &str = "system-s-1";
 const WORKER_UNIT_TYPES: &[&str] = &["service"];
+
+// ---------------------------------------------------------------------------
+// Outgoing-message helpers
+// ---------------------------------------------------------------------------
+
+/// Encode an [`Envelope`] into a length-delimited frame (just the raw bytes;
+/// the [`FramedWrite`] will prepend the length header).
+fn encode_envelope(env: Envelope) -> Result<bytes::Bytes> {
+    let mut buf = BytesMut::new();
+    env.encode(&mut buf).context("Failed to encode Envelope")?;
+    Ok(buf.freeze())
+}
+
+/// Queue an `EventPublish` message for delivery to System A.
+fn queue_event(
+    out_tx: &mpsc::UnboundedSender<bytes::Bytes>,
+    event_type: &str,
+    unit_name: &str,
+    data: &[u8],
+) -> Result<()> {
+    let event = EventPublish {
+        event_type: event_type.to_string(),
+        unit_name: unit_name.to_string(),
+        event_data: data.to_vec(),
+    };
+    let env = make_envelope(0, WORKER_ID, "system-a", "event.publish", event)?;
+    out_tx
+        .send(encode_envelope(env)?)
+        .map_err(|_| anyhow::anyhow!("Outgoing channel closed"))
+}
+
+// ---------------------------------------------------------------------------
+// Public entry-point
+// ---------------------------------------------------------------------------
 
 /// Connect to System A and run the worker event loop.
 pub async fn run() -> Result<()> {
@@ -45,6 +88,10 @@ pub async fn run() -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inner connection loop
+// ---------------------------------------------------------------------------
+
 async fn try_run(registry: ServiceRegistry) -> Result<()> {
     info!("Connecting to System A at {}", ALLOCATOR_SOCKET);
 
@@ -54,6 +101,7 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
 
     info!("Connected to System A");
 
+    // Use the full framed connection for the registration handshake.
     let mut framed = frame_stream(stream);
 
     // --- Register ---
@@ -74,33 +122,95 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
     }
     info!("Registration accepted: {}", ack.message);
 
-    // --- Main event loop: receive tasks and send results/events ---
-    loop {
-        let env = match recv_envelope(&mut framed).await? {
-            Some(e) => e,
-            None => {
-                info!("System A closed the connection");
-                break;
-            }
-        };
+    // --- Split the connection so reader and writer run concurrently ---
+    // This lets background monitor tasks push events while the reader
+    // is blocked inside execute_task waiting for a process to stop.
+    let inner = framed.into_inner();
+    let (reader_half, writer_half) = tokio::io::split(inner);
 
-        match env.method.as_str() {
-            "task.dispatch" => {
-                let task = TaskDispatch::decode(env.payload.as_slice())
-                    .context("Decode TaskDispatch")?;
+    let make_codec = || {
+        LengthDelimitedCodec::builder()
+            .max_frame_length(16 * 1024 * 1024)
+            .new_codec()
+    };
+    let mut reader = FramedRead::new(reader_half, make_codec());
+    let writer = FramedWrite::new(writer_half, make_codec());
+
+    // Outgoing-message channel: execute_task and monitor_service push encoded
+    // envelopes here; the writer task drains them onto the socket.
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
+
+    // --- Writer task ---
+    let writer_task = {
+        let mut writer = writer;
+        let mut out_rx = out_rx;
+        async move {
+            use futures::SinkExt;
+            while let Some(msg) = out_rx.recv().await {
+                writer.send(msg).await.context("Write to System A socket")?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+    };
+
+    // --- Reader / processor task ---
+    let reader_task = {
+        let out_tx = out_tx.clone();
+        let registry = registry.clone();
+        async move {
+            use futures::StreamExt;
+            loop {
+                let bytes = match reader.next().await {
+                    None => {
+                        info!("System A closed the connection");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        warn!("Read error from System A: {}", e);
+                        break;
+                    }
+                    Some(Ok(b)) => b,
+                };
+
+                let env = match Envelope::decode(bytes.freeze()) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!("Failed to decode envelope: {}", e);
+                        continue;
+                    }
+                };
+
+                if env.method != "task.dispatch" {
+                    warn!("Unexpected method from System A: {}", env.method);
+                    continue;
+                }
+
+                let task = match TaskDispatch::decode(env.payload.as_slice()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("Failed to decode TaskDispatch: {}", e);
+                        continue;
+                    }
+                };
                 debug!(
                     "Received task {} for {} (kind={:?})",
                     task.task_id, task.unit_name, task.kind
                 );
 
-                // Parse the unit config from the embedded bytes.
                 let unit_config = if !task.unit_config.is_empty() {
-                    Some(UnitConfig::decode(task.unit_config.as_slice()).context("Decode UnitConfig")?)
+                    match UnitConfig::decode(task.unit_config.as_slice()) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            warn!("Failed to decode UnitConfig: {}", e);
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
 
-                let result = execute_task(&registry, &task, unit_config.as_ref(), &mut framed).await;
+                let result =
+                    execute_task(&registry, &task, unit_config.as_ref(), &out_tx).await;
 
                 let (success, message, result_kind) = match result {
                     Ok(()) => (true, String::new(), TaskResultKind::TaskResultDone),
@@ -114,30 +224,55 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
                     message,
                     result_kind: result_kind as i32,
                 };
-                let result_env = make_envelope(
+                match make_envelope(
                     env.request_id,
                     WORKER_ID,
                     "system-a",
                     "task.result",
                     task_result,
-                )?;
-                send_envelope(&mut framed, &result_env).await?;
+                )
+                .and_then(encode_envelope)
+                {
+                    Ok(encoded) => {
+                        if out_tx.send(encoded).is_err() {
+                            warn!("Outgoing channel closed; cannot send task result");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to encode task result: {}", e);
+                    }
+                }
             }
-            other => {
-                warn!("Unknown method from System A: {}", other);
-            }
+            Ok::<_, anyhow::Error>(())
+        }
+    };
+
+    // Run reader and writer concurrently; stop as soon as either exits.
+    tokio::select! {
+        res = writer_task => {
+            if let Err(e) = res { warn!("Writer task error: {}", e); }
+        }
+        res = reader_task => {
+            if let Err(e) = res { warn!("Reader task error: {}", e); }
         }
     }
 
     Ok(())
 }
 
-/// Execute a single task, sending events as needed.
+// ---------------------------------------------------------------------------
+// Task execution
+// ---------------------------------------------------------------------------
+
+/// Execute a single task, queuing events onto `out_tx` instead of writing
+/// them directly to the socket (so background monitor tasks can share the
+/// same sender).
 async fn execute_task(
     registry: &ServiceRegistry,
     task: &TaskDispatch,
     unit_config: Option<&UnitConfig>,
-    framed: &mut common::ipc::EnvelopeFramed,
+    out_tx: &mpsc::UnboundedSender<bytes::Bytes>,
 ) -> Result<()> {
     let kind = TaskKind::try_from(task.kind).unwrap_or(TaskKind::Start);
 
@@ -149,22 +284,20 @@ async fn execute_task(
 
             let pid = start_service(registry.clone(), config).await?;
 
-            // Publish "service.started" event.
-            publish_event(
-                framed,
+            // Notify System A that the service is running.
+            queue_event(
+                out_tx,
                 "service.started",
                 &task.unit_name,
                 serde_json::json!({ "pid": pid }).to_string().as_bytes(),
-            )
-            .await?;
+            )?;
 
-            // Spawn a monitor task to watch for process exit.
-            let registry2 = registry.clone();
-            let unit_name = task.unit_name.clone();
-            // We can't easily send events from a spawned task over the current framed
-            // connection without splitting it. In Phase 1, we poll for exit separately.
-            // Full async event push is implemented in Phase 2.
-            tokio::spawn(monitor_service(registry2, unit_name));
+            // Spawn a background monitor that will report unexpected exits.
+            tokio::spawn(monitor_service(
+                registry.clone(),
+                task.unit_name.clone(),
+                out_tx.clone(),
+            ));
         }
 
         TaskKind::Stop => {
@@ -175,11 +308,10 @@ async fn execute_task(
 
             stop_service(registry.clone(), &task.unit_name, timeout).await?;
 
-            publish_event(framed, "process.exit", &task.unit_name, b"").await?;
+            queue_event(out_tx, "process.exit", &task.unit_name, b"")?;
         }
 
         TaskKind::Restart => {
-            // Stop then start.
             let timeout = unit_config
                 .and_then(|c| c.service.as_ref())
                 .map(|s| s.timeout_stop_secs)
@@ -188,18 +320,21 @@ async fn execute_task(
 
             if let Some(config) = unit_config {
                 let pid = start_service(registry.clone(), config).await?;
-                publish_event(
-                    framed,
+                queue_event(
+                    out_tx,
                     "service.started",
                     &task.unit_name,
                     serde_json::json!({ "pid": pid }).to_string().as_bytes(),
-                )
-                .await?;
+                )?;
+                tokio::spawn(monitor_service(
+                    registry.clone(),
+                    task.unit_name.clone(),
+                    out_tx.clone(),
+                ));
             }
         }
 
         TaskKind::Reload => {
-            // Send SIGHUP to the main process.
             let pid = {
                 let reg = registry.lock();
                 reg.get(&task.unit_name).and_then(|i| i.main_pid)
@@ -222,26 +357,22 @@ async fn execute_task(
     Ok(())
 }
 
-/// Publish an event to System A.
-async fn publish_event(
-    framed: &mut common::ipc::EnvelopeFramed,
-    event_type: &str,
-    unit_name: &str,
-    data: &[u8],
-) -> Result<()> {
-    let event = EventPublish {
-        event_type: event_type.to_string(),
-        unit_name: unit_name.to_string(),
-        event_data: data.to_vec(),
-    };
-    let env = make_envelope(0, WORKER_ID, "system-a", "event.publish", event)?;
-    send_envelope(framed, &env).await
-}
+// ---------------------------------------------------------------------------
+// Background monitor
+// ---------------------------------------------------------------------------
 
-/// Background task that monitors a service process for exit.
-/// In Phase 2 this will push events back to System A via a dedicated channel.
-async fn monitor_service(registry: ServiceRegistry, unit_name: String) {
-    // Poll every second for the main process to exit.
+/// Poll a service every second and report unexpected exits to System A via
+/// the outgoing-message channel.
+///
+/// This task exits once the service stops (for any reason).  When the exit is
+/// NOT caused by an intentional `Stop` task (i.e. the service state is still
+/// `Running` when the PID disappears), a `service.failed` event is sent so
+/// System A can update its runtime state.
+async fn monitor_service(
+    registry: ServiceRegistry,
+    unit_name: String,
+    out_tx: mpsc::UnboundedSender<bytes::Bytes>,
+) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
@@ -253,21 +384,33 @@ async fn monitor_service(registry: ServiceRegistry, unit_name: String) {
             }
         };
 
-        if state == ServiceState::Dead || state == ServiceState::Failed {
+        // Service already marked as stopped / failed / stopping — exit quietly.
+        if matches!(
+            state,
+            ServiceState::Dead | ServiceState::Failed | ServiceState::Stopping
+        ) {
             break;
         }
 
         if let Some(pid) = pid {
-            if !crate::process::is_alive(pid) {
-                info!("Service {} (PID {}) exited", unit_name, pid);
-                let mut reg = registry.lock();
-                if let Some(inst) = reg.get_mut(&unit_name) {
-                    inst.state = ServiceState::Dead;
-                    inst.main_pid = None;
+            if !is_alive(pid) {
+                info!(
+                    "Service {} (PID {}) exited unexpectedly",
+                    unit_name, pid
+                );
+                {
+                    let mut reg = registry.lock();
+                    if let Some(inst) = reg.get_mut(&unit_name) {
+                        inst.state = ServiceState::Failed;
+                        inst.main_pid = None;
+                    }
                 }
+                // Report the unexpected exit to System A.
+                let _ = queue_event(&out_tx, "service.failed", &unit_name, b"");
                 break;
             }
         } else {
+            // No PID recorded — service is not running.
             break;
         }
     }

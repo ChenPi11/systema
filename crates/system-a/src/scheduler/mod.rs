@@ -84,15 +84,22 @@ pub async fn enqueue_job(
                 }
                 JobKind::Reload => false,
             };
-            let has_running_job = state.jobs.values().any(|j| {
-                j.unit_name == *name
-                    && j.kind == kind
-                    && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
-            });
-            if already_in_desired_state || has_running_job {
-                let reason = if already_in_desired_state { "already in desired state" } else { "existing job running" };
+
+            // Check for an existing running/waiting job of the same kind.
+            let existing_running_job_id: Option<u64> = state.jobs.values()
+                .find(|j| {
+                    j.unit_name == *name
+                        && j.kind == kind
+                        && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+                })
+                .map(|j| j.id);
+
+            if already_in_desired_state {
+                let reason = "already in desired state";
                 debug!("Skipping {:?} for {} ({})", kind, name, reason);
                 if is_root {
+                    // Unit is already in the desired state — send an immediate
+                    // completion so the caller (e.g. systemctl) doesn't wait.
                     if let Some(ref tx) = state.job_completion_tx {
                         let _ = tx.send(JobCompletion {
                             job_id: primary_job_id,
@@ -100,6 +107,17 @@ pub async fn enqueue_job(
                             result: JobResultKind::Done,
                         });
                     }
+                }
+                continue;
+            }
+
+            if let Some(existing_jid) = existing_running_job_id {
+                debug!("Skipping {:?} for {} (existing job running)", kind, name);
+                if is_root {
+                    // There is already an in-flight job for this operation.
+                    // Return its ID so the caller waits for the REAL completion
+                    // signal rather than a phantom new ID that will never fire.
+                    return Ok(existing_jid);
                 }
                 continue;
             }

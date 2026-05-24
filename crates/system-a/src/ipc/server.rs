@@ -18,7 +18,8 @@ use common::proto::{
 
 use crate::scheduler::{self, build_task_dispatch};
 use crate::state::{
-    AllocatorHandle, JobKind, WorkerEntry, WorkerTask, next_request_id,
+    ActiveState, AllocatorHandle, JobCompletion, JobKind, JobResultKind, JobStatus,
+    WorkerEntry, WorkerTask, next_request_id,
 };
 
 pub const SOCKET_PATH: &str = "/run/system-alphabet/allocator.sock";
@@ -184,10 +185,45 @@ async fn handle_worker(
         }
     }
 
-    // Deregister the worker.
+    // Deregister the worker and cancel any jobs that were pending for it.
+    // Without this, Running/Waiting jobs would stay stuck forever if the worker
+    // crashes or disconnects before sending a task.result back.
     {
         let mut state = allocator.write();
         state.workers.remove(&worker_id);
+
+        // Collect all Running/Waiting jobs and mark them Cancelled.
+        let stale: Vec<JobCompletion> = state
+            .jobs
+            .values_mut()
+            .filter(|j| matches!(j.status, JobStatus::Running | JobStatus::Waiting))
+            .map(|j| {
+                j.status = JobStatus::Cancelled;
+                JobCompletion {
+                    job_id: j.id,
+                    unit_name: j.unit_name.clone(),
+                    result: JobResultKind::Cancelled,
+                }
+            })
+            .collect();
+
+        // Reset any units that were in a transitional state.
+        for rt in state.runtime.values_mut() {
+            if matches!(
+                rt.active_state,
+                ActiveState::Activating | ActiveState::Deactivating
+            ) {
+                rt.active_state = ActiveState::Failed;
+                rt.sub_state = "failed".to_string();
+            }
+        }
+
+        // Emit JobRemoved for each cancelled job so waiting clients unblock.
+        if let Some(ref tx) = state.job_completion_tx {
+            for completion in stale {
+                let _ = tx.send(completion);
+            }
+        }
     }
     info!("Worker '{}' deregistered", worker_id);
 
