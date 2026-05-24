@@ -146,6 +146,8 @@ pub struct UnitRuntimeInfo {
     pub load_state: String,
     /// The worker that currently owns this unit (if any).
     pub worker_id: Option<String>,
+    /// The main PID of the service process, if running.
+    pub main_pid: Option<u32>,
 }
 
 // --------------------------------------------------------------------------

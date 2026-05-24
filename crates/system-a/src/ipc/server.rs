@@ -283,18 +283,25 @@ async fn handle_event(allocator: AllocatorHandle, event: EventPublish) -> Result
                 rt.active_state = crate::state::ActiveState::Inactive;
                 rt.sub_state = "dead".to_string();
             }
+            rt.main_pid = None;
         }
         "service.started" => {
+            let pid = serde_json::from_slice::<serde_json::Value>(&event.event_data)
+                .ok()
+                .and_then(|v| v["pid"].as_u64())
+                .map(|p| p as u32);
             let mut state = allocator.write();
             let rt = state.runtime.entry(event.unit_name.clone()).or_default();
             rt.active_state = crate::state::ActiveState::Active;
             rt.sub_state = "running".to_string();
+            rt.main_pid = pid;
         }
         "service.failed" => {
             let mut state = allocator.write();
             let rt = state.runtime.entry(event.unit_name.clone()).or_default();
             rt.active_state = crate::state::ActiveState::Failed;
             rt.sub_state = "failed".to_string();
+            rt.main_pid = None;
         }
         _ => {}
     }

@@ -253,50 +253,84 @@ impl ManagerInterface {
     /// List all loaded units.
     async fn list_units(&self) -> zbus::fdo::Result<Vec<UnitInfo>> {
         let state = self.allocator.read();
-        let mut result = Vec::new();
+        Ok(build_unit_list(&state, |_, _| true))
+    }
 
-        for (name, unit) in &state.units {
-            let rt = state.runtime.get(name).cloned().unwrap_or_default();
-            let load_state = if rt.load_state.is_empty() {
-                "loaded".to_string()
-            } else {
-                rt.load_state.clone()
-            };
-            let active_state = rt.active_state.as_str().to_string();
-            let sub_state = if rt.sub_state.is_empty() {
-                "dead".to_string()
-            } else {
-                rt.sub_state.clone()
-            };
+    /// List loaded units filtered by active state(s).
+    /// Pass an empty slice to list all units (same as `list_units`).
+    async fn list_units_filtered(
+        &self,
+        states: Vec<String>,
+    ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+        let state = self.allocator.read();
+        Ok(build_unit_list(&state, |name, s| {
+            if states.is_empty() {
+                return true;
+            }
+            let active = s.runtime.get(*name)
+                .map(|rt| rt.active_state.as_str())
+                .unwrap_or("inactive");
+            states.iter().any(|f| f == active)
+        }))
+    }
 
-            // Find associated job (if any).
-            let (job_id, job_type) = state
-                .jobs
-                .values()
-                .find(|j| j.unit_name == *name && matches!(j.status, JobStatus::Running | JobStatus::Waiting))
-                .map(|j| (j.id as u32, j.kind.as_str().to_string()))
-                .unwrap_or((0, String::new()));
+    /// List loaded units filtered by active state(s) and name glob patterns.
+    /// An empty `states` slice means "any state"; an empty `patterns` slice
+    /// means "any name".
+    async fn list_units_by_patterns(
+        &self,
+        states: Vec<String>,
+        patterns: Vec<String>,
+    ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+        let state = self.allocator.read();
+        Ok(build_unit_list(&state, |name, s| {
+            // State filter.
+            if !states.is_empty() {
+                let active = s.runtime.get(*name)
+                    .map(|rt| rt.active_state.as_str())
+                    .unwrap_or("inactive");
+                if !states.iter().any(|f| f == active) {
+                    return false;
+                }
+            }
+            // Pattern filter.
+            if !patterns.is_empty() {
+                if !patterns.iter().any(|p| matches_glob(p, name)) {
+                    return false;
+                }
+            }
+            true
+        }))
+    }
 
-            let job_path = if job_id > 0 {
-                job_object_path(job_id as u64)
-            } else {
-                OwnedObjectPath::try_from("/").unwrap()
-            };
+    /// Return unit info for specific named units, loading them from disk if
+    /// they are not already in memory.
+    async fn list_units_by_names(
+        &self,
+        names: Vec<String>,
+    ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+        // Load any units that aren't already in memory.
+        let to_load: Vec<String> = {
+            let state = self.allocator.read();
+            names
+                .iter()
+                .filter(|n| !state.units.contains_key(*n))
+                .cloned()
+                .collect()
+        };
 
-            result.push((
-                name.clone(),
-                unit.unit.description.clone(),
-                load_state,
-                active_state,
-                sub_state,
-                String::new(), // following
-                unit_object_path(name),
-                job_id,
-                job_type,
-                job_path,
-            ));
+        for name in to_load {
+            let alloc = self.allocator.clone();
+            let _ = tokio::task::spawn_blocking(move || load_unit_sync(&alloc, &name)).await;
         }
 
+        let state = self.allocator.read();
+        let result = names
+            .iter()
+            .filter_map(|name| {
+                state.units.get(name).map(|unit| unit_info_entry(name, unit, &state))
+            })
+            .collect();
         Ok(result)
     }
 
@@ -329,21 +363,81 @@ impl ManagerInterface {
     /// List unit files (enabled/disabled status).
     async fn list_unit_files(&self) -> zbus::fdo::Result<Vec<UnitFileInfo>> {
         let state = self.allocator.read();
-        let result = state
-            .units
-            .keys()
-            .map(|name| {
-                // Check if it's wanted-by something (enabled).
-                let unit = state.units.get(name).unwrap();
-                let file_state = if !unit.install.wanted_by.is_empty() {
-                    "enabled"
-                } else {
-                    "static"
-                };
-                (format!("/usr/lib/systemd/system/{}", name), file_state.to_string())
-            })
-            .collect();
-        Ok(result)
+        Ok(build_unit_file_list(&state, |_, _| true))
+    }
+
+    /// List unit files filtered by state(s) and name glob patterns.
+    /// An empty `states` slice means "any state"; an empty `patterns` slice
+    /// means "any name".
+    async fn list_unit_files_by_patterns(
+        &self,
+        states: Vec<String>,
+        patterns: Vec<String>,
+    ) -> zbus::fdo::Result<Vec<UnitFileInfo>> {
+        let state = self.allocator.read();
+        Ok(build_unit_file_list(&state, |name, file_state| {
+            if !states.is_empty() && !states.iter().any(|s| s == file_state) {
+                return false;
+            }
+            if !patterns.is_empty() && !patterns.iter().any(|p| matches_glob(p, name)) {
+                return false;
+            }
+            true
+        }))
+    }
+
+    /// Return the enablement state of a specific unit file.
+    /// `file` may be a unit name (e.g. "sshd.service") or an absolute path.
+    async fn get_unit_file_state(&self, file: &str) -> zbus::fdo::Result<String> {
+        // Normalise: strip leading path components if the caller passed a full path.
+        let name = std::path::Path::new(file)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(file);
+
+        let state = self.allocator.read();
+        if let Some(unit) = state.units.get(name) {
+            let file_state = if !unit.install.wanted_by.is_empty() {
+                "enabled"
+            } else {
+                "static"
+            };
+            Ok(file_state.to_string())
+        } else {
+            // Unit not loaded — try to find it on disk without loading it fully.
+            for dir in crate::unit::loader::UNIT_SEARCH_PATHS {
+                let path = std::path::Path::new(dir).join(name);
+                if path.exists() {
+                    // File exists but isn't loaded; report as "static".
+                    return Ok("static".to_string());
+                }
+            }
+            Err(zbus::fdo::Error::Failed(format!(
+                "Unit file {} not found",
+                name
+            )))
+        }
+    }
+
+    /// Return the processes currently running under a unit's control group.
+    /// Each tuple is (cgroup_path, pid, command_line).
+    async fn get_unit_processes(
+        &self,
+        unit_name: &str,
+    ) -> zbus::fdo::Result<Vec<(String, u32, String)>> {
+        let state = self.allocator.read();
+        let main_pid = state
+            .runtime
+            .get(unit_name)
+            .and_then(|rt| rt.main_pid);
+
+        match main_pid {
+            Some(pid) => {
+                let cmdline = read_proc_cmdline(pid);
+                Ok(vec![(String::new(), pid, cmdline)])
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -692,4 +786,153 @@ pub(super) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<
         }
     }
     anyhow::bail!("Unit not found: {}", name)
+}
+
+// --------------------------------------------------------------------------
+// Private list-building helpers
+// --------------------------------------------------------------------------
+
+/// Build a `UnitInfo` tuple for a single unit from the current allocator state.
+fn unit_info_entry(
+    name: &str,
+    unit: &crate::unit::types::UnitFile,
+    state: &crate::state::AllocatorState,
+) -> UnitInfo {
+    let rt = state.runtime.get(name).cloned().unwrap_or_default();
+    let load_state = if rt.load_state.is_empty() {
+        "loaded".to_string()
+    } else {
+        rt.load_state.clone()
+    };
+    let active_state = rt.active_state.as_str().to_string();
+    let sub_state = if rt.sub_state.is_empty() {
+        "dead".to_string()
+    } else {
+        rt.sub_state.clone()
+    };
+
+    let (job_id, job_type) = state
+        .jobs
+        .values()
+        .find(|j| {
+            j.unit_name == name
+                && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+        })
+        .map(|j| (j.id as u32, j.kind.as_str().to_string()))
+        .unwrap_or((0, String::new()));
+
+    let job_path = if job_id > 0 {
+        job_object_path(job_id as u64)
+    } else {
+        OwnedObjectPath::try_from("/").unwrap()
+    };
+
+    (
+        name.to_string(),
+        unit.unit.description.clone(),
+        load_state,
+        active_state,
+        sub_state,
+        String::new(), // following
+        unit_object_path(name),
+        job_id,
+        job_type,
+        job_path,
+    )
+}
+
+/// Collect `UnitInfo` entries from the allocator state, applying a predicate.
+///
+/// The predicate receives `(unit_name, &AllocatorState)` and returns `true`
+/// if the entry should be included.
+fn build_unit_list<F>(
+    state: &crate::state::AllocatorState,
+    predicate: F,
+) -> Vec<UnitInfo>
+where
+    F: Fn(&&str, &crate::state::AllocatorState) -> bool,
+{
+    state
+        .units
+        .iter()
+        .filter(|(name, _)| predicate(&name.as_str(), state))
+        .map(|(name, unit)| unit_info_entry(name, unit, state))
+        .collect()
+}
+
+/// Collect `UnitFileInfo` entries from the allocator state, applying a predicate.
+///
+/// The predicate receives `(unit_name, file_state_str)` and returns `true`
+/// if the entry should be included.
+fn build_unit_file_list<F>(
+    state: &crate::state::AllocatorState,
+    predicate: F,
+) -> Vec<UnitFileInfo>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    state
+        .units
+        .keys()
+        .filter_map(|name| {
+            let unit = state.units.get(name)?;
+            let file_state = if !unit.install.wanted_by.is_empty() {
+                "enabled"
+            } else {
+                "static"
+            };
+            if predicate(name, file_state) {
+                Some((
+                    format!("/usr/lib/systemd/system/{}", name),
+                    file_state.to_string(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Simple shell-style glob matcher supporting `*` (any sequence) and `?`
+/// (any single character).  Used by `ListUnitsByPatterns` and
+/// `ListUnitFilesByPatterns`.
+fn matches_glob(pattern: &str, name: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let nm: Vec<char> = name.chars().collect();
+    glob_match(&pat, &nm)
+}
+
+fn glob_match(pattern: &[char], name: &[char]) -> bool {
+    match (pattern.first(), name.first()) {
+        (None, None) => true,
+        (Some(&'*'), _) => {
+            // Try matching `*` against 0, 1, 2, … trailing characters.
+            for i in 0..=name.len() {
+                if glob_match(&pattern[1..], &name[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        (Some(&'?'), Some(_)) => glob_match(&pattern[1..], &name[1..]),
+        (Some(p), Some(n)) if p == n => glob_match(&pattern[1..], &name[1..]),
+        _ => false,
+    }
+}
+
+/// Read `/proc/<pid>/cmdline` and return it as a human-readable string.
+/// Returns an empty string if the file cannot be read.
+fn read_proc_cmdline(pid: u32) -> String {
+    let path = format!("/proc/{}/cmdline", pid);
+    std::fs::read(&path)
+        .map(|bytes| {
+            // cmdline uses NUL bytes as separators.
+            bytes
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
 }
