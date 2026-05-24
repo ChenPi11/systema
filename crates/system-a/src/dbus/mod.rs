@@ -7,7 +7,10 @@
 pub mod manager;
 pub mod unit_obj;
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use once_cell::sync::OnceCell;
 use tracing::{info, warn};
 use zbus::connection::Builder;
 
@@ -18,7 +21,7 @@ pub const BUS_NAME: &str = "org.freedesktop.systemd1";
 
 /// Register a per-unit D-Bus object for `unit_name` on the connection's
 /// object server.  Silently skips if the object is already registered.
-async fn register_unit_object(
+pub(super) async fn register_unit_object(
     conn: &zbus::Connection,
     allocator: AllocatorHandle,
     unit_name: &str,
@@ -45,13 +48,20 @@ async fn register_unit_object(
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     info!("Starting D-Bus server as '{}'", BUS_NAME);
 
-    let manager = manager::ManagerInterface::new(allocator.clone());
+    // Shared connection cell: set after the connection is built so that
+    // ManagerInterface methods can register unit objects synchronously.
+    let conn_cell: Arc<OnceCell<zbus::Connection>> = Arc::new(OnceCell::new());
+
+    let manager = manager::ManagerInterface::new(allocator.clone(), conn_cell.clone());
 
     let conn = Builder::system()?
         .name(BUS_NAME)?
         .serve_at("/org/freedesktop/systemd1", manager)?
         .build()
         .await?;
+
+    // Make the connection available to ManagerInterface methods.
+    let _ = conn_cell.set(conn.clone());
 
     info!("D-Bus server running");
 

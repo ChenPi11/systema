@@ -169,6 +169,22 @@ pub async fn enqueue_job(
                 }
                 None => {
                     warn!("No worker registered for unit type '{}' (unit: {})", unit_type, name);
+                    if is_root {
+                        // No worker available — mark the unit as failed and emit
+                        // a failure completion so callers (e.g. systemctl) are
+                        // not left waiting forever for a JobRemoved signal.
+                        let mut state = allocator.write();
+                        let rt = state.runtime.entry(name.clone()).or_default();
+                        rt.active_state = ActiveState::Failed;
+                        rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.job_completion_tx {
+                            let _ = tx.send(JobCompletion {
+                                job_id: primary_job_id,
+                                unit_name: name.clone(),
+                                result: JobResultKind::Failed,
+                            });
+                        }
+                    }
                     continue;
                 }
             }
@@ -182,7 +198,21 @@ pub async fn enqueue_job(
         // Record the job and the task_id → job_kind mapping.
         {
             let mut state = allocator.write();
-            state.runtime.entry(name.clone()).or_default().load_state = "loaded".to_string();
+            let rt = state.runtime.entry(name.clone()).or_default();
+            rt.load_state = "loaded".to_string();
+            // Mark as activating/deactivating so the disconnect-cleanup code
+            // can transition the unit to Failed if the worker disconnects.
+            match kind {
+                JobKind::Start | JobKind::Restart => {
+                    rt.active_state = ActiveState::Activating;
+                    rt.sub_state = "start".to_string();
+                }
+                JobKind::Stop => {
+                    rt.active_state = ActiveState::Deactivating;
+                    rt.sub_state = "stop".to_string();
+                }
+                JobKind::Reload => {}
+            }
             state.jobs.insert(
                 job_id,
                 Job {
@@ -209,6 +239,20 @@ pub async fn enqueue_job(
             let mut state = allocator.write();
             if let Some(job) = state.jobs.get_mut(&job_id) {
                 job.status = JobStatus::Failed("Worker disconnected".to_string());
+            }
+            let rt = state.runtime.entry(name.clone()).or_default();
+            rt.active_state = ActiveState::Failed;
+            rt.sub_state = "failed".to_string();
+            // Emit failure so the caller (e.g. systemctl) doesn't hang
+            // waiting for a JobRemoved signal that will never arrive.
+            if is_root {
+                if let Some(ref tx) = state.job_completion_tx {
+                    let _ = tx.send(JobCompletion {
+                        job_id,
+                        unit_name: name.clone(),
+                        result: JobResultKind::Failed,
+                    });
+                }
             }
         }
     }

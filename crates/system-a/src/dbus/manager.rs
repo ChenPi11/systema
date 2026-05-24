@@ -5,6 +5,8 @@
 
 
 use anyhow::Result;
+use once_cell::sync::OnceCell;
+use std::sync::Arc;
 use tracing::info;
 use zbus::interface;
 use zvariant::OwnedObjectPath;
@@ -50,11 +52,24 @@ pub fn job_object_path(job_id: u64) -> OwnedObjectPath {
 /// The systemd1 Manager D-Bus interface.
 pub struct ManagerInterface {
     allocator: AllocatorHandle,
+    /// Connection reference set by `dbus::run` after the connection is built.
+    /// Used to register per-unit D-Bus objects synchronously so that
+    /// callers can read unit properties immediately after `LoadUnit`/`StartUnit`.
+    conn: Arc<OnceCell<zbus::Connection>>,
 }
 
 impl ManagerInterface {
-    pub fn new(allocator: AllocatorHandle) -> Self {
-        ManagerInterface { allocator }
+    pub fn new(allocator: AllocatorHandle, conn: Arc<OnceCell<zbus::Connection>>) -> Self {
+        ManagerInterface { allocator, conn }
+    }
+
+    /// Ensure the per-unit D-Bus object is registered for `name`.
+    /// This is a no-op if the object is already registered or the connection
+    /// is not yet available.
+    async fn ensure_unit_object(&self, name: &str) {
+        if let Some(conn) = self.conn.get() {
+            super::register_unit_object(conn, self.allocator.clone(), name).await;
+        }
     }
 }
 
@@ -108,8 +123,10 @@ impl ManagerInterface {
         if state.units.contains_key(name) {
             Ok(unit_object_path(name))
         } else {
-            Err(zbus::fdo::Error::Failed(format!(
-                "Unit {} not loaded",
+            // Return UnknownObject so that systemctl recognises the unit as
+            // "not in memory" and automatically falls back to LoadUnit.
+            Err(zbus::fdo::Error::UnknownObject(format!(
+                "Unit {} is not loaded",
                 name
             )))
         }
@@ -126,7 +143,12 @@ impl ManagerInterface {
         })
         .await
         {
-            Ok(Ok(_)) => Ok(unit_object_path(name)),
+            Ok(Ok(_)) => {
+                // Register the unit's D-Bus object synchronously so that
+                // property reads issued by the caller succeed immediately.
+                self.ensure_unit_object(name).await;
+                Ok(unit_object_path(name))
+            }
             Ok(Err(e)) => Err(zbus::fdo::Error::Failed(e.to_string())),
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
@@ -152,6 +174,11 @@ impl ManagerInterface {
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
+
+        // Ensure the per-unit D-Bus object is registered before returning the
+        // job path.  systemctl reads unit properties after the job completes,
+        // so the object must be in place by then.
+        self.ensure_unit_object(&name).await;
 
         let job_id = scheduler::enqueue_start(alloc.clone(), &name)
             .await
