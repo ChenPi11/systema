@@ -5,6 +5,7 @@
 //! - `org.freedesktop.systemd1.Unit` on each unit's object path
 
 pub mod manager;
+pub mod service_obj;
 pub mod unit_obj;
 
 use std::sync::Arc;
@@ -28,6 +29,10 @@ pub(super) async fn register_unit_object(
 ) {
     let path = manager::unit_object_path(unit_name);
     let obj = unit_obj::UnitObject {
+        allocator: allocator.clone(),
+        unit_name: unit_name.to_string(),
+    };
+    let service = service_obj::ServiceObject {
         allocator,
         unit_name: unit_name.to_string(),
     };
@@ -40,6 +45,15 @@ pub(super) async fn register_unit_object(
         }
         Err(e) => {
             warn!("Failed to register D-Bus object for {}: {}", unit_name, e);
+        }
+    }
+    match conn.object_server().at(path, service).await {
+        Ok(true) | Ok(false) => {}
+        Err(e) => {
+            warn!(
+                "Failed to register D-Bus service interface for {}: {}",
+                unit_name, e
+            );
         }
     }
 }
