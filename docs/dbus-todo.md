@@ -320,7 +320,7 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 | `UnitNew(id, unit)` | ❌ 未实现 | 单元加载时发出 |
 | `UnitRemoved(id, unit)` | ❌ 未实现 | 单元卸载时发出 |
 | `JobNew(id, job, unit)` | ❌ 未实现 | 作业创建时发出 |
-| `JobRemoved(id, job, unit, result)` | ❌ 未实现 | 作业完成时发出（带结果） |
+| `JobRemoved(id, job, unit, result)` | ⚠️ 部分实现 | 已在作业完成时发出；但 `Job` 对象本身未注册，且无 `JobNew` |
 | `StartupFinished(firmware, loader, kernel, initrd, userspace, total)` | ❌ 未实现 | 系统启动完成时发出 |
 | `UnitFilesChanged()` | ❌ 未实现 | 单元文件变更时发出 |
 | `Reloading(active)` | ❌ 未实现 | 重载开始/完成时发出 |
@@ -330,9 +330,9 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 ## 二、`org.freedesktop.systemd1.Unit`
 
 对象路径：`/org/freedesktop/systemd1/unit/<escaped_name>`
-实现文件：`crates/system-a/src/dbus/unit_obj.rs`（**占位文件，尚未实现**）
+实现文件：`crates/system-a/src/dbus/unit_obj.rs`
 
-> **当前状态：整个接口完全未实现。** 每个单元的 D-Bus 对象未被动态注册，`GetUnit`/`LoadUnit` 返回的对象路径在 D-Bus 上实际不存在。`unit_obj.rs` 文件是占位注释，无任何功能代码。
+> **当前状态：部分实现。** 单元对象已动态注册，`GetUnit`/`LoadUnit` 返回路径在 D-Bus 上可访问；但仅实现了少量方法与属性，且大量字段为固定值或空值。
 
 ### 2.1 方法（Methods）
 
@@ -349,7 +349,7 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 | `Kill(whom, signal)` | ❌ 未实现 | 向单元进程发送信号 |
 | `KillSubgroup(whom, subgroup, signal)` | ❌ 未实现 | 向 cgroup 子组发送信号 |
 | `QueueSignal(whom, signal, value)` | ❌ 未实现 | 发送带值的实时信号 |
-| `ResetFailed()` | ❌ 未实现 | 重置此单元的失败状态 |
+| `ResetFailed()` | ⚠️ 部分实现 | 可将 `failed` 状态重置为 `inactive/dead`，但行为未完全对齐 systemd |
 | `SetProperties(runtime, properties)` | ❌ 未实现 | 动态设置属性 |
 | `Ref()` | ❌ 未实现 | 增加引用计数 |
 | `Unref()` | ❌ 未实现 | 减少引用计数 |
@@ -362,60 +362,30 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 
 ### 2.2 属性（Properties）
 
-以下所有 Unit 接口属性均未实现：
+已实现（部分）属性（存在但部分为固定值/空值）：
 
 | 属性名 | 状态 |
 |--------|------|
-| `Id` | ❌ 未实现 |
-| `Names` | ❌ 未实现 |
-| `Following` | ❌ 未实现 |
-| `Requires` / `Requisite` / `Wants` / `BindsTo` / `PartOf` / `Upholds` | ❌ 未实现 |
-| `Conflicts` / `Before` / `After` | ❌ 未实现 |
-| `RequiredBy` / `RequisiteOf` / `WantedBy` / `BoundBy` / `UpheldBy` | ❌ 未实现 |
-| `ConflictedBy` / `ConsistsOf` | ❌ 未实现 |
-| `OnSuccess` / `OnSuccessOf` / `OnFailure` / `OnFailureOf` | ❌ 未实现 |
-| `Triggers` / `TriggeredBy` | ❌ 未实现 |
-| `PropagatesReloadTo` / `ReloadPropagatedFrom` | ❌ 未实现 |
-| `PropagatesStopTo` / `StopPropagatedFrom` | ❌ 未实现 |
-| `JoinsNamespaceOf` | ❌ 未实现 |
-| `Description` | ❌ 未实现 |
-| `Documentation` | ❌ 未实现 |
-| `LoadState` | ❌ 未实现 |
-| `ActiveState` | ❌ 未实现 |
-| `FreezerState` | ❌ 未实现 |
-| `SubState` | ❌ 未实现 |
-| `FragmentPath` | ❌ 未实现 |
-| `SourcePath` | ❌ 未实现 |
-| `DropInPaths` | ❌ 未实现 |
-| `UnitFileState` | ❌ 未实现 |
-| `UnitFilePreset` | ❌ 未实现 |
-| `StateChangeTimestamp` / `StateChangeTimestampMonotonic` | ❌ 未实现 |
-| `InactiveExitTimestamp` / `...Monotonic` | ❌ 未实现 |
-| `ActiveEnterTimestamp` / `...Monotonic` | ❌ 未实现 |
-| `ActiveExitTimestamp` / `...Monotonic` | ❌ 未实现 |
-| `InactiveEnterTimestamp` / `...Monotonic` | ❌ 未实现 |
-| `CanStart` / `CanStop` / `CanReload` / `CanIsolate` / `CanFreeze` / `CanClean` | ❌ 未实现 |
-| `Job` | ❌ 未实现 |
-| `StopWhenUnneeded` | ❌ 未实现 |
-| `RefuseManualStart` / `RefuseManualStop` | ❌ 未实现 |
-| `AllowIsolate` | ❌ 未实现 |
-| `DefaultDependencies` | ❌ 未实现 |
-| `OnSuccessJobMode` / `OnFailureJobMode` | ❌ 未实现 |
-| `IgnoreOnIsolate` | ❌ 未实现 |
-| `NeedDaemonReload` | ❌ 未实现 |
-| `Markers` | ❌ 未实现 |
-| `JobTimeoutUSec` / `JobRunningTimeoutUSec` / `JobTimeoutAction` | ❌ 未实现 |
-| `StartLimitIntervalUSec` / `StartLimitBurst` / `StartLimitAction` | ❌ 未实现 |
-| `RebootArgument` | ❌ 未实现 |
-| `ConditionResult` / `AssertResult` | ❌ 未实现 |
-| `ConditionTimestamp` / `AssertTimestamp` | ❌ 未实现 |
-| `Conditions` / `Asserts` | ❌ 未实现 |
-| `TransientPath` | ❌ 未实现 |
-| `Perpetual` | ❌ 未实现 |
-| `CollectMode` | ❌ 未实现 |
-| `InvocationID` | ❌ 未实现 |
-| `AccessSELinuxContext` | ❌ 未实现 |
-| cgroup 相关属性（MemoryPressureWatch、CPUWeight、MemoryMax 等） | ❌ 未实现 |
+| `Id` / `Names` / `Description` / `Following` | ⚠️ 部分实现 |
+| `LoadState` / `ActiveState` / `SubState` | ⚠️ 部分实现 |
+| `Requires` / `Wants` / `After` / `Before` | ⚠️ 部分实现 |
+| `FragmentPath` / `SourcePath` | ⚠️ 部分实现 |
+| `UnitFileState` / `UnitFilePreset` | ⚠️ 部分实现 |
+| `Job` | ⚠️ 部分实现 |
+| `CanStart` / `CanStop` / `CanReload` / `CanIsolate` / `CanFreeze` | ⚠️ 部分实现 |
+| `NeedDaemonReload` / `JobTimeoutUSec` / `JobRunningTimeoutUSec` | ⚠️ 部分实现 |
+| `ConditionResult` / `AssertResult` / `ActivationDetails` / `Refs` / `Transient` / `Perpetual` | ⚠️ 部分实现 |
+
+主要仍未实现属性（非完整列表）：
+
+| 属性名 | 状态 |
+|--------|------|
+| 依赖反向关系与传播类（`RequiredBy`、`RequisiteOf`、`PropagatesStopTo` 等） | ❌ 未实现 |
+| 时间戳类（`StateChangeTimestamp`、`ActiveEnterTimestamp` 等） | ❌ 未实现 |
+| 作业策略类（`JobTimeoutAction`、`OnSuccessJobMode`、`OnFailureJobMode` 等） | ❌ 未实现 |
+| 启停限制类（`StartLimitIntervalUSec`、`StartLimitBurst`、`StartLimitAction`） | ❌ 未实现 |
+| 条件明细类（`ConditionTimestamp`、`Conditions`、`Asserts`） | ❌ 未实现 |
+| 其余 cgroup / SELinux / CollectMode / InvocationID 等高级属性 | ❌ 未实现 |
 
 ### 2.3 信号（Signals）
 
@@ -423,7 +393,7 @@ Unit 接口本身无额外信号，属性变更通知通过标准 `PropertiesCha
 
 | 信号名 | 状态 |
 |--------|------|
-| `PropertiesChanged`（来自 `org.freedesktop.DBus.Properties`） | ❌ 未实现 |
+| `PropertiesChanged`（来自 `org.freedesktop.DBus.Properties`） | ⚠️ 部分实现 |
 
 ---
 
@@ -431,7 +401,7 @@ Unit 接口本身无额外信号，属性变更通知通过标准 `PropertiesCha
 
 对象路径：`/org/freedesktop/systemd1/unit/<service_name>`
 
-> **当前状态：整个接口完全未实现。** 服务单元对象未被注册为 D-Bus 对象。
+> **当前状态：部分实现。** 服务单元路径已注册 `org.freedesktop.systemd1.Service` 接口，但仅覆盖少量属性。
 
 ### 3.1 方法（Methods）
 
@@ -441,35 +411,35 @@ Unit 接口本身无额外信号，属性变更通知通过标准 `PropertiesCha
 | `MountImage(source, destination, read_only, mkdir, options)` | ❌ 未实现 | 动态挂载镜像到服务命名空间 |
 | `DumpFileDescriptorStore()` | ❌ 未实现 | 转储 FD 存储内容 |
 
-以及全部继承自 `Unit` 的方法（均未实现）。
+以及继承自 `Unit` 的方法（大多未实现，见上节）。
 
 ### 3.2 属性（Properties，Service 专有）
 
 | 属性名 | 状态 |
 |--------|------|
-| `Type` | ❌ 未实现 |
+| `Type` | ⚠️ 部分实现 |
 | `ExitType` | ❌ 未实现 |
-| `Restart` | ❌ 未实现 |
+| `Restart` | ⚠️ 部分实现 |
 | `RestartMode` | ❌ 未实现 |
 | `RemainAfterExit` | ❌ 未实现 |
 | `GuessMainPID` | ❌ 未实现 |
 | `RootDirectoryStartOnly` | ❌ 未实现 |
 | `OOMPolicy` | ❌ 未实现 |
 | `PIDFile` | ❌ 未实现 |
-| `BusName` | ❌ 未实现 |
-| `NotifyAccess` | ❌ 未实现 |
-| `MainPID` | ❌ 未实现 |
-| `ControlPID` | ❌ 未实现 |
+| `BusName` | ⚠️ 部分实现 |
+| `NotifyAccess` | ⚠️ 部分实现 |
+| `MainPID` | ⚠️ 部分实现 |
+| `ControlPID` | ⚠️ 部分实现 |
 | `UID` / `GID` | ❌ 未实现 |
 | `TimeoutStartUSec` / `TimeoutStopUSec` / `TimeoutAbortUSec` | ❌ 未实现 |
 | `TimeoutStartFailureMode` / `TimeoutStopFailureMode` | ❌ 未实现 |
 | `RuntimeMaxUSec` / `RuntimeRandomizedExtraUSec` | ❌ 未实现 |
 | `WatchdogUSec` | ❌ 未实现 |
-| `RestartUSec` / `RestartSteps` / `RestartMaxDelayUSec` / `RestartUSecNext` | ❌ 未实现 |
+| `RestartUSec` / `RestartSteps` / `RestartMaxDelayUSec` / `RestartUSecNext` | ⚠️ 部分实现 |
 | `NRestarts` | ❌ 未实现 |
 | `RestartPreventExitStatus` / `RestartForceExitStatus` / `SuccessExitStatus` | ❌ 未实现 |
 | `StatusText` / `StatusErrno` / `StatusBusError` / `StatusVarlinkError` | ❌ 未实现 |
-| `Result` / `ReloadResult` / `CleanResult` / `LiveMountResult` | ❌ 未实现 |
+| `Result` / `ReloadResult` / `CleanResult` / `LiveMountResult` | ⚠️ 部分实现 |
 | `FileDescriptorStoreMax` / `NFileDescriptorStore` / `FileDescriptorStorePreserve` | ❌ 未实现 |
 | `ExecCondition` / `ExecStartPre` / `ExecStart` / `ExecStartPost` | ❌ 未实现 |
 | `ExecReload` / `ExecStop` / `ExecStopPost` | ❌ 未实现 |
@@ -484,9 +454,9 @@ Unit 接口本身无额外信号，属性变更通知通过标准 `PropertiesCha
 
 ## 四、`org.freedesktop.systemd1.Target`（继承自 Unit）
 
-> **当前状态：整个接口完全未实现。** Target 单元对象未被注册为 D-Bus 对象。
+> **当前状态：部分实现。** Target 相关对象路径存在基础 `Unit` 接口能力，但 Target 专有接口未实现。
 >
-> 注：Target 接口本身无额外方法和属性，全部继承自 `Unit`（均未实现）。
+> 注：Target 单元会注册基础 `Unit` 对象；但 `org.freedesktop.systemd1.Target` 专有接口尚未单独注册。
 
 ---
 

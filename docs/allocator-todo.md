@@ -159,11 +159,11 @@
 | `org.freedesktop.systemd1.Manager` 接口注册（`/org/freedesktop/systemd1`） | ✅ 完全实现 | |
 | 核心管理方法（Start/Stop/Restart/Reload/ListUnits 等） | ⚠️ 部分实现 | 详见 `dbus-todo.md` |
 | 管理器属性（Version/Architecture/NNames 等） | ⚠️ 部分实现 | 大量属性为固定值，详见 `dbus-todo.md` |
-| 每单元 D-Bus 对象动态注册（`Unit`/`Service`/`Target` 接口） | ❌ 未实现 | `unit_obj.rs` 仅为占位注释 |
-| 每作业 D-Bus 对象动态注册（`Job` 接口） | ❌ 未实现 | |
-| D-Bus 信号（`UnitNew`/`UnitRemoved`/`JobNew`/`JobRemoved`/`StartupFinished`） | ❌ 未实现 | |
+| 每单元 D-Bus 对象动态注册（`Unit`/`Service`/`Target` 接口） | ⚠️ 部分实现 | 已动态注册 `Unit`/`Service`；`Target` 接口尚未注册 |
+| 每作业 D-Bus 对象动态注册（`Job` 接口） | ❌ 未实现 | `job/<id>` 对象路径尚未注册实际对象 |
+| D-Bus 信号（`UnitNew`/`UnitRemoved`/`JobNew`/`JobRemoved`/`StartupFinished`） | ⚠️ 部分实现 | 已发出 `JobRemoved`，其余信号未实现 |
 | polkit 权限检查 | ❌ 未实现 | 所有方法无访问控制 |
-| `org.freedesktop.DBus.Properties` 标准接口 | ⚠️ 部分实现 | zbus 自动为 Manager 生成，但单元对象未注册 |
+| `org.freedesktop.DBus.Properties` 标准接口 | ⚠️ 部分实现 | zbus 自动为 Manager 和已注册 Unit/Service 对象提供 |
 | `org.freedesktop.DBus.Introspectable` 标准接口 | ⚠️ 部分实现 | zbus 自动为 Manager 生成 |
 | `org.freedesktop.DBus.ObjectManager` 接口 | ❌ 未实现 | 无法枚举所有 D-Bus 对象 |
 | `PropertiesChanged` 信号（属性变更通知） | ❌ 未实现 | |
