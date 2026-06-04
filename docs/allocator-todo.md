@@ -100,7 +100,7 @@
 | 事件总线：`process.exit` 触发自动重启 | ⚠️ 部分实现 | 接收到 `process.exit` 事件会更新状态为 inactive，但不触发重启 |
 | 重启策略执行（`Restart=on-failure/always`） | ❌ 未实现 | Phase 2 功能 |
 | 重启限流（`StartLimitIntervalSec=`/`StartLimitBurst=`） | ❌ 未实现 | |
-| `D-Bus JobNew / JobRemoved` 信号发出 | ❌ 未实现 | |
+| `D-Bus JobNew / JobRemoved` 信号发出 | ⚠️ 部分实现 | 已发出 `JobRemoved`；`JobNew` 仍未实现 |
 
 ---
 
@@ -159,8 +159,8 @@
 | `org.freedesktop.systemd1.Manager` 接口注册（`/org/freedesktop/systemd1`） | ✅ 完全实现 | |
 | 核心管理方法（Start/Stop/Restart/Reload/ListUnits 等） | ⚠️ 部分实现 | 详见 `dbus-todo.md` |
 | 管理器属性（Version/Architecture/NNames 等） | ⚠️ 部分实现 | 大量属性为固定值，详见 `dbus-todo.md` |
-| 每单元 D-Bus 对象动态注册（`Unit`/`Service`/`Target` 接口） | ⚠️ 部分实现 | 已动态注册 `Unit`/`Service`；`Target` 接口尚未注册 |
-| 每作业 D-Bus 对象动态注册（`Job` 接口） | ❌ 未实现 | `job/<id>` 对象路径尚未注册实际对象 |
+| 每单元 D-Bus 对象动态注册（`Unit`/`Service`/`Target` 接口） | ⚠️ 部分实现 | 已动态注册基础 `Unit` 与 `Service`；`Target` 专有接口尚未注册 |
+| 每作业 D-Bus 对象动态注册（`Job` 接口） | ❌ 未实现 | 管理方法会返回 `job/<id>` 路径，但该路径未注册 `Job` 对象 |
 | D-Bus 信号（`UnitNew`/`UnitRemoved`/`JobNew`/`JobRemoved`/`StartupFinished`） | ⚠️ 部分实现 | 已发出 `JobRemoved`，其余信号未实现 |
 | polkit 权限检查 | ❌ 未实现 | 所有方法无访问控制 |
 | `org.freedesktop.DBus.Properties` 标准接口 | ⚠️ 部分实现 | zbus 自动为 Manager 和已注册 Unit/Service 对象提供 |

@@ -464,7 +464,7 @@ Unit 接口本身无额外信号，属性变更通知通过标准 `PropertiesCha
 
 对象路径：`/org/freedesktop/systemd1/job/<job_id>`
 
-> **当前状态：整个接口完全未实现。** 作业的 D-Bus 对象未被动态注册。`ListJobs` 和 `StartUnit` 等方法返回的作业对象路径在 D-Bus 上实际不存在。
+> **当前状态：整个接口完全未实现。** 作业的 D-Bus 对象未被动态注册。`ListJobs`、`StartUnit` 与 `JobRemoved` 信号中出现的作业路径仅为引用值，在 D-Bus 上不可解析为实际 `Job` 对象。
 
 ### 5.1 属性（Properties）
 
