@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 use crate::state::{
     ActiveState, AllocatorHandle, Job, JobCompletion, JobKind, JobResult, JobResultKind,
-    JobStatus, WorkerTask, next_job_id, next_task_id,
+    JobStatus, UnitRuntimeInfo, WorkerTask, next_job_id, next_task_id,
 };
 use crate::unit::types::{UnitFile, UnitKind};
 
@@ -40,6 +40,73 @@ pub async fn enqueue_job(
 ) -> Result<u64> {
     info!("Scheduling {:?} for {}", kind, unit_name);
 
+    // --- Requisite check: all Requisite= deps must already be active ---
+    if matches!(kind, JobKind::Start | JobKind::Restart) {
+        let requisite_check = {
+            let state = allocator.read();
+            if let Some(unit) = state.units.get(unit_name) {
+                let mut failed_requisites = Vec::new();
+                for req in &unit.unit.requisite {
+                    let is_active = state.runtime.get(req.as_str())
+                        .map(|rt| matches!(rt.active_state, ActiveState::Active))
+                        .unwrap_or(false);
+                    if !is_active {
+                        failed_requisites.push(req.clone());
+                    }
+                }
+                if failed_requisites.is_empty() {
+                    None
+                } else {
+                    Some(failed_requisites)
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(failed) = requisite_check {
+            warn!(
+                "Requisite check failed for {}: required units not active: {:?}",
+                unit_name, failed
+            );
+            let job_id = next_job_id();
+            let mut state = allocator.write();
+            let rt = state.runtime.entry(unit_name.to_string()).or_default();
+            rt.active_state = ActiveState::Failed;
+            rt.sub_state = "failed".to_string();
+            if let Some(ref tx) = state.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id,
+                    unit_name: unit_name.to_string(),
+                    result: JobResultKind::Dependency,
+                });
+            }
+            return Ok(job_id);
+        }
+    }
+
+    // --- Conflicts handling: stop conflicting units when starting ---
+    if matches!(kind, JobKind::Start | JobKind::Restart) {
+        let conflicts: Vec<String> = {
+            let state = allocator.read();
+            state.units.get(unit_name)
+                .map(|u| u.unit.conflicts.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        for conflict in conflicts {
+            let is_active = {
+                let state = allocator.read();
+                state.runtime.get(conflict.as_str())
+                    .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                    .unwrap_or(false)
+            };
+            if is_active {
+                info!("Stopping conflicting unit {} before starting {}", conflict, unit_name);
+                // Use Box::pin to handle the recursive async call.
+                Box::pin(enqueue_job(allocator.clone(), &conflict, JobKind::Stop)).await?;
+            }
+        }
+    }
+
     // Determine which units to activate in dependency order.
     let units_to_process = {
         let state = allocator.read();
@@ -48,11 +115,12 @@ pub async fn enqueue_job(
                 compute_start_order(&state.units, unit_name)
             }
             JobKind::Stop => {
-                // For stop, we just stop the requested unit (and dependents if needed).
-                vec![unit_name.to_string()]
+                // For stop, compute reverse dependencies to propagate the stop.
+                compute_stop_order(&state.units, &state.runtime, unit_name)
             }
             JobKind::Reload => {
-                vec![unit_name.to_string()]
+                // Propagate reload to units declared in PropagatesReloadTo=.
+                compute_reload_order(&state.units, unit_name)
             }
         }
     };
@@ -260,6 +328,67 @@ pub async fn enqueue_job(
     Ok(primary_job_id)
 }
 
+/// Compute the order in which units should be stopped.
+/// This includes the requested unit plus all units that have a hard dependency
+/// on it (Requires=, BindsTo=, PartOf=).
+fn compute_stop_order(
+    units: &std::collections::HashMap<String, UnitFile>,
+    runtime: &std::collections::HashMap<String, UnitRuntimeInfo>,
+    root: &str,
+) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut result = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![root.to_string()];
+
+    while let Some(name) = stack.pop() {
+        if visited.contains(&name) {
+            continue;
+        }
+        visited.insert(name.clone());
+        result.push(name.clone());
+
+        // Find all units that have Requires=name, BindsTo=name, or PartOf=name
+        // and are currently active — they must be stopped too.
+        for (other_name, other_unit) in units {
+            if visited.contains(other_name) {
+                continue;
+            }
+            let depends_on_name = other_unit.unit.requires.contains(&name)
+                || other_unit.unit.binds_to.contains(&name)
+                || other_unit.unit.part_of.contains(&name);
+            if depends_on_name {
+                let is_active = runtime.get(other_name.as_str())
+                    .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                    .unwrap_or(false);
+                if is_active {
+                    stack.push(other_name.clone());
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Compute the reload propagation order.
+/// Includes the root unit plus all units listed in its PropagatesReloadTo=.
+fn compute_reload_order(
+    units: &std::collections::HashMap<String, UnitFile>,
+    root: &str,
+) -> Vec<String> {
+    let mut result = vec![root.to_string()];
+    if let Some(unit) = units.get(root) {
+        for target in &unit.unit.propagates_reload_to {
+            if !result.contains(target) {
+                result.push(target.clone());
+            }
+        }
+    }
+    result
+}
+
 /// Compute the order in which units should be started, respecting After/Before.
 fn compute_start_order(
     units: &std::collections::HashMap<String, UnitFile>,
@@ -271,7 +400,7 @@ fn compute_start_order(
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
 
-    // Collect all units reachable via Requires/Wants from root.
+    // Collect all units reachable via Requires/Wants/Requisite/BindsTo/Upholds from root.
     queue.push_back(root.to_string());
     let mut reachable = HashSet::new();
     while let Some(name) = queue.pop_front() {
@@ -280,7 +409,11 @@ fn compute_start_order(
         }
         reachable.insert(name.clone());
         if let Some(unit) = units.get(&name) {
-            for dep in unit.unit.requires.iter().chain(unit.unit.wants.iter()) {
+            for dep in unit.unit.requires.iter()
+                .chain(unit.unit.wants.iter())
+                .chain(unit.unit.requisite.iter())
+                .chain(unit.unit.binds_to.iter())
+            {
                 queue.push_back(dep.clone());
             }
         }
@@ -339,68 +472,169 @@ pub fn handle_task_result(
     unit_name: &str,
     kind: JobKind,
 ) {
-    let mut state = allocator.write();
+    // Collect dependency-related actions that need async scheduling BEFORE
+    // taking the write lock.  We'll collect them and spawn them afterwards.
+    let mut post_actions: Vec<PostAction> = Vec::new();
 
-    // Clean up the task_id → kind mapping.
-    state.task_kinds.remove(&task_id);
+    {
+        let mut state = allocator.write();
 
-    // Update active state based on task kind and success.
-    let rt = state.runtime.entry(unit_name.to_string()).or_default();
-    if success {
-        rt.active_state = match kind {
-            JobKind::Start | JobKind::Restart => ActiveState::Active,
-            JobKind::Stop => ActiveState::Inactive,
-            JobKind::Reload => ActiveState::Active,
-        };
-        rt.sub_state = if kind == JobKind::Stop {
-            "dead".to_string()
-        } else {
-            "running".to_string()
-        };
-    } else {
-        rt.active_state = ActiveState::Failed;
-        rt.sub_state = "failed".to_string();
-    }
+        // Clean up the task_id → kind mapping.
+        state.task_kinds.remove(&task_id);
 
-    // Find and update the associated job.
-    let job_id = state
-        .jobs
-        .values()
-        .find(|j| j.unit_name == unit_name && matches!(j.status, JobStatus::Running))
-        .map(|j| j.id);
-
-    if let Some(jid) = job_id {
-        let result_kind = if success {
-            JobResultKind::Done
-        } else {
-            JobResultKind::Failed
-        };
-        let result = JobResult {
-            job_id: jid,
-            unit_name: unit_name.to_string(),
-            result: result_kind.clone(),
-        };
-        if let Some(job) = state.jobs.get_mut(&jid) {
-            job.status = if success {
-                JobStatus::Done
-            } else {
-                JobStatus::Failed(message.to_string())
+        // Update active state based on task kind and success.
+        let rt = state.runtime.entry(unit_name.to_string()).or_default();
+        if success {
+            rt.active_state = match kind {
+                JobKind::Start | JobKind::Restart => ActiveState::Active,
+                JobKind::Stop => ActiveState::Inactive,
+                JobKind::Reload => ActiveState::Active,
             };
-            // Notify D-Bus waiter if present.
-            if let Some(tx) = job.completion_tx.take() {
-                let _ = tx.send(result);
-            }
+            rt.sub_state = if kind == JobKind::Stop {
+                "dead".to_string()
+            } else {
+                "running".to_string()
+            };
+        } else {
+            rt.active_state = ActiveState::Failed;
+            rt.sub_state = "failed".to_string();
         }
-        // Notify the D-Bus signal emitter so it can send JobRemoved to subscribers
-        // (e.g. systemctl waits for this signal before returning to the user).
-        if let Some(ref tx) = state.job_completion_tx {
-            let _ = tx.send(JobCompletion {
+
+        // Find and update the associated job.
+        let job_id = state
+            .jobs
+            .values()
+            .find(|j| j.unit_name == unit_name && matches!(j.status, JobStatus::Running))
+            .map(|j| j.id);
+
+        if let Some(jid) = job_id {
+            let result_kind = if success {
+                JobResultKind::Done
+            } else {
+                JobResultKind::Failed
+            };
+            let result = JobResult {
                 job_id: jid,
                 unit_name: unit_name.to_string(),
-                result: result_kind,
-            });
+                result: result_kind.clone(),
+            };
+            if let Some(job) = state.jobs.get_mut(&jid) {
+                job.status = if success {
+                    JobStatus::Done
+                } else {
+                    JobStatus::Failed(message.to_string())
+                };
+                // Notify D-Bus waiter if present.
+                if let Some(tx) = job.completion_tx.take() {
+                    let _ = tx.send(result);
+                }
+            }
+            // Notify the D-Bus signal emitter so it can send JobRemoved to subscribers
+            // (e.g. systemctl waits for this signal before returning to the user).
+            if let Some(ref tx) = state.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id: jid,
+                    unit_name: unit_name.to_string(),
+                    result: result_kind,
+                });
+            }
         }
+
+        // --- BindsTo= lifecycle binding ---
+        // If a unit that others BindsTo stops or fails, stop those units.
+        if matches!(kind, JobKind::Stop) || !success {
+            for (other_name, other_unit) in &state.units {
+                if other_unit.unit.binds_to.contains(unit_name) {
+                    let is_active = state.runtime.get(other_name.as_str())
+                        .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                        .unwrap_or(false);
+                    if is_active {
+                        post_actions.push(PostAction::Stop(other_name.clone()));
+                    }
+                }
+            }
+        }
+
+        // --- PartOf= stop propagation ---
+        // If a unit stops, stop all units that have PartOf= pointing to it.
+        if matches!(kind, JobKind::Stop) {
+            for (other_name, other_unit) in &state.units {
+                if other_unit.unit.part_of.contains(unit_name) {
+                    let is_active = state.runtime.get(other_name.as_str())
+                        .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                        .unwrap_or(false);
+                    if is_active {
+                        post_actions.push(PostAction::Stop(other_name.clone()));
+                    }
+                }
+            }
+        }
+
+        // --- OnSuccess= / OnFailure= triggers ---
+        if let Some(unit) = state.units.get(unit_name) {
+            if success && matches!(kind, JobKind::Start | JobKind::Restart) {
+                for target in &unit.unit.on_success {
+                    post_actions.push(PostAction::Start(target.clone()));
+                }
+            }
+            if !success {
+                for target in &unit.unit.on_failure {
+                    post_actions.push(PostAction::Start(target.clone()));
+                }
+            }
+        }
+
+        // --- Upholds= continuous activation ---
+        // If a unit that someone Upholds= becomes inactive/failed, restart it.
+        if (!success || matches!(kind, JobKind::Stop))
+            && matches!(
+                state.runtime.get(unit_name).map(|rt| &rt.active_state),
+                Some(ActiveState::Inactive) | Some(ActiveState::Failed)
+            )
+        {
+            for (_other_name, other_unit) in &state.units {
+                if other_unit.unit.upholds.contains(unit_name) {
+                    // The upholder wants this unit to stay active — restart it.
+                    let upholder_active = state.runtime.get(_other_name.as_str())
+                        .map(|rt| matches!(rt.active_state, ActiveState::Active))
+                        .unwrap_or(false);
+                    if upholder_active {
+                        post_actions.push(PostAction::Start(unit_name.to_string()));
+                        break; // one restart is enough
+                    }
+                }
+            }
+        }
+    } // drop write lock
+
+    // Execute post-actions asynchronously (these need the lock released).
+    if !post_actions.is_empty() {
+        let alloc = allocator.clone();
+        tokio::spawn(async move {
+            for action in post_actions {
+                match action {
+                    PostAction::Stop(name) => {
+                        info!("Propagating stop to {}", name);
+                        if let Err(e) = enqueue_job(alloc.clone(), &name, JobKind::Stop).await {
+                            warn!("Failed to propagate stop to {}: {}", name, e);
+                        }
+                    }
+                    PostAction::Start(name) => {
+                        info!("Triggering start for {}", name);
+                        if let Err(e) = enqueue_job(alloc.clone(), &name, JobKind::Start).await {
+                            warn!("Failed to trigger start for {}: {}", name, e);
+                        }
+                    }
+                }
+            }
+        });
     }
+}
+
+/// Post-processing actions to be taken after a task result is handled.
+enum PostAction {
+    Stop(String),
+    Start(String),
 }
 
 /// Build a `TaskDispatch` protobuf from a `WorkerTask`.

@@ -131,6 +131,21 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection) -> Result<()> {
     let binds_to = get_str(config, "unit", "bindsto");
     unit.binds_to = split_list(&binds_to);
 
+    let requisite = get_str(config, "unit", "requisite");
+    unit.requisite = split_list(&requisite);
+
+    let upholds = get_str(config, "unit", "upholds");
+    unit.upholds = split_list(&upholds);
+
+    let on_success = get_str(config, "unit", "onsuccess");
+    unit.on_success = split_list(&on_success);
+
+    let on_failure = get_str(config, "unit", "onfailure");
+    unit.on_failure = split_list(&on_failure);
+
+    let propagates_reload_to = get_str(config, "unit", "propagatesreloadto");
+    unit.propagates_reload_to = split_list(&propagates_reload_to);
+
     Ok(())
 }
 

@@ -61,6 +61,16 @@ pub struct UnitSection {
     pub part_of: HashSet<String>,
     /// Bind the lifecycle to these units (if they stop, stop this one).
     pub binds_to: HashSet<String>,
+    /// Like Requires but the dependency must already be active (not started).
+    pub requisite: HashSet<String>,
+    /// Continuously maintain activation of these units.
+    pub upholds: HashSet<String>,
+    /// Units to activate when this unit succeeds.
+    pub on_success: HashSet<String>,
+    /// Units to activate when this unit fails.
+    pub on_failure: HashSet<String>,
+    /// When this unit is reloaded, also reload these units.
+    pub propagates_reload_to: HashSet<String>,
     /// Condition checks — not enforced in Phase 1 but parsed.
     pub condition_path_exists: Vec<String>,
     pub default_dependencies: bool,

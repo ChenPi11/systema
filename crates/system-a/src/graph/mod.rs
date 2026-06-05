@@ -8,16 +8,27 @@ use std::collections::HashMap;
 use anyhow::{bail, Result};
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
-use tracing::debug;
+use petgraph::visit::EdgeRef;
+use tracing::{debug, warn};
 
 use crate::unit::types::UnitFile;
+
+/// Edge weight indicating how strong the ordering dependency is.
+/// Used for cycle-breaking: weak edges (Wants, After) are removed first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// Strong ordering (Requires, Requisite, BindsTo) — harder to break.
+    Strong,
+    /// Weak ordering (Wants, After, Before) — preferred for cycle-breaking.
+    Weak,
+}
 
 /// A resolved dependency graph.
 #[derive(Debug)]
 pub struct DependencyGraph {
     /// The underlying directed graph. Edges go from dependency to dependent
     /// (i.e., edge A→B means "A must start before B").
-    graph: DiGraph<String, ()>,
+    graph: DiGraph<String, EdgeKind>,
     /// Maps unit name → node index.
     index: HashMap<String, NodeIndex>,
 }
@@ -36,41 +47,63 @@ impl DependencyGraph {
             index.insert(unit.name.clone(), node);
         }
 
+        // Helper: get or create a node for a dependency name.
+        let get_or_create_node =
+            |graph: &mut DiGraph<String, EdgeKind>,
+             index: &mut HashMap<String, NodeIndex>,
+             name: &str|
+             -> NodeIndex {
+                if let Some(&n) = index.get(name) {
+                    n
+                } else {
+                    let n = graph.add_node(name.to_string());
+                    index.insert(name.to_string(), n);
+                    n
+                }
+            };
+
         // Second pass: add dependency edges.
         for unit in &units {
             let Some(&unit_node) = index.get(&unit.name) else {
                 continue;
             };
 
-            // `After=X` means X must start before this unit → edge X→unit.
+            // `After=X` means X must start before this unit → edge X→unit (Weak).
             for dep in &unit.unit.after {
-                if let Some(&dep_node) = index.get(dep) {
-                    if !graph.contains_edge(dep_node, unit_node) {
-                        graph.add_edge(dep_node, unit_node, ());
-                    }
-                } else {
-                    // Add a placeholder node for unknown units.
-                    let dep_node = graph.add_node(dep.clone());
-                    index.insert(dep.clone(), dep_node);
-                    graph.add_edge(dep_node, unit_node, ());
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(dep_node, unit_node) {
+                    graph.add_edge(dep_node, unit_node, EdgeKind::Weak);
                 }
             }
 
-            // `Before=X` means this unit must start before X → edge unit→X.
+            // `Before=X` means this unit must start before X → edge unit→X (Weak).
             for dep in &unit.unit.before {
-                if let Some(&dep_node) = index.get(dep) {
-                    if !graph.contains_edge(unit_node, dep_node) {
-                        graph.add_edge(unit_node, dep_node, ());
-                    }
-                } else {
-                    let dep_node = graph.add_node(dep.clone());
-                    index.insert(dep.clone(), dep_node);
-                    graph.add_edge(unit_node, dep_node, ());
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(unit_node, dep_node) {
+                    graph.add_edge(unit_node, dep_node, EdgeKind::Weak);
+                }
+            }
+
+            // `Requisite=X` implies ordering edge X→unit (Strong).
+            // At scheduling time, X must already be active (not started for it).
+            for dep in &unit.unit.requisite {
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(dep_node, unit_node) {
+                    graph.add_edge(dep_node, unit_node, EdgeKind::Strong);
+                }
+            }
+
+            // `BindsTo=X` implies ordering edge X→unit (Strong).
+            for dep in &unit.unit.binds_to {
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(dep_node, unit_node) {
+                    graph.add_edge(dep_node, unit_node, EdgeKind::Strong);
                 }
             }
 
             // `Requires=` and `Wants=` are dependency declarations but don't
             // imply ordering by themselves (ordering is via After/Before).
+            // However, if combined with After, the edge is already present.
         }
 
         DependencyGraph { graph, index }
@@ -78,22 +111,67 @@ impl DependencyGraph {
 
     /// Return a topological ordering of all units.
     ///
-    /// Units earlier in the list must be started first. Returns an error if
-    /// there is a cycle in the dependency graph.
+    /// Units earlier in the list must be started first. If there is a cycle,
+    /// this method attempts to break it by removing weak edges (mimicking
+    /// systemd's cycle-breaking behavior). Returns an error only if a cycle
+    /// consists entirely of strong edges and cannot be broken.
     pub fn topological_order(&self) -> Result<Vec<String>> {
-        match toposort(&self.graph, None) {
-            Ok(nodes) => {
-                let names = nodes
-                    .into_iter()
-                    .map(|n| self.graph[n].clone())
-                    .collect();
-                Ok(names)
-            }
-            Err(cycle) => {
-                let name = &self.graph[cycle.node_id()];
-                bail!("Dependency cycle detected involving unit: {}", name)
+        // Try the fast path first.
+        if let Ok(nodes) = toposort(&self.graph, None) {
+            let names = nodes.into_iter().map(|n| self.graph[n].clone()).collect();
+            return Ok(names);
+        }
+
+        // There is at least one cycle — attempt to break it.
+        let mut graph = self.graph.clone();
+        let max_attempts = graph.edge_count();
+
+        for _ in 0..max_attempts {
+            match toposort(&graph, None) {
+                Ok(nodes) => {
+                    let names = nodes.into_iter().map(|n| graph[n].clone()).collect();
+                    return Ok(names);
+                }
+                Err(cycle) => {
+                    let cycle_node = cycle.node_id();
+                    // Find a weak back-edge involving the cycle node and remove it.
+                    let weak_edge = graph
+                        .edges_directed(cycle_node, petgraph::Direction::Incoming)
+                        .find(|e| *e.weight() == EdgeKind::Weak)
+                        .map(|e| e.id());
+
+                    if let Some(eid) = weak_edge {
+                        let (src, tgt) = graph.edge_endpoints(eid).unwrap();
+                        warn!(
+                            "Breaking dependency cycle: removing weak edge {} → {}",
+                            graph[src], graph[tgt]
+                        );
+                        graph.remove_edge(eid);
+                    } else {
+                        // No weak edge to remove — try any incoming edge.
+                        let any_edge = graph
+                            .edges_directed(cycle_node, petgraph::Direction::Incoming)
+                            .next()
+                            .map(|e| e.id());
+                        if let Some(eid) = any_edge {
+                            let (src, tgt) = graph.edge_endpoints(eid).unwrap();
+                            warn!(
+                                "Breaking dependency cycle: removing strong edge {} → {} (no weak edges available)",
+                                graph[src], graph[tgt]
+                            );
+                            graph.remove_edge(eid);
+                        } else {
+                            bail!(
+                                "Dependency cycle detected involving unit: {} (unable to break)",
+                                graph[cycle_node]
+                            );
+                        }
+                    }
+                }
             }
         }
+
+        bail!("Unable to resolve dependency cycles after removing {} edges", max_attempts)
     }
 
     /// Compute the start order for a single unit and all of its transitive
