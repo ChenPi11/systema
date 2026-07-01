@@ -94,6 +94,26 @@ pub async fn load_named_unit(
     Ok(None)
 }
 
+/// Load all units from the standard search paths whose file names match
+/// `predicate`, skipping units that are already in memory.
+pub async fn load_units_matching<F>(allocator: AllocatorHandle, predicate: F) -> Result<usize>
+where
+    F: Fn(&str) -> bool,
+{
+    let paths: Vec<PathBuf> = UNIT_SEARCH_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+
+    let mut total = 0usize;
+    for dir in &paths {
+        total += load_matching_units_from_dir(dir, allocator.clone(), &predicate).await?;
+    }
+
+    Ok(total)
+}
+
 // --------------------------------------------------------------------------
 // Private helpers
 // --------------------------------------------------------------------------
@@ -106,6 +126,57 @@ async fn load_units_from_dir(dir: &Path, allocator: AllocatorHandle) -> Result<u
         let path = entry.path();
         if !path.is_file() {
             continue;
+        }
+
+        async fn load_matching_units_from_dir<F>(
+            dir: &Path,
+            allocator: AllocatorHandle,
+            predicate: &F,
+        ) -> Result<usize>
+        where
+            F: Fn(&str) -> bool,
+        {
+            let mut count = 0usize;
+            let mut entries = tokio::fs::read_dir(dir).await?;
+
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+
+                if !is_known_extension(&name) || !predicate(&name) {
+                    continue;
+                }
+
+                {
+                    let state = allocator.read();
+                    if state.units.contains_key(&name) {
+                        continue;
+                    }
+                }
+
+                match load_unit_file(&path) {
+                    Ok(unit) => {
+                        let unit_name = unit.name.clone();
+                        let mut state = allocator.write();
+                        state.units.insert(unit_name.clone(), unit);
+                        if let Some(ref tx) = state.unit_loaded_tx {
+                            let _ = tx.send(unit_name);
+                        }
+                        count += 1;
+                    }
+                    Err(e) => {
+                        warn!("Skipping {}: {}", path.display(), e);
+                    }
+                }
+            }
+
+            Ok(count)
         }
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),

@@ -324,6 +324,18 @@ impl ManagerInterface {
         patterns: Vec<String>,
     ) -> zbus::fdo::Result<Vec<UnitInfo>> {
         debug!("D-Bus ListUnitsByPatterns: states={:?} patterns={:?}", states, patterns);
+        if !patterns.is_empty() {
+            let patterns_for_load = patterns.clone();
+            let alloc = self.allocator.clone();
+            tokio::task::spawn(async move {
+                let _ = crate::unit::loader::load_units_matching(alloc, |name| {
+                    patterns_for_load.iter().any(|pattern| matches_glob(pattern, name))
+                })
+                .await;
+            })
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
         let state = self.allocator.read();
         let result = build_unit_list(&state, |name, s| {
             // State filter.

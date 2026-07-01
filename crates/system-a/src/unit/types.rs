@@ -13,6 +13,8 @@ pub enum UnitKind {
     Mount,
     Timer,
     Socket,
+    Slice,
+    Scope,
     Unknown(String),
 }
 
@@ -25,6 +27,8 @@ impl UnitKind {
             "mount" => UnitKind::Mount,
             "timer" => UnitKind::Timer,
             "socket" => UnitKind::Socket,
+            "slice" => UnitKind::Slice,
+            "scope" => UnitKind::Scope,
             other => UnitKind::Unknown(other.to_string()),
         }
     }
@@ -37,6 +41,8 @@ impl UnitKind {
             UnitKind::Mount => "mount",
             UnitKind::Timer => "timer",
             UnitKind::Socket => "socket",
+            UnitKind::Slice => "slice",
+            UnitKind::Scope => "scope",
             UnitKind::Unknown(s) => s.as_str(),
         }
     }
@@ -219,6 +225,18 @@ impl UnitFile {
             unit: UnitSection::default(),
             install: InstallSection::default(),
             service: None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::UnitKind;
+
+        #[test]
+        fn classifies_extended_unit_kinds() {
+            assert_eq!(UnitKind::from_extension("demo.socket"), UnitKind::Socket);
+            assert_eq!(UnitKind::from_extension("demo.slice"), UnitKind::Slice);
+            assert_eq!(UnitKind::from_extension("demo.scope"), UnitKind::Scope);
         }
     }
 }

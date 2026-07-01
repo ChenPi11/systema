@@ -6,6 +6,8 @@
 
 pub mod manager;
 pub mod service_obj;
+pub mod slice_obj;
+pub mod socket_obj;
 pub mod unit_obj;
 
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use tracing::{info, warn};
 use zbus::connection::Builder;
 
 use crate::state::AllocatorHandle;
+use crate::unit::types::UnitKind;
 
 /// The well-known D-Bus bus name we claim.
 pub const BUS_NAME: &str = "org.freedesktop.systemd1";
@@ -27,13 +30,14 @@ pub(super) async fn register_unit_object(
     allocator: AllocatorHandle,
     unit_name: &str,
 ) {
+    let unit_kind = allocator
+        .read()
+        .units
+        .get(unit_name)
+        .map(|unit| unit.kind.clone());
     let path = manager::unit_object_path(unit_name);
     let obj = unit_obj::UnitObject {
         allocator: allocator.clone(),
-        unit_name: unit_name.to_string(),
-    };
-    let service = service_obj::ServiceObject {
-        allocator,
         unit_name: unit_name.to_string(),
     };
     match conn.object_server().at(path.clone(), obj).await {
@@ -47,14 +51,49 @@ pub(super) async fn register_unit_object(
             warn!("Failed to register D-Bus object for {}: {}", unit_name, e);
         }
     }
-    match conn.object_server().at(path, service).await {
-        Ok(true) | Ok(false) => {}
-        Err(e) => {
-            warn!(
-                "Failed to register D-Bus service interface for {}: {}",
-                unit_name, e
-            );
+    match unit_kind {
+        Some(UnitKind::Service) => {
+            let service = service_obj::ServiceObject {
+                allocator,
+                unit_name: unit_name.to_string(),
+            };
+            match conn.object_server().at(path, service).await {
+                Ok(true) | Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to register D-Bus service interface for {}: {}",
+                        unit_name, e
+                    );
+                }
+            }
         }
+        Some(UnitKind::Socket) => {
+            let socket = socket_obj::SocketObject {
+                allocator,
+                unit_name: unit_name.to_string(),
+            };
+            match conn.object_server().at(path, socket).await {
+                Ok(true) | Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to register D-Bus socket interface for {}: {}",
+                        unit_name, e
+                    );
+                }
+            }
+        }
+        Some(UnitKind::Slice) => {
+            match conn.object_server().at(path, slice_obj::SliceObject).await {
+                Ok(true) | Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to register D-Bus slice interface for {}: {}",
+                        unit_name, e
+                    );
+                }
+            }
+        }
+        _ => {}
     }
 }
 
