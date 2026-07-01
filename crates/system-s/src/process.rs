@@ -14,10 +14,7 @@ use crate::state::{ServiceInstance, ServiceRegistry, ServiceState};
 
 /// Launch the service described by `config`.
 /// Returns the PID of the spawned main process.
-pub async fn start_service(
-    registry: ServiceRegistry,
-    config: &UnitConfig,
-) -> Result<u32> {
+pub async fn start_service(registry: ServiceRegistry, config: &UnitConfig) -> Result<u32> {
     let unit_name = config.unit_name.clone();
     let svc = config
         .service

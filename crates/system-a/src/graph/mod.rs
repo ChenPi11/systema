@@ -48,19 +48,18 @@ impl DependencyGraph {
         }
 
         // Helper: get or create a node for a dependency name.
-        let get_or_create_node =
-            |graph: &mut DiGraph<String, EdgeKind>,
-             index: &mut HashMap<String, NodeIndex>,
-             name: &str|
-             -> NodeIndex {
-                if let Some(&n) = index.get(name) {
-                    n
-                } else {
-                    let n = graph.add_node(name.to_string());
-                    index.insert(name.to_string(), n);
-                    n
-                }
-            };
+        let get_or_create_node = |graph: &mut DiGraph<String, EdgeKind>,
+                                  index: &mut HashMap<String, NodeIndex>,
+                                  name: &str|
+         -> NodeIndex {
+            if let Some(&n) = index.get(name) {
+                n
+            } else {
+                let n = graph.add_node(name.to_string());
+                index.insert(name.to_string(), n);
+                n
+            }
+        };
 
         // Second pass: add dependency edges.
         for unit in &units {
@@ -171,7 +170,10 @@ impl DependencyGraph {
             }
         }
 
-        bail!("Unable to resolve dependency cycles after removing {} edges", max_attempts)
+        bail!(
+            "Unable to resolve dependency cycles after removing {} edges",
+            max_attempts
+        )
     }
 
     /// Compute the start order for a single unit and all of its transitive
@@ -215,17 +217,17 @@ impl DependencyGraph {
             })
             .collect();
 
-        debug!(
-            "Start order for {}: {:?}",
-            unit_name,
-            ordered
-        );
+        debug!("Start order for {}: {:?}", unit_name, ordered);
 
         Ok(ordered)
     }
 
     /// Return the `Requires` and `Wants` dependencies of a unit by name.
-    pub fn required_deps<'a>(&'a self, unit_name: &str, units: &'a HashMap<String, UnitFile>) -> Vec<String> {
+    pub fn required_deps<'a>(
+        &'a self,
+        unit_name: &str,
+        units: &'a HashMap<String, UnitFile>,
+    ) -> Vec<String> {
         let Some(unit) = units.get(unit_name) else {
             return vec![];
         };
@@ -833,7 +835,11 @@ mod tests {
         unit.unit.requires.insert("base.target".to_string());
         unit.unit.wants.insert("logging.service".to_string());
 
-        let units = vec![make_unit("base.target"), make_unit("logging.service"), unit.clone()];
+        let units = vec![
+            make_unit("base.target"),
+            make_unit("logging.service"),
+            unit.clone(),
+        ];
         let graph = DependencyGraph::build(units.iter());
 
         let mut unit_map = HashMap::new();
@@ -886,7 +892,10 @@ mod tests {
 
         let mut multi_user = make_unit("multi-user.target");
         multi_user.unit.after.insert("basic.target".to_string());
-        multi_user.unit.before.insert("graphical.target".to_string());
+        multi_user
+            .unit
+            .before
+            .insert("graphical.target".to_string());
 
         let mut graphical = make_unit("graphical.target");
         graphical.unit.after.insert("multi-user.target".to_string());
@@ -995,12 +1004,7 @@ mod tests {
             let next = format!("unit{}.service", i + 1);
             let pos_curr = order.iter().position(|x| x == &curr).unwrap();
             let pos_next = order.iter().position(|x| x == &next).unwrap();
-            assert!(
-                pos_curr < pos_next,
-                "{} should come before {}",
-                curr,
-                next
-            );
+            assert!(pos_curr < pos_next, "{} should come before {}", curr, next);
         }
     }
 

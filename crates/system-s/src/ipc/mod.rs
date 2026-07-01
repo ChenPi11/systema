@@ -27,7 +27,7 @@ use common::proto::{
 };
 
 use crate::process::{is_alive, start_service, stop_service};
-use crate::state::{ServiceRegistry, ServiceState, new_registry};
+use crate::state::{new_registry, ServiceRegistry, ServiceState};
 
 const ALLOCATOR_SOCKET: &str = "/run/system-alphabet/allocator.sock";
 const WORKER_ID: &str = "system-s-1";
@@ -209,8 +209,7 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
                     None
                 };
 
-                let result =
-                    execute_task(&registry, &task, unit_config.as_ref(), &out_tx).await;
+                let result = execute_task(&registry, &task, unit_config.as_ref(), &out_tx).await;
 
                 let (success, message, result_kind) = match result {
                     Ok(()) => (true, String::new(), TaskResultKind::TaskResultDone),
@@ -278,9 +277,8 @@ async fn execute_task(
 
     match kind {
         TaskKind::Start => {
-            let config = unit_config.ok_or_else(|| {
-                anyhow::anyhow!("No UnitConfig in task for {}", task.unit_name)
-            })?;
+            let config = unit_config
+                .ok_or_else(|| anyhow::anyhow!("No UnitConfig in task for {}", task.unit_name))?;
 
             let pid = start_service(registry.clone(), config).await?;
 
@@ -399,10 +397,7 @@ async fn monitor_service(
 
         if let Some(pid) = pid {
             if !is_alive(pid) {
-                info!(
-                    "Service {} (PID {}) exited unexpectedly",
-                    unit_name, pid
-                );
+                info!("Service {} (PID {}) exited unexpectedly", unit_name, pid);
                 {
                     let mut reg = registry.lock();
                     if let Some(inst) = reg.get_mut(&unit_name) {

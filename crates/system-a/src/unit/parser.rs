@@ -63,9 +63,7 @@ fn split_list(value: &str) -> HashSet<String> {
 
 /// Get a string value from the config, returning empty string if absent.
 fn get_str(config: &Ini, section: &str, key: &str) -> String {
-    config
-        .get(section, key)
-        .unwrap_or_default()
+    config.get(section, key).unwrap_or_default()
 }
 
 /// Get a boolean value (`yes`/`no`/`true`/`false`/`1`/`0`).

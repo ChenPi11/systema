@@ -3,7 +3,6 @@
 //! This is the primary D-Bus interface exposed by System A, compatible with
 //! `systemd` so that tools like `systemctl` can talk to us.
 
-
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
@@ -12,9 +11,7 @@ use zbus::interface;
 use zvariant::OwnedObjectPath;
 
 use crate::scheduler;
-use crate::state::{
-    ActiveState, AllocatorHandle, DesiredState, JobKind, JobStatus,
-};
+use crate::state::{ActiveState, AllocatorHandle, DesiredState, JobKind, JobStatus};
 
 // --------------------------------------------------------------------------
 // Helper: D-Bus path encoding
@@ -91,7 +88,14 @@ type UnitInfo = (
 
 /// Job info tuple returned by ListJobs.
 /// (job_id, unit_name, job_type, job_state, job_object_path, unit_object_path)
-type JobInfo = (u32, String, String, String, OwnedObjectPath, OwnedObjectPath);
+type JobInfo = (
+    u32,
+    String,
+    String,
+    String,
+    OwnedObjectPath,
+    OwnedObjectPath,
+);
 
 /// Unit file info returned by ListUnitFiles.
 /// (path, state) where state is "enabled"/"disabled"/"static" etc.
@@ -105,13 +109,24 @@ impl ManagerInterface {
 
     /// Emitted when a new job is queued.
     #[zbus(signal)]
-    pub async fn job_new(ctxt: &zbus::SignalContext<'_>, id: u32, job: OwnedObjectPath, unit: String) -> zbus::Result<()>;
+    pub async fn job_new(
+        ctxt: &zbus::SignalContext<'_>,
+        id: u32,
+        job: OwnedObjectPath,
+        unit: String,
+    ) -> zbus::Result<()>;
 
     /// Emitted when a job finishes (done, failed, cancelled, …).
     /// `result` is one of: "done", "failed", "cancelled", "timeout",
     /// "dependency", "skipped".
     #[zbus(signal)]
-    pub async fn job_removed(ctxt: &zbus::SignalContext<'_>, id: u32, job: OwnedObjectPath, unit: String, result: String) -> zbus::Result<()>;
+    pub async fn job_removed(
+        ctxt: &zbus::SignalContext<'_>,
+        id: u32,
+        job: OwnedObjectPath,
+        unit: String,
+        result: String,
+    ) -> zbus::Result<()>;
 
     // ------------------------------------------------------------------
     // Unit lookup methods
@@ -187,7 +202,10 @@ impl ManagerInterface {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        alloc.write().desired.insert(name.clone(), DesiredState::Active);
+        alloc
+            .write()
+            .desired
+            .insert(name.clone(), DesiredState::Active);
 
         Ok(job_object_path(job_id))
     }
@@ -203,7 +221,10 @@ impl ManagerInterface {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        alloc.write().desired.insert(name.clone(), DesiredState::Inactive);
+        alloc
+            .write()
+            .desired
+            .insert(name.clone(), DesiredState::Inactive);
 
         Ok(job_object_path(job_id))
     }
@@ -219,7 +240,10 @@ impl ManagerInterface {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        alloc.write().desired.insert(name.clone(), DesiredState::Active);
+        alloc
+            .write()
+            .desired
+            .insert(name.clone(), DesiredState::Active);
 
         Ok(job_object_path(job_id))
     }
@@ -239,11 +263,7 @@ impl ManagerInterface {
     }
 
     /// Try-restart: only restart if currently active.
-    async fn try_restart_unit(
-        &self,
-        name: &str,
-        mode: &str,
-    ) -> zbus::fdo::Result<OwnedObjectPath> {
+    async fn try_restart_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         debug!("D-Bus TryRestartUnit: name={} mode={}", name, mode);
         let is_active = self
             .allocator
@@ -296,22 +316,24 @@ impl ManagerInterface {
 
     /// List loaded units filtered by active state(s).
     /// Pass an empty slice to list all units (same as `list_units`).
-    async fn list_units_filtered(
-        &self,
-        states: Vec<String>,
-    ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+    async fn list_units_filtered(&self, states: Vec<String>) -> zbus::fdo::Result<Vec<UnitInfo>> {
         debug!("D-Bus ListUnitsFiltered: states={:?}", states);
         let state = self.allocator.read();
         let result = build_unit_list(&state, |name, s| {
             if states.is_empty() {
                 return true;
             }
-            let active = s.runtime.get(*name)
+            let active = s
+                .runtime
+                .get(*name)
                 .map(|rt| rt.active_state.as_str())
                 .unwrap_or("inactive");
             states.iter().any(|f| f == active)
         });
-        debug!("D-Bus ListUnitsFiltered: returning {} unit(s)", result.len());
+        debug!(
+            "D-Bus ListUnitsFiltered: returning {} unit(s)",
+            result.len()
+        );
         Ok(result)
     }
 
@@ -323,15 +345,16 @@ impl ManagerInterface {
         states: Vec<String>,
         patterns: Vec<String>,
     ) -> zbus::fdo::Result<Vec<UnitInfo>> {
-        debug!("D-Bus ListUnitsByPatterns: states={:?} patterns={:?}", states, patterns);
+        debug!(
+            "D-Bus ListUnitsByPatterns: states={:?} patterns={:?}",
+            states, patterns
+        );
         if !patterns.is_empty() {
             let patterns_for_load = patterns.clone();
-            let alloc = self.allocator.clone();
-            tokio::task::spawn(async move {
-                let _ = crate::unit::loader::load_units_matching(alloc, |name| {
-                    patterns_for_load.iter().any(|pattern| matches_glob(pattern, name))
-                })
-                .await;
+            crate::unit::loader::load_units_matching(self.allocator.clone(), |name| {
+                patterns_for_load
+                    .iter()
+                    .any(|pattern| matches_glob(pattern, name))
             })
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -340,7 +363,9 @@ impl ManagerInterface {
         let result = build_unit_list(&state, |name, s| {
             // State filter.
             if !states.is_empty() {
-                let active = s.runtime.get(*name)
+                let active = s
+                    .runtime
+                    .get(*name)
                     .map(|rt| rt.active_state.as_str())
                     .unwrap_or("inactive");
                 if !states.iter().any(|f| f == active) {
@@ -355,16 +380,16 @@ impl ManagerInterface {
             }
             true
         });
-        debug!("D-Bus ListUnitsByPatterns: returning {} unit(s)", result.len());
+        debug!(
+            "D-Bus ListUnitsByPatterns: returning {} unit(s)",
+            result.len()
+        );
         Ok(result)
     }
 
     /// Return unit info for specific named units, loading them from disk if
     /// they are not already in memory.
-    async fn list_units_by_names(
-        &self,
-        names: Vec<String>,
-    ) -> zbus::fdo::Result<Vec<UnitInfo>> {
+    async fn list_units_by_names(&self, names: Vec<String>) -> zbus::fdo::Result<Vec<UnitInfo>> {
         debug!("D-Bus ListUnitsByNames: names={:?}", names);
         // Load any units that aren't already in memory.
         let to_load: Vec<String> = {
@@ -385,7 +410,10 @@ impl ManagerInterface {
         let result = names
             .iter()
             .filter_map(|name| {
-                state.units.get(name).map(|unit| unit_info_entry(name, unit, &state))
+                state
+                    .units
+                    .get(name)
+                    .map(|unit| unit_info_entry(name, unit, &state))
             })
             .collect();
         Ok(result)
@@ -433,7 +461,10 @@ impl ManagerInterface {
         states: Vec<String>,
         patterns: Vec<String>,
     ) -> zbus::fdo::Result<Vec<UnitFileInfo>> {
-        debug!("D-Bus ListUnitFilesByPatterns: states={:?} patterns={:?}", states, patterns);
+        debug!(
+            "D-Bus ListUnitFilesByPatterns: states={:?} patterns={:?}",
+            states, patterns
+        );
         let state = self.allocator.read();
         Ok(build_unit_file_list(&state, |name, file_state| {
             if !states.is_empty() && !states.iter().any(|s| s == file_state) {
@@ -488,10 +519,7 @@ impl ManagerInterface {
     ) -> zbus::fdo::Result<Vec<(String, u32, String)>> {
         debug!("D-Bus GetUnitProcesses: unit={}", unit_name);
         let state = self.allocator.read();
-        let main_pid = state
-            .runtime
-            .get(unit_name)
-            .and_then(|rt| rt.main_pid);
+        let main_pid = state.runtime.get(unit_name).and_then(|rt| rt.main_pid);
 
         match main_pid {
             Some(pid) => {
@@ -880,8 +908,7 @@ fn unit_info_entry(
         .jobs
         .values()
         .find(|j| {
-            j.unit_name == name
-                && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+            j.unit_name == name && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
         })
         .map(|j| (j.id as u32, j.kind.as_str().to_string()))
         .unwrap_or((0, String::new()));
@@ -910,10 +937,7 @@ fn unit_info_entry(
 ///
 /// The predicate receives `(unit_name, &AllocatorState)` and returns `true`
 /// if the entry should be included.
-fn build_unit_list<F>(
-    state: &crate::state::AllocatorState,
-    predicate: F,
-) -> Vec<UnitInfo>
+fn build_unit_list<F>(state: &crate::state::AllocatorState, predicate: F) -> Vec<UnitInfo>
 where
     F: Fn(&&str, &crate::state::AllocatorState) -> bool,
 {
@@ -929,10 +953,7 @@ where
 ///
 /// The predicate receives `(unit_name, file_state_str)` and returns `true`
 /// if the entry should be included.
-fn build_unit_file_list<F>(
-    state: &crate::state::AllocatorState,
-    predicate: F,
-) -> Vec<UnitFileInfo>
+fn build_unit_file_list<F>(state: &crate::state::AllocatorState, predicate: F) -> Vec<UnitFileInfo>
 where
     F: Fn(&str, &str) -> bool,
 {

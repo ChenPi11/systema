@@ -48,8 +48,7 @@ pub async fn recv_envelope(framed: &mut EnvelopeFramed) -> Result<Option<Envelop
         None => Ok(None),
         Some(result) => {
             let bytes: Bytes = result.context("Frame receive error")?.freeze();
-            let envelope =
-                Envelope::decode(bytes).context("Failed to decode Envelope")?;
+            let envelope = Envelope::decode(bytes).context("Failed to decode Envelope")?;
             Ok(Some(envelope))
         }
     }
@@ -64,7 +63,9 @@ pub fn make_envelope(
     payload: impl Message,
 ) -> Result<Envelope> {
     let mut buf = BytesMut::new();
-    payload.encode(&mut buf).context("Failed to encode payload")?;
+    payload
+        .encode(&mut buf)
+        .context("Failed to encode payload")?;
     Ok(Envelope {
         request_id,
         source: source.into(),

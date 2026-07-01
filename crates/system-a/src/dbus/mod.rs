@@ -134,8 +134,7 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     let (completion_tx, mut completion_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::state::JobCompletion>();
     // unit-loaded → register per-unit object
-    let (unit_loaded_tx, mut unit_loaded_rx) =
-        tokio::sync::mpsc::unbounded_channel::<String>();
+    let (unit_loaded_tx, mut unit_loaded_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     {
         let mut state = allocator.write();

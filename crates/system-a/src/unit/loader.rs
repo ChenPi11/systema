@@ -11,8 +11,8 @@ use crate::state::AllocatorHandle;
 
 /// Standard systemd unit file search directories, in priority order.
 pub const UNIT_SEARCH_PATHS: &[&str] = &[
-    "/etc/system-alphabet",       // system-alphabet-specific overrides
-    "/run/system-alphabet",       // runtime-generated units
+    "/etc/system-alphabet", // system-alphabet-specific overrides
+    "/run/system-alphabet", // runtime-generated units
     "/usr/local/lib/system-alphabet",
     "/usr/lib/system-alphabet",
     // Fall back to systemd's own directories so we can read real unit files.
@@ -53,10 +53,7 @@ pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {
 }
 
 /// Load a single named unit, searching through the standard paths.
-pub async fn load_named_unit(
-    allocator: AllocatorHandle,
-    name: &str,
-) -> Result<Option<UnitFile>> {
+pub async fn load_named_unit(allocator: AllocatorHandle, name: &str) -> Result<Option<UnitFile>> {
     // Check if already loaded.
     {
         let state = allocator.read();

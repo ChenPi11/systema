@@ -227,16 +227,16 @@ impl UnitFile {
             service: None,
         }
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::UnitKind;
+#[cfg(test)]
+mod tests {
+    use super::UnitKind;
 
-        #[test]
-        fn classifies_extended_unit_kinds() {
-            assert_eq!(UnitKind::from_extension("demo.socket"), UnitKind::Socket);
-            assert_eq!(UnitKind::from_extension("demo.slice"), UnitKind::Slice);
-            assert_eq!(UnitKind::from_extension("demo.scope"), UnitKind::Scope);
-        }
+    #[test]
+    fn classifies_extended_unit_kinds() {
+        assert_eq!(UnitKind::from_extension("demo.socket"), UnitKind::Socket);
+        assert_eq!(UnitKind::from_extension("demo.slice"), UnitKind::Slice);
+        assert_eq!(UnitKind::from_extension("demo.scope"), UnitKind::Scope);
     }
 }

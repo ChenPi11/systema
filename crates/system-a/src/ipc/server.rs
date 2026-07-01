@@ -4,7 +4,6 @@
 //! sends a `WorkerRegistration`, then receives dispatched `TaskDispatch`
 //! messages and sends back `TaskResult` / `EventPublish` messages.
 
-
 use anyhow::Result;
 use prost::Message as ProstMessage;
 use tokio::net::UnixListener;
@@ -12,14 +11,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use common::proto::{
-    Envelope, EventPublish, RegisterAck, TaskResult, WorkerRegistration,
-};
+use common::proto::{Envelope, EventPublish, RegisterAck, TaskResult, WorkerRegistration};
 
 use crate::scheduler::{self, build_task_dispatch};
 use crate::state::{
-    ActiveState, AllocatorHandle, JobCompletion, JobKind, JobResultKind, JobStatus,
-    WorkerEntry, WorkerTask, next_request_id,
+    next_request_id, ActiveState, AllocatorHandle, JobCompletion, JobKind, JobResultKind,
+    JobStatus, WorkerEntry, WorkerTask,
 };
 
 pub const SOCKET_PATH: &str = "/run/system-alphabet/allocator.sock";
@@ -55,10 +52,7 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
 }
 
 /// Handle a single worker connection from registration through task dispatch.
-async fn handle_worker(
-    stream: tokio::net::UnixStream,
-    allocator: AllocatorHandle,
-) -> Result<()> {
+async fn handle_worker(stream: tokio::net::UnixStream, allocator: AllocatorHandle) -> Result<()> {
     let mut framed = frame_stream(stream);
 
     // --- Step 1: receive WorkerRegistration ---
@@ -162,7 +156,10 @@ async fn handle_worker(
                     let env = match Envelope::decode(bytes.freeze()) {
                         Ok(e) => e,
                         Err(e) => {
-                            warn!("Failed to decode envelope from worker '{}': {}", worker_id_recv, e);
+                            warn!(
+                                "Failed to decode envelope from worker '{}': {}",
+                                worker_id_recv, e
+                            );
                             continue;
                         }
                     };
@@ -257,7 +254,9 @@ async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<
             let event = EventPublish::decode(env.payload.as_slice())?;
             debug!(
                 "IPC event.publish: event_type={} unit={} data_len={}",
-                event.event_type, event.unit_name, event.event_data.len()
+                event.event_type,
+                event.unit_name,
+                event.event_data.len()
             );
             handle_event(allocator, event).await?;
         }

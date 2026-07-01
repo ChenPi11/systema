@@ -9,12 +9,12 @@ use anyhow::Result;
 use prost::Message;
 use tracing::{debug, info, warn};
 
-use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 use crate::state::{
-    ActiveState, AllocatorHandle, Job, JobCompletion, JobKind, JobResult, JobResultKind,
-    JobStatus, UnitRuntimeInfo, WorkerTask, next_job_id, next_task_id,
+    next_job_id, next_task_id, ActiveState, AllocatorHandle, Job, JobCompletion, JobKind,
+    JobResult, JobResultKind, JobStatus, UnitRuntimeInfo, WorkerTask,
 };
 use crate::unit::types::{UnitFile, UnitKind};
+use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
 /// Returns the primary job ID.
@@ -47,7 +47,9 @@ pub async fn enqueue_job(
             if let Some(unit) = state.units.get(unit_name) {
                 let mut failed_requisites = Vec::new();
                 for req in &unit.unit.requisite {
-                    let is_active = state.runtime.get(req.as_str())
+                    let is_active = state
+                        .runtime
+                        .get(req.as_str())
                         .map(|rt| matches!(rt.active_state, ActiveState::Active))
                         .unwrap_or(false);
                     if !is_active {
@@ -88,19 +90,31 @@ pub async fn enqueue_job(
     if matches!(kind, JobKind::Start | JobKind::Restart) {
         let conflicts: Vec<String> = {
             let state = allocator.read();
-            state.units.get(unit_name)
+            state
+                .units
+                .get(unit_name)
                 .map(|u| u.unit.conflicts.iter().cloned().collect())
                 .unwrap_or_default()
         };
         for conflict in conflicts {
             let is_active = {
                 let state = allocator.read();
-                state.runtime.get(conflict.as_str())
-                    .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                state
+                    .runtime
+                    .get(conflict.as_str())
+                    .map(|rt| {
+                        matches!(
+                            rt.active_state,
+                            ActiveState::Active | ActiveState::Activating
+                        )
+                    })
                     .unwrap_or(false)
             };
             if is_active {
-                info!("Stopping conflicting unit {} before starting {}", conflict, unit_name);
+                info!(
+                    "Stopping conflicting unit {} before starting {}",
+                    conflict, unit_name
+                );
                 // Use Box::pin to handle the recursive async call.
                 Box::pin(enqueue_job(allocator.clone(), &conflict, JobKind::Stop)).await?;
             }
@@ -111,9 +125,7 @@ pub async fn enqueue_job(
     let units_to_process = {
         let state = allocator.read();
         match kind {
-            JobKind::Start | JobKind::Restart => {
-                compute_start_order(&state.units, unit_name)
-            }
+            JobKind::Start | JobKind::Restart => compute_start_order(&state.units, unit_name),
             JobKind::Stop => {
                 // For stop, compute reverse dependencies to propagate the stop.
                 compute_stop_order(&state.units, &state.runtime, unit_name)
@@ -133,30 +145,48 @@ pub async fn enqueue_job(
     for name in units_to_process.iter() {
         // The primary job ID belongs to the unit that was directly requested.
         let is_root = name.as_str() == unit_name;
-        let job_id = if is_root { primary_job_id } else { next_job_id() };
+        let job_id = if is_root {
+            primary_job_id
+        } else {
+            next_job_id()
+        };
 
         // Idempotency: skip if the unit is already in the desired state,
         // or if there is already an in-flight job of the same kind for it.
         {
             let state = allocator.read();
             let already_in_desired_state = match kind {
-                JobKind::Start => {
-                    state.runtime.get(name.as_str())
-                        .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
-                        .unwrap_or(false)
-                }
+                JobKind::Start => state
+                    .runtime
+                    .get(name.as_str())
+                    .map(|rt| {
+                        matches!(
+                            rt.active_state,
+                            ActiveState::Active | ActiveState::Activating
+                        )
+                    })
+                    .unwrap_or(false),
                 // Restart always re-executes: stop then start, regardless of current state.
                 JobKind::Restart => false,
                 JobKind::Stop => {
-                    state.runtime.get(name.as_str())
-                        .map(|rt| matches!(rt.active_state, ActiveState::Inactive | ActiveState::Deactivating))
+                    state
+                        .runtime
+                        .get(name.as_str())
+                        .map(|rt| {
+                            matches!(
+                                rt.active_state,
+                                ActiveState::Inactive | ActiveState::Deactivating
+                            )
+                        })
                         .unwrap_or(true) // treat unknown as inactive for stop
                 }
                 JobKind::Reload => false,
             };
 
             // Check for an existing running/waiting job of the same kind.
-            let existing_running_job_id: Option<u64> = state.jobs.values()
+            let existing_running_job_id: Option<u64> = state
+                .jobs
+                .values()
                 .find(|j| {
                     j.unit_name == *name
                         && j.kind == kind
@@ -198,7 +228,10 @@ pub async fn enqueue_job(
         // activate_target_internally, which needs a write lock on the same handle.
         let is_target = {
             let state = allocator.read();
-            state.units.get(name.as_str()).map_or(false, |u| matches!(u.kind, UnitKind::Target))
+            state
+                .units
+                .get(name.as_str())
+                .map_or(false, |u| matches!(u.kind, UnitKind::Target))
         };
         if is_target {
             activate_target_internally(allocator.clone(), name);
@@ -236,7 +269,10 @@ pub async fn enqueue_job(
                     (tx, tid, unit_type)
                 }
                 None => {
-                    warn!("No worker registered for unit type '{}' (unit: {})", unit_type, name);
+                    warn!(
+                        "No worker registered for unit type '{}' (unit: {})",
+                        unit_type, name
+                    );
                     if is_root {
                         // No worker available — mark the unit as failed and emit
                         // a failure completion so callers (e.g. systemctl) are
@@ -359,8 +395,14 @@ fn compute_stop_order(
                 || other_unit.unit.binds_to.contains(&name)
                 || other_unit.unit.part_of.contains(&name);
             if depends_on_name {
-                let is_active = runtime.get(other_name.as_str())
-                    .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                let is_active = runtime
+                    .get(other_name.as_str())
+                    .map(|rt| {
+                        matches!(
+                            rt.active_state,
+                            ActiveState::Active | ActiveState::Activating
+                        )
+                    })
                     .unwrap_or(false);
                 if is_active {
                     stack.push(other_name.clone());
@@ -409,7 +451,10 @@ fn compute_start_order(
         }
         reachable.insert(name.clone());
         if let Some(unit) = units.get(&name) {
-            for dep in unit.unit.requires.iter()
+            for dep in unit
+                .unit
+                .requires
+                .iter()
                 .chain(unit.unit.wants.iter())
                 .chain(unit.unit.requisite.iter())
                 .chain(unit.unit.binds_to.iter())
@@ -545,8 +590,15 @@ pub fn handle_task_result(
         if matches!(kind, JobKind::Stop) || !success {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.binds_to.contains(unit_name) {
-                    let is_active = state.runtime.get(other_name.as_str())
-                        .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                    let is_active = state
+                        .runtime
+                        .get(other_name.as_str())
+                        .map(|rt| {
+                            matches!(
+                                rt.active_state,
+                                ActiveState::Active | ActiveState::Activating
+                            )
+                        })
                         .unwrap_or(false);
                     if is_active {
                         post_actions.push(PostAction::Stop(other_name.clone()));
@@ -560,8 +612,15 @@ pub fn handle_task_result(
         if matches!(kind, JobKind::Stop) {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.part_of.contains(unit_name) {
-                    let is_active = state.runtime.get(other_name.as_str())
-                        .map(|rt| matches!(rt.active_state, ActiveState::Active | ActiveState::Activating))
+                    let is_active = state
+                        .runtime
+                        .get(other_name.as_str())
+                        .map(|rt| {
+                            matches!(
+                                rt.active_state,
+                                ActiveState::Active | ActiveState::Activating
+                            )
+                        })
                         .unwrap_or(false);
                     if is_active {
                         post_actions.push(PostAction::Stop(other_name.clone()));
@@ -595,7 +654,9 @@ pub fn handle_task_result(
             for (_other_name, other_unit) in &state.units {
                 if other_unit.unit.upholds.contains(unit_name) {
                     // The upholder wants this unit to stay active — restart it.
-                    let upholder_active = state.runtime.get(_other_name.as_str())
+                    let upholder_active = state
+                        .runtime
+                        .get(_other_name.as_str())
                         .map(|rt| matches!(rt.active_state, ActiveState::Active))
                         .unwrap_or(false);
                     if upholder_active {
