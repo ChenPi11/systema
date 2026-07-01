@@ -150,6 +150,38 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         .build()
         .await?;
 
+    // Replace zbus's built-in org.freedesktop.DBus.Properties on the manager
+    // object with our custom implementation that accepts an empty interface
+    // name in GetAll (systemd extension).
+    if let Err(e) = conn
+        .object_server()
+        .remove::<zbus::fdo::Properties, _>("/org/freedesktop/systemd1")
+        .await
+    {
+        warn!(
+            "Failed to remove default Properties interface from manager: {}",
+            e
+        );
+    }
+    match conn
+        .object_server()
+        .at(
+            "/org/freedesktop/systemd1",
+            properties::ManagerProperties {
+                allocator: allocator.clone(),
+            },
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                "Failed to register custom Properties on manager: {}",
+                e
+            );
+        }
+    }
+
     // Make the connection available to ManagerInterface methods.
     let _ = conn_cell.set(conn.clone());
 
