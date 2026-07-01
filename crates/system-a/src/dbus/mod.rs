@@ -5,6 +5,7 @@
 //! - `org.freedesktop.systemd1.Unit` on each unit's object path
 
 pub mod manager;
+pub mod properties;
 pub mod service_obj;
 pub mod slice_obj;
 pub mod socket_obj;
@@ -46,18 +47,22 @@ pub(super) async fn register_unit_object(
         }
         Ok(false) => {
             // Already registered — fine.
+            return;
         }
         Err(e) => {
             warn!("Failed to register D-Bus object for {}: {}", unit_name, e);
+            return;
         }
     }
+
+    // Register type-specific interface (Service / Socket / Slice).
     match unit_kind {
         Some(UnitKind::Service) => {
             let service = service_obj::ServiceObject {
-                allocator,
+                allocator: allocator.clone(),
                 unit_name: unit_name.to_string(),
             };
-            match conn.object_server().at(path, service).await {
+            match conn.object_server().at(path.clone(), service).await {
                 Ok(true) | Ok(false) => {}
                 Err(e) => {
                     warn!(
@@ -69,10 +74,10 @@ pub(super) async fn register_unit_object(
         }
         Some(UnitKind::Socket) => {
             let socket = socket_obj::SocketObject {
-                allocator,
+                allocator: allocator.clone(),
                 unit_name: unit_name.to_string(),
             };
-            match conn.object_server().at(path, socket).await {
+            match conn.object_server().at(path.clone(), socket).await {
                 Ok(true) | Ok(false) => {}
                 Err(e) => {
                     warn!(
@@ -83,7 +88,11 @@ pub(super) async fn register_unit_object(
             }
         }
         Some(UnitKind::Slice) => {
-            match conn.object_server().at(path, slice_obj::SliceObject).await {
+            match conn
+                .object_server()
+                .at(path.clone(), slice_obj::SliceObject)
+                .await
+            {
                 Ok(true) | Ok(false) => {}
                 Err(e) => {
                     warn!(
@@ -94,6 +103,34 @@ pub(super) async fn register_unit_object(
             }
         }
         _ => {}
+    }
+
+    // Replace zbus's built-in org.freedesktop.DBus.Properties with our custom
+    // implementation that accepts an empty interface name in GetAll (systemd
+    // extension).  We must do this after all other interfaces are registered so
+    // that the custom Properties implementation can correctly enumerate them.
+    let custom_props = properties::Properties {
+        allocator,
+        unit_name: unit_name.to_string(),
+    };
+    if let Err(e) = conn
+        .object_server()
+        .remove::<zbus::fdo::Properties, _>(path.clone())
+        .await
+    {
+        warn!(
+            "Failed to remove default Properties interface for {}: {}",
+            unit_name, e
+        );
+    }
+    match conn.object_server().at(path, custom_props).await {
+        Ok(true) | Ok(false) => {}
+        Err(e) => {
+            warn!(
+                "Failed to register custom Properties interface for {}: {}",
+                unit_name, e
+            );
+        }
     }
 }
 

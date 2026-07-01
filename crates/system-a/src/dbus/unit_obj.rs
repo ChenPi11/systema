@@ -8,7 +8,7 @@
 use zbus::interface;
 use zvariant::OwnedObjectPath;
 
-use super::manager::{job_object_path, unit_object_path};
+use super::manager::{job_object_path};
 use crate::state::{AllocatorHandle, JobStatus};
 
 /// D-Bus object representing a single loaded unit.
