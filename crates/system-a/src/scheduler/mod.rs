@@ -13,7 +13,7 @@ use crate::state::{
     next_job_id, next_task_id, ActiveState, AllocatorHandle, Job, JobCompletion, JobKind,
     JobResult, JobResultKind, JobStatus, UnitRuntimeInfo, WorkerTask,
 };
-use crate::unit::types::{UnitFile, UnitKind};
+use crate::unit::types::{UnitFile, UnitKind, UnitSection};
 use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
@@ -39,6 +39,68 @@ pub async fn enqueue_job(
     kind: JobKind,
 ) -> Result<u64> {
     info!("Scheduling {:?} for {}", kind, unit_name);
+
+    // --- Condition checks: skip start (not failure) if conditions not met ---
+    if matches!(kind, JobKind::Start | JobKind::Restart) {
+        let conditions_met = {
+            let state = allocator.read();
+            state
+                .units
+                .get(unit_name)
+                .map(|u| check_conditions(&u.unit))
+                .unwrap_or(true)
+        };
+        if !conditions_met {
+            info!(
+                "Conditions not met for {}; skipping start (unit stays inactive)",
+                unit_name
+            );
+            let job_id = next_job_id();
+            let mut state = allocator.write();
+            let rt = state.runtime.entry(unit_name.to_string()).or_default();
+            rt.active_state = ActiveState::Inactive;
+            rt.sub_state = "dead".to_string();
+            if let Some(ref tx) = state.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id,
+                    unit_name: unit_name.to_string(),
+                    result: JobResultKind::Skipped,
+                });
+            }
+            return Ok(job_id);
+        }
+    }
+
+    // --- Assert checks: fail start if asserts not met ---
+    if matches!(kind, JobKind::Start | JobKind::Restart) {
+        let asserts_met = {
+            let state = allocator.read();
+            state
+                .units
+                .get(unit_name)
+                .map(|u| check_asserts(&u.unit))
+                .unwrap_or(true)
+        };
+        if !asserts_met {
+            warn!(
+                "Assert check failed for {}; marking unit as failed",
+                unit_name
+            );
+            let job_id = next_job_id();
+            let mut state = allocator.write();
+            let rt = state.runtime.entry(unit_name.to_string()).or_default();
+            rt.active_state = ActiveState::Failed;
+            rt.sub_state = "failed".to_string();
+            if let Some(ref tx) = state.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id,
+                    unit_name: unit_name.to_string(),
+                    result: JobResultKind::Dependency,
+                });
+            }
+            return Ok(job_id);
+        }
+    }
 
     // --- Requisite check: all Requisite= deps must already be active ---
     if matches!(kind, JobKind::Start | JobKind::Restart) {
@@ -731,9 +793,9 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
     let service = uf.service.as_ref().map(|svc| ServiceConfig {
         // Only the first ExecStart command is sent to the worker.
         // Multiple ExecStart directives (Type=oneshot) will be supported in Phase 2.
-        exec_start: svc.exec_start.first().cloned().unwrap_or_default(),
-        exec_stop: svc.exec_stop.first().cloned().unwrap_or_default(),
-        exec_reload: svc.exec_reload.first().cloned().unwrap_or_default(),
+        exec_start: svc.exec_start.first().map(|c| c.raw.clone()).unwrap_or_default(),
+        exec_stop: svc.exec_stop.first().map(|c| c.raw.clone()).unwrap_or_default(),
+        exec_reload: svc.exec_reload.first().map(|c| c.raw.clone()).unwrap_or_default(),
         working_directory: svc.working_directory.clone(),
         user: svc.user.clone(),
         group: svc.group.clone(),
@@ -751,4 +813,189 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
         description: uf.unit.description.clone(),
         service,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Condition and assert evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluate all `Condition*=` directives in `unit`.
+///
+/// Returns `true` if all conditions pass (unit should start), `false` if any
+/// condition fails (unit should be silently skipped, staying inactive).
+///
+/// A value prefixed with `!` negates the check.
+fn check_conditions(unit: &UnitSection) -> bool {
+    for path in &unit.condition_path_exists {
+        if !eval_condition_bool(path, |p| std::path::Path::new(p).exists()) {
+            return false;
+        }
+    }
+    for glob in &unit.condition_path_exists_glob {
+        if !eval_condition_bool(glob, |g| path_glob_matches(g)) {
+            return false;
+        }
+    }
+    for path in &unit.condition_file_not_empty {
+        if !eval_condition_bool(path, |p| {
+            std::fs::metadata(p)
+                .map(|m| m.len() != 0)
+                .unwrap_or(false)
+        }) {
+            return false;
+        }
+    }
+    for path in &unit.condition_directory_not_empty {
+        if !eval_condition_bool(path, |p| {
+            std::fs::read_dir(p)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        }) {
+            return false;
+        }
+    }
+    for spec in &unit.condition_ac_power {
+        let (negate, value) = strip_negate(spec);
+        let on_ac = is_on_ac_power();
+        let want = matches!(value.to_lowercase().as_str(), "yes" | "true" | "1");
+        if (on_ac != want) != negate {
+            return false;
+        }
+    }
+    // ConditionFirstBoot=yes passes only on the first boot.
+    for spec in &unit.condition_first_boot {
+        let (negate, value) = strip_negate(spec);
+        let first = is_first_boot();
+        let want = matches!(value.to_lowercase().as_str(), "yes" | "true" | "1");
+        if (first != want) != negate {
+            return false;
+        }
+    }
+    true
+}
+
+/// Evaluate all `Assert*=` directives in `unit`.
+///
+/// Returns `true` if all asserts pass, `false` if any assert fails (unit
+/// should be marked failed, not just skipped).
+fn check_asserts(unit: &UnitSection) -> bool {
+    for path in &unit.assert_path_exists {
+        if !eval_condition_bool(path, |p| std::path::Path::new(p).exists()) {
+            return false;
+        }
+    }
+    for glob in &unit.assert_path_exists_glob {
+        if !eval_condition_bool(glob, |g| path_glob_matches(g)) {
+            return false;
+        }
+    }
+    for path in &unit.assert_file_not_empty {
+        if !eval_condition_bool(path, |p| {
+            std::fs::metadata(p)
+                .map(|m| m.len() != 0)
+                .unwrap_or(false)
+        }) {
+            return false;
+        }
+    }
+    for path in &unit.assert_directory_not_empty {
+        if !eval_condition_bool(path, |p| {
+            std::fs::read_dir(p)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        }) {
+            return false;
+        }
+    }
+    for spec in &unit.assert_first_boot {
+        let (negate, value) = strip_negate(spec);
+        let first = is_first_boot();
+        let want = matches!(value.to_lowercase().as_str(), "yes" | "true" | "1");
+        if (first != want) != negate {
+            return false;
+        }
+    }
+    true
+}
+
+/// Strip a leading `!` from `spec`, returning `(negated, rest)`.
+fn strip_negate(spec: &str) -> (bool, &str) {
+    if let Some(rest) = spec.strip_prefix('!') {
+        (true, rest)
+    } else {
+        (false, spec)
+    }
+}
+
+/// Evaluate a single condition string against a predicate.
+///
+/// If the spec starts with `!`, the result is negated.
+fn eval_condition_bool<F: Fn(&str) -> bool>(spec: &str, pred: F) -> bool {
+    let (negate, path) = strip_negate(spec);
+    let result = pred(path);
+    if negate { !result } else { result }
+}
+
+/// Check if any filesystem path matches a simple glob pattern.
+///
+/// Uses the same glob logic as the rest of systema (no external crate).
+fn path_glob_matches(pattern: &str) -> bool {
+    // Split into directory and file-name glob parts.
+    let (dir, file_pattern) = match pattern.rfind('/') {
+        Some(pos) => (&pattern[..pos], &pattern[pos + 1..]),
+        None => (".", pattern),
+    };
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok()).any(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| simple_glob_match(file_pattern, n))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Minimal shell-style glob: `*` matches any sequence, `?` matches any char.
+fn simple_glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    glob_match_impl(&pat, &txt)
+}
+
+fn glob_match_impl(pat: &[char], txt: &[char]) -> bool {
+    match (pat.first(), txt.first()) {
+        (None, None) => true,
+        (Some(&'*'), _) => (0..=txt.len()).any(|i| glob_match_impl(&pat[1..], &txt[i..])),
+        (Some(&'?'), Some(_)) => glob_match_impl(&pat[1..], &txt[1..]),
+        (Some(p), Some(t)) if p == t => glob_match_impl(&pat[1..], &txt[1..]),
+        _ => false,
+    }
+}
+
+/// Returns `true` if the system appears to be running on AC power.
+/// Best-effort: returns `true` (assume AC) if the check cannot be performed.
+fn is_on_ac_power() -> bool {
+    // Linux: check /sys/class/power_supply/*/online
+    let path = std::path::Path::new("/sys/class/power_supply");
+    if !path.exists() {
+        return true; // assume AC if sysfs is unavailable
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok()).any(|e| {
+                let online = e.path().join("online");
+                std::fs::read_to_string(&online)
+                    .map(|s| s.trim() == "1")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(true)
+}
+
+/// Returns `true` if this appears to be the first boot of the system.
+/// Heuristic: `/run/systemd/first-boot` or `/run/machine-id` does not exist.
+fn is_first_boot() -> bool {
+    std::path::Path::new("/run/systemd/first-boot").exists()
 }

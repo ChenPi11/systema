@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
-use super::parser::parse_unit;
+use super::parser;
 use super::types::UnitFile;
 use crate::state::AllocatorHandle;
 
@@ -209,15 +209,10 @@ fn is_known_extension(name: &str) -> bool {
     matches!(
         name.rsplit('.').next().unwrap_or(""),
         "service" | "target" | "mount" | "timer" | "socket" | "slice" | "scope"
+            | "swap" | "path" | "device"
     )
 }
 
 fn load_unit_file(path: &Path) -> Result<UnitFile> {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let content = std::fs::read_to_string(path)?;
-    parse_unit(&name, &content)
+    super::parser::parse_unit_from_path(path)
 }
