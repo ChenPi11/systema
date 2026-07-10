@@ -31,3 +31,4 @@ petgraph.workspace = true
 configparser.workspace = true
 zbus.workspace = true
 zvariant.workspace = true
+inotify.workspace = true

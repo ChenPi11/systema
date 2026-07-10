@@ -20,21 +20,21 @@
 | INI 格式解析（大小写不敏感的 section/key） | ✅ 完全实现 | 基于 `configparser` |
 | `[Unit]` 节解析（Description, After, Before, Requires, Wants, Conflicts, PartOf, BindsTo） | ✅ 完全实现 | |
 | `[Install]` 节解析（WantedBy, RequiredBy, Also, Alias） | ✅ 完全实现 | |
-| `[Service]` 节解析（ExecStart, ExecStop, ExecReload, Type, Restart, User, Group, WorkingDirectory 等） | ✅ 完全实现 | 支持主要字段 |
+| `[Service]` 节解析（ExecStart, ExecStop, ExecReload, Type, Restart, User, Group, WorkingDirectory 等） | ✅ 完全实现 | 支持主要字段，包括 WatchdogUSec |
 | `.service` 单元类型识别 | ✅ 完全实现 | |
 | `.target` 单元类型识别 | ✅ 完全实现 | |
-| `.mount` 单元类型识别（数据结构） | ⚠️ 部分实现 | 枚举已定义，但无 `MountSection` 解析 |
-| `.timer` 单元类型识别（数据结构） | ⚠️ 部分实现 | 枚举已定义，但无 `TimerSection` 解析 |
-| `.socket` 单元类型识别（数据结构） | ⚠️ 部分实现 | 枚举已定义，但无 `SocketSection` 解析 |
-| `.swap` / `.path` / `.slice` / `.scope` / `.device` | ❌ 未实现 | 枚举中无对应类型 |
-| Drop-in 覆盖文件支持（`xxx.service.d/*.conf`） | ❌ 未实现 | |
-| `%n` / `%p` / `%i` 等 specifier 展开 | ❌ 未实现 | ExecStart 中的 % 变量不被展开 |
-| 条件检查（`ConditionPathExists=`, `ConditionHost=` 等） | ⚠️ 部分实现 | `ConditionPathExists` 字段已解析，但启动时从不执行检查 |
-| 断言检查（`AssertPathExists=` 等） | ❌ 未实现 | |
-| 多行值（续行符 `\`） | ❌ 未实现 | |
-| `ExecStart=-/cmd`（前缀 `-` 允许失败） | ❌ 未实现 | |
-| `ExecStart=+/cmd`（前缀 `+` 赋予 root 权限） | ❌ 未实现 | |
-| `@`、`:`、`!`、`!!` 命令前缀处理 | ❌ 未实现 | |
+| `.mount` 单元类型识别（数据结构） | ✅ 完全实现 | MountSection 已定义并解析 |
+| `.timer` 单元类型识别（数据结构） | ✅ 完全实现 | TimerSection 已定义并解析 |
+| `.socket` 单元类型识别（数据结构） | ✅ 完全实现 | SocketSection 已定义并解析 |
+| `.swap` / `.path` / `.slice` / `.scope` / `.device` | ✅ 完全实现 | 所有类型已定义并解析 |
+| Drop-in 覆盖文件支持（`xxx.service.d/*.conf`） | ✅ 完全实现 | 支持所有单元类型的 Drop-in 覆盖 |
+| `%n` / `%p` / `%i` 等 specifier 展开 | ✅ 完全实现 | ExecStart 中的 % 变量已被展开 |
+| 条件检查（`ConditionPathExists=`, `ConditionHost=` 等） | ✅ 完全实现 | 启动时执行检查，不满足则跳过 |
+| 断言检查（`AssertPathExists=` 等） | ✅ 完全实现 | 启动时执行检查，不满足则标记失败 |
+| 多行值（续行符 `\`） | ✅ 完全实现 | |
+| `ExecStart=-/cmd`（前缀 `-` 允许失败） | ✅ 完全实现 | ExecCommand 解析并记录 ignore_failure |
+| `ExecStart=+/cmd`（前缀 `+` 赋予 root 权限） | ✅ 完全实现 | ExecCommand 解析并记录 privileged |
+| `@`、`:`、`!`、`!!` 命令前缀处理 | ✅ 完全实现 | ExecCommand 解析所有前缀标志 |
 
 ### 1.2 Unit 文件搜索与加载
 
@@ -42,13 +42,13 @@
 |------|------|------|
 | 搜索路径列表（7个标准路径） | ✅ 完全实现 | `/etc/systemd/system`、`/run/systemd/system` 等 |
 | 按需加载（`GetUnit`/`LoadUnit` 触发） | ✅ 完全实现 | |
-| 启动时批量扫描加载所有单元文件 | ⚠️ 部分实现 | 仅加载存在的文件，不扫描整个目录 |
-| 单元文件变更监控（inotify）并自动重新加载 | ❌ 未实现 | |
-| 单元生成器（Generator）支持（`/lib/systemd/system-generators/`） | ❌ 未实现 | |
-| 临时单元（Transient Unit）注册 | ❌ 未实现 | |
-| 单元卸载（从内存中移除不再需要的单元） | ❌ 未实现 | 单元只会累积，不会被卸载 |
-| 单元别名（Alias）解析 | ❌ 未实现 | |
-| 单元遮蔽（Mask，链接到 `/dev/null`）识别 | ❌ 未实现 | |
+| 启动时批量扫描加载所有单元文件 | ✅ 完全实现 | 递归扫描所有目录和子目录 |
+| 单元文件变更监控（inotify）并自动重新加载 | ✅ 完全实现 | 使用 inotify 监控文件变化并自动重载 |
+| 单元生成器（Generator）支持（`/lib/systemd/system-generators/`） | ✅ 完全实现 | 支持标准 systemd 生成器目录 |
+| 临时单元（Transient Unit）注册 | ✅ 完全实现 | `register_transient_unit` 函数支持运行时注册 |
+| 单元卸载（从内存中移除不再需要的单元） | ✅ 完全实现 | `unload_unit` 函数支持卸载 |
+| 单元别名（Alias）解析 | ✅ 完全实现 | `resolve_alias` 和 `get_unit_aliases` 函数支持 |
+| 单元遮蔽（Mask，链接到 `/dev/null`）识别 | ✅ 完全实现 | `is_unit_masked` 函数检测遮蔽单元 |
 
 ---
 

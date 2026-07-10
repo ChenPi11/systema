@@ -107,19 +107,100 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
     if config.get("install", "wantedby").is_some() {
         parse_install_section(&config, &mut unit.install)?;
     }
-    if let Some(ref mut svc) = unit.service {
-        // configparser only retains the last repeated key, so we must scan raw
-        // lines ourselves to implement systemd's "empty ExecStart= clears" semantics.
-        let exec_lines = collect_exec_lines(&processed, "service", "execstart");
-        for val in exec_lines {
-            if val.is_empty() {
-                svc.exec_start.clear();
-            } else {
-                svc.exec_start
-                    .push(ExecCommand::parse(expand_specifiers(&val, &unit.name)));
+
+    // Handle drop-in for specific section types.
+    match &unit.kind {
+        UnitKind::Service => {
+            if let Some(ref mut svc) = unit.service {
+                // configparser only retains the last repeated key, so we must scan raw
+                // lines ourselves to implement systemd's "empty ExecStart= clears" semantics.
+                let exec_lines = collect_exec_lines(&processed, "service", "execstart");
+                for val in exec_lines {
+                    if val.is_empty() {
+                        svc.exec_start.clear();
+                    } else {
+                        svc.exec_start
+                            .push(ExecCommand::parse(expand_specifiers(&val, &unit.name)));
+                    }
+                }
             }
         }
+        UnitKind::Mount => {
+            if config.get("mount", "what").is_some()
+                || config.get("mount", "where").is_some()
+                || config.get("mount", "type").is_some()
+            {
+                let mut mnt = unit.mount.take().unwrap_or_default();
+                parse_mount_section(&config, &mut mnt, &unit.name)?;
+                unit.mount = Some(mnt);
+            }
+        }
+        UnitKind::Timer => {
+            if config.get("timer", "oncalendar").is_some()
+                || config.get("timer", "onbootsec").is_some()
+                || config.get("timer", "unit").is_some()
+            {
+                let mut tmr = unit.timer.take().unwrap_or_default();
+                parse_timer_section(&config, &mut tmr, &unit.name)?;
+                unit.timer = Some(tmr);
+            }
+        }
+        UnitKind::Socket => {
+            if config.get("socket", "listenstream").is_some()
+                || config.get("socket", "listendatagram").is_some()
+                || config.get("socket", "accept").is_some()
+            {
+                let mut sock = unit.socket.take().unwrap_or_default();
+                parse_socket_section(&config, &mut sock, &unit.name)?;
+                unit.socket = Some(sock);
+            }
+        }
+        UnitKind::Swap => {
+            if config.get("swap", "what").is_some() || config.get("swap", "options").is_some() {
+                let mut swap = unit.swap.take().unwrap_or_default();
+                parse_swap_section(&config, &mut swap, &unit.name)?;
+                unit.swap = Some(swap);
+            }
+        }
+        UnitKind::Path => {
+            if config.get("path", "pathexists").is_some()
+                || config.get("path", "unit").is_some()
+            {
+                let mut path_sec = unit.path.take().unwrap_or_default();
+                parse_path_section(&config, &mut path_sec, &unit.name)?;
+                unit.path = Some(path_sec);
+            }
+        }
+        UnitKind::Slice => {
+            if config.get("slice", "cpuquota").is_some()
+                || config.get("slice", "memorymax").is_some()
+            {
+                let mut slice = unit.slice.take().unwrap_or_default();
+                parse_slice_section(&config, &mut slice, &unit.name)?;
+                unit.slice = Some(slice);
+            }
+        }
+        UnitKind::Scope => {
+            if config.get("scope", "pids").is_some()
+                || config.get("scope", "timeoutstopsec").is_some()
+            {
+                let mut scope = unit.scope.take().unwrap_or_default();
+                parse_scope_section(&config, &mut scope, &unit.name)?;
+                unit.scope = Some(scope);
+            }
+        }
+        UnitKind::Device => {
+            if config.get("device", "property").is_some()
+                || config.get("device", "sysfspath").is_some()
+            {
+                let mut device = unit.device.take().unwrap_or_default();
+                parse_device_section(&config, &mut device, &unit.name)?;
+                unit.device = Some(device);
+            }
+        }
+        _ => {}
     }
+
     Ok(())
 }
 
@@ -211,8 +292,23 @@ fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
                 .with_context(|| format!("Parsing [Path] section of {name}"))?;
             unit.path = Some(path_sec);
         }
-        UnitKind::Slice | UnitKind::Scope | UnitKind::Device => {
-            // These unit types have no dedicated configuration section.
+        UnitKind::Slice => {
+            let mut slice = SliceSection::default();
+            parse_slice_section(&config, &mut slice, name)
+                .with_context(|| format!("Parsing [Slice] section of {name}"))?;
+            unit.slice = Some(slice);
+        }
+        UnitKind::Scope => {
+            let mut scope = ScopeSection::default();
+            parse_scope_section(&config, &mut scope, name)
+                .with_context(|| format!("Parsing [Scope] section of {name}"))?;
+            unit.scope = Some(scope);
+        }
+        UnitKind::Device => {
+            let mut device = DeviceSection::default();
+            parse_device_section(&config, &mut device, name)
+                .with_context(|| format!("Parsing [Device] section of {name}"))?;
+            unit.device = Some(device);
         }
         other => {
             warn!("Unit kind {:?} not fully parsed", other);
@@ -755,6 +851,8 @@ fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> 
         svc.environment_file.push(env_file);
     }
 
+    svc.watchdog_sec = get_u32(config, "service", "watchdogusec", 0);
+
     Ok(())
 }
 
@@ -909,6 +1007,52 @@ fn parse_path_section(config: &Ini, path_sec: &mut PathSection, name: &str) -> R
     path_sec.trigger_limit_interval_sec =
         get_u32(config, "path", "triggerlimitintervalsec", 2);
     path_sec.trigger_limit_burst = get_u32(config, "path", "triggerlimitburst", 200);
+    Ok(())
+}
+
+fn parse_slice_section(config: &Ini, slice: &mut SliceSection, _name: &str) -> Result<()> {
+    slice.cpu_quota = get_str(config, "slice", "cpuquota");
+    slice.cpu_weight = get_u32(config, "slice", "cpuweight", 100);
+    slice.startup_cpu_weight = get_u32(config, "slice", "startupcpuweight", 100);
+    slice.cpu_set_cpus = get_str(config, "slice", "cpusetcpus");
+    slice.cpu_set_memory_nodes = get_str(config, "slice", "cpusetmemorynodes");
+    slice.memory_max = get_str(config, "slice", "memorymax");
+    slice.memory_high = get_str(config, "slice", "memoryhigh");
+    slice.memory_low = get_str(config, "slice", "memorylow");
+    slice.memory_min = get_str(config, "slice", "memorymin");
+    slice.io_weight = get_u32(config, "slice", "ioweight", 100);
+    slice.io_bandwidth_max = get_str(config, "slice", "iobandwidthmax");
+    slice.tasks_max = get_u32(config, "slice", "tasksmax", u32::MAX);
+    slice.allowed_cpus = get_str(config, "slice", "allowedcpus");
+    slice.allowed_memory_nodes = get_str(config, "slice", "allowedmemorynodes");
+    Ok(())
+}
+
+fn parse_scope_section(config: &Ini, scope: &mut ScopeSection, _name: &str) -> Result<()> {
+    let pids = get_str(config, "scope", "pids");
+    if !pids.is_empty() {
+        scope.pids = split_vec(&pids);
+    }
+    scope.timeout_stop_sec = get_u32(config, "scope", "timeoutstopsec", 90);
+    scope.runtime_max_sec = get_u32(config, "scope", "runtimemaxsec", 0);
+    scope.kill_mode = get_str(config, "scope", "killmode");
+    scope.kill_signal = get_str(config, "scope", "killsignal");
+    scope.send_sighup = get_bool(config, "scope", "sendsighup", false);
+    scope.cpu_quota = get_str(config, "scope", "cpuquota");
+    scope.cpu_weight = get_u32(config, "scope", "cpuweight", 100);
+    scope.memory_max = get_str(config, "scope", "memorymax");
+    scope.tasks_max = get_u32(config, "scope", "tasksmax", u32::MAX);
+    Ok(())
+}
+
+fn parse_device_section(config: &Ini, device: &mut DeviceSection, _name: &str) -> Result<()> {
+    let property = get_str(config, "device", "property");
+    if !property.is_empty() {
+        device.property = split_vec(&property);
+    }
+    device.sysfs_path = get_str(config, "device", "sysfspath");
+    device.device_name = get_str(config, "device", "devicename");
+    device.device_path = get_str(config, "device", "devicepath");
     Ok(())
 }
 
@@ -1336,6 +1480,91 @@ ExecStart=/usr/bin/myapp \
         let unit = parse_unit("hello.service", content).unwrap();
         let svc = unit.service.unwrap();
         assert_eq!(svc.exec_start[0].args, vec!["hello.service"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Slice unit parsing
+    // -----------------------------------------------------------------------
+
+    const SLICE_UNIT: &str = r#"
+[Unit]
+Description=System slice
+
+[Slice]
+CPUQuota=50%
+MemoryMax=1G
+TasksMax=512
+CPUWeight=200
+"#;
+
+    #[test]
+    fn test_parse_slice() {
+        let unit = parse_unit("system.slice", SLICE_UNIT).unwrap();
+        assert!(matches!(unit.kind, UnitKind::Slice));
+        let slice = unit.slice.unwrap();
+        assert_eq!(slice.cpu_quota, "50%");
+        assert_eq!(slice.memory_max, "1G");
+        assert_eq!(slice.tasks_max, 512);
+        assert_eq!(slice.cpu_weight, 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // Scope unit parsing
+    // -----------------------------------------------------------------------
+
+    const SCOPE_UNIT: &str = r#"
+[Scope]
+PIDs=1234 5678
+TimeoutStopSec=30
+KillMode=control-group
+MemoryMax=2G
+"#;
+
+    #[test]
+    fn test_parse_scope() {
+        let unit = parse_unit("test.scope", SCOPE_UNIT).unwrap();
+        assert!(matches!(unit.kind, UnitKind::Scope));
+        let scope = unit.scope.unwrap();
+        assert_eq!(scope.pids, vec!["1234", "5678"]);
+        assert_eq!(scope.timeout_stop_sec, 30);
+        assert_eq!(scope.kill_mode, "control-group");
+        assert_eq!(scope.memory_max, "2G");
+    }
+
+    // -----------------------------------------------------------------------
+    // Device unit parsing
+    // -----------------------------------------------------------------------
+
+    const DEVICE_UNIT: &str = r#"
+[Device]
+Property=ID_BUS=usb
+SysfsPath=/sys/devices/pci0000:00/0000:00:14.0/usb1
+DeviceName=/dev/sda
+"#;
+
+    #[test]
+    fn test_parse_device() {
+        let unit = parse_unit("sda.device", DEVICE_UNIT).unwrap();
+        assert!(matches!(unit.kind, UnitKind::Device));
+        let device = unit.device.unwrap();
+        assert_eq!(device.property, vec!["ID_BUS=usb"]);
+        assert_eq!(
+            device.sysfs_path,
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1"
+        );
+        assert_eq!(device.device_name, "/dev/sda");
+    }
+
+    // -----------------------------------------------------------------------
+    // WatchdogSec parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_watchdog_sec_parsed() {
+        let content = "[Service]\nExecStart=/usr/bin/daemon\nWatchdogUSec=30\n";
+        let unit = parse_unit("watchdog.service", content).unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.watchdog_sec, 30);
     }
 
     // -----------------------------------------------------------------------

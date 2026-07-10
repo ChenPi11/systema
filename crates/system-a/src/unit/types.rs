@@ -445,6 +445,12 @@ pub struct UnitFile {
     pub swap: Option<SwapSection>,
     /// Present only for path units.
     pub path: Option<PathSection>,
+    /// Present only for slice units.
+    pub slice: Option<SliceSection>,
+    /// Present only for scope units.
+    pub scope: Option<ScopeSection>,
+    /// Present only for device units.
+    pub device: Option<DeviceSection>,
 }
 
 impl UnitFile {
@@ -462,6 +468,9 @@ impl UnitFile {
             socket: None,
             swap: None,
             path: None,
+            slice: None,
+            scope: None,
+            device: None,
         }
     }
 }
@@ -601,6 +610,95 @@ impl Default for SwapSection {
             timeout_sec: 90,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// [Slice] section
+// ---------------------------------------------------------------------------
+
+/// `[Slice]` section for `.slice` units.
+///
+/// Slices are cgroup-based resource management units. They don't have
+/// their own processes but group other units (services, scopes, etc.)
+/// for resource control.
+#[derive(Debug, Clone, Default)]
+pub struct SliceSection {
+    /// CPU quota relative to the total CPU time (`CPUQuota=`).
+    /// e.g. "50%" means the slice can use at most 50% of one CPU.
+    pub cpu_quota: String,
+    /// CPU weight (relative weight, default 100) (`CPUWeight=`).
+    pub cpu_weight: u32,
+    /// Startup CPU weight (`StartupCPUWeight=`).
+    pub startup_cpu_weight: u32,
+    /// CPU set (`CPUSetCPUs=`, `CPUSetMemoryNodes=`).
+    pub cpu_set_cpus: String,
+    pub cpu_set_memory_nodes: String,
+    /// Memory limit (`MemoryMax=`, `MemoryHigh=`, `MemoryLow=`, `MemoryMin=`).
+    pub memory_max: String,
+    pub memory_high: String,
+    pub memory_low: String,
+    pub memory_min: String,
+    /// IO weight (`IOWeight=`).
+    pub io_weight: u32,
+    /// IO bandwidth limits (`IOBandwidthMax=`).
+    pub io_bandwidth_max: String,
+    /// Tasks max (`TasksMax=`).
+    pub tasks_max: u32,
+    /// Allowed CPUs (`AllowedCPUs=`).
+    pub allowed_cpus: String,
+    /// Allowed memory nodes (`AllowedMemoryNodes=`).
+    pub allowed_memory_nodes: String,
+}
+
+// ---------------------------------------------------------------------------
+// [Scope] section
+// ---------------------------------------------------------------------------
+
+/// `[Scope]` section for `.scope` units.
+///
+/// Scopes are cgroup-based units that wrap externally created processes
+/// (not spawned by systemd). They are used for resource management of
+/// processes started by other means.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeSection {
+    /// Processes to include in the scope (`PIDs=`).
+    pub pids: Vec<String>,
+    /// Timeout for the scope in seconds (`TimeoutStopSec=`).
+    pub timeout_stop_sec: u32,
+    /// Runtime timeout in seconds (`RuntimeMaxSec=`).
+    pub runtime_max_sec: u32,
+    /// Whether to kill all processes when the scope is stopped (`KillMode=`).
+    pub kill_mode: String,
+    /// Signal to send when stopping (`KillSignal=`).
+    pub kill_signal: String,
+    /// Whether to send SIGHUP before SIGKILL (`SendSIGHUP=`).
+    pub send_sighup: bool,
+    /// Resource limits (same as Slice).
+    pub cpu_quota: String,
+    pub cpu_weight: u32,
+    pub memory_max: String,
+    pub tasks_max: u32,
+}
+
+// ---------------------------------------------------------------------------
+// [Device] section
+// ---------------------------------------------------------------------------
+
+/// `[Device]` section for `.device` units.
+///
+/// Device units represent device files in `/dev/`. They are typically
+/// created automatically by systemd when devices appear, but can also
+/// be defined in unit files for udev rule integration.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceSection {
+    /// udev property name to match (`Property=`).
+    pub property: Vec<String>,
+    /// sysfs path to match (`SysfsPath=`).
+    pub sysfs_path: String,
+    /// Device name pattern (`DeviceName=`).
+    pub device_name: String,
+    /// Shell-style pattern for device name (`DevicePath=`).
+    pub device_path: String,
 }
 
 // ---------------------------------------------------------------------------
