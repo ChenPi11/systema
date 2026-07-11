@@ -131,7 +131,7 @@ impl UnitObject {
 
     #[zbus(property)]
     fn fragment_path(&self) -> String {
-        for dir in crate::unit::loader::UNIT_SEARCH_PATHS {
+        for dir in common::paths::UNIT_SEARCH_PATHS {
             let path = std::path::Path::new(dir).join(&self.unit_name);
             if path.exists() {
                 return path.to_string_lossy().into_owned();

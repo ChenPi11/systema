@@ -29,7 +29,7 @@ use common::proto::{
 use crate::process::{is_alive, start_service, stop_service};
 use crate::state::{new_registry, ServiceRegistry, ServiceState};
 
-const ALLOCATOR_SOCKET: &str = "/run/system-alphabet/allocator.sock";
+const ALLOCATOR_SOCKET: &str = common::paths::IPC_SOCKET_PATH;
 const WORKER_ID: &str = "system-s-1";
 const WORKER_UNIT_TYPES: &[&str] = &["service"];
 

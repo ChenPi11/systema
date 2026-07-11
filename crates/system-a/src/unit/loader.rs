@@ -19,26 +19,10 @@ use super::types::UnitFile;
 use crate::state::AllocatorHandle;
 
 /// Standard systemd unit file search directories, in priority order.
-pub const UNIT_SEARCH_PATHS: &[&str] = &[
-    "/etc/system-alphabet", // system-alphabet-specific overrides
-    "/run/system-alphabet", // runtime-generated units
-    "/usr/local/lib/system-alphabet",
-    "/usr/lib/system-alphabet",
-    // Fall back to systemd's own directories so we can read real unit files.
-    "/etc/systemd/system",
-    "/usr/lib/systemd/system",
-    "/lib/systemd/system",
-];
-
-/// Standard systemd generator search directories.
-pub const GENERATOR_SEARCH_PATHS: &[&str] = &[
-    "/run/systemd/generator",
-    "/run/systemd/generator.late",
-    "/etc/systemd/system-generators",
-    "/usr/local/lib/systemd/system-generators",
-    "/usr/lib/systemd/system-generators",
-    "/lib/systemd/system-generators",
-];
+///
+/// Populated from `common::paths::UNIT_SEARCH_PATHS` (compile-time configurable).
+pub use common::paths::UNIT_SEARCH_PATHS;
+pub use common::paths::GENERATOR_SEARCH_PATHS;
 
 /// Load all unit files from the default search paths into the allocator.
 pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {

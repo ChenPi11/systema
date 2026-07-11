@@ -19,7 +19,7 @@ use crate::state::{
     JobStatus, WorkerEntry, WorkerTask,
 };
 
-pub const SOCKET_PATH: &str = "/run/system-alphabet/allocator.sock";
+pub const SOCKET_PATH: &str = common::paths::IPC_SOCKET_PATH;
 
 /// Run the IPC server — accepts System Worker connections indefinitely.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
