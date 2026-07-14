@@ -714,7 +714,7 @@ pub struct PathSection {
     pub path_exists_glob: Vec<String>,
     /// Activate when the path is created or modified (`PathChanged=`).
     pub path_changed: Vec<String>,
-    /// Activate when the path is modified (inotify `IN_CLOSE_WRITE`) (`PathModified=`).
+    /// Activate when the path is modified (`PathModified=`).
     pub path_modified: Vec<String>,
     /// Activate when the directory is non-empty (`DirectoryNotEmpty=`).
     pub directory_not_empty: Vec<String>,

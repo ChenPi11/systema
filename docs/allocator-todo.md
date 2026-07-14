@@ -43,7 +43,7 @@
 | 搜索路径列表（7个标准路径） | ✅ 完全实现 | `/etc/systemd/system`、`/run/systemd/system` 等 |
 | 按需加载（`GetUnit`/`LoadUnit` 触发） | ✅ 完全实现 | |
 | 启动时批量扫描加载所有单元文件 | ✅ 完全实现 | 递归扫描所有目录和子目录 |
-| 单元文件变更监控（inotify）并自动重新加载 | ✅ 完全实现 | 使用 inotify 监控文件变化并自动重载 |
+| 单元文件变更监控（inotify）并自动重新加载 | 🚫 不计划实现 | 使用 inotify 监控文件变化并自动重载 |
 | 单元生成器（Generator）支持（`/lib/systemd/system-generators/`） | ✅ 完全实现 | 支持标准 systemd 生成器目录 |
 | 临时单元（Transient Unit）注册 | ✅ 完全实现 | `register_transient_unit` 函数支持运行时注册 |
 | 单元卸载（从内存中移除不再需要的单元） | ✅ 完全实现 | `unload_unit` 函数支持卸载 |

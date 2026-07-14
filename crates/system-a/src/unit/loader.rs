@@ -3,7 +3,6 @@
 //! This module handles:
 //! - Loading unit files from standard search paths
 //! - Recursive directory scanning for unit files
-//! - File system monitoring (inotify) for automatic reload
 //! - Unit generators
 //! - Transient unit registration
 //! - Unit unloading
@@ -200,35 +199,6 @@ pub fn is_unit_masked(name: &str) -> bool {
     false
 }
 
-/// Start monitoring unit directories for changes using inotify.
-/// Returns a handle that can be used to stop monitoring.
-pub async fn start_watching_units(
-    allocator: AllocatorHandle,
-) -> Result<tokio::sync::oneshot::Sender<()>> {
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-
-    let watch_dirs: Vec<PathBuf> = UNIT_SEARCH_PATHS
-        .iter()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect();
-
-    if watch_dirs.is_empty() {
-        warn!("No unit directories to watch");
-        return Ok(stop_tx);
-    }
-
-    info!("Starting unit file watcher for {} directories", watch_dirs.len());
-
-    tokio::spawn(async move {
-        if let Err(e) = watch_unit_directories(allocator, watch_dirs, stop_rx).await {
-            warn!("Unit file watcher error: {}", e);
-        }
-    });
-
-    Ok(stop_tx)
-}
-
 // --------------------------------------------------------------------------
 // Private helpers
 // --------------------------------------------------------------------------
@@ -346,71 +316,6 @@ async fn load_units_from_dir(dir: &Path, allocator: AllocatorHandle) -> Result<u
     }
 
     Ok(count)
-}
-
-/// Watch unit directories for changes using inotify and reload units when modified.
-async fn watch_unit_directories(
-    allocator: AllocatorHandle,
-    dirs: Vec<PathBuf>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-) -> Result<()> {
-    use inotify::{Inotify, WatchMask};
-    use std::sync::{Arc, Mutex};
-
-    let inotify = Inotify::init().context("Failed to initialize inotify")?;
-    let inotify = Arc::new(Mutex::new(inotify));
-
-    // Watch for: create, modify, delete, move events
-    let mask = WatchMask::CREATE
-        | WatchMask::MODIFY
-        | WatchMask::DELETE
-        | WatchMask::MOVED_FROM
-        | WatchMask::MOVED_TO;
-
-    // Watch all directories
-    {
-        let inotify_guard = inotify.lock().unwrap();
-        for dir in &dirs {
-            if let Err(e) = inotify_guard.watches().add(dir, mask) {
-                warn!("Failed to watch {}: {}", dir.display(), e);
-            }
-        }
-    }
-
-    loop {
-        tokio::select! {
-            _ = &mut stop_rx => {
-                info!("Unit file watcher stopped");
-                break;
-            }
-            result = {
-                let inotify = inotify.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        let mut buffer = [0u8; 4096];
-                        let mut inotify_guard = inotify.lock().unwrap();
-                        inotify_guard.read_events(&mut buffer).map(|_| ())
-                    }).await
-                }
-            } => {
-                match result {
-                    Ok(Ok(())) => {
-                        // Events were read, but we need to re-read to get the actual events
-                        // For now, we'll just log that events were detected
-                        debug!("Unit file change detected");
-                    }
-                    Ok(Err(e)) => {
-                        warn!("inotify read error: {}", e);
-                    }
-                    Err(e) => {
-                        warn!("inotify task error: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn is_known_extension(name: &str) -> bool {

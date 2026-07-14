@@ -26,9 +26,7 @@ once_cell.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
 petgraph.workspace = true
 configparser.workspace = true
 zbus.workspace = true
 zvariant.workspace = true
-inotify.workspace = true
