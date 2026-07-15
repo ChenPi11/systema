@@ -13,8 +13,12 @@ use common::proto::UnitConfig;
 use crate::state::{ServiceInstance, ServiceRegistry, ServiceState};
 
 /// Launch the service described by `config`.
-/// Returns the PID of the spawned main process.
-pub async fn start_service(registry: ServiceRegistry, config: &UnitConfig) -> Result<u32> {
+/// Returns the PID and the Child handle of the spawned main process.
+/// The caller must keep the Child handle to later collect the exit status.
+pub async fn start_service(
+    registry: ServiceRegistry,
+    config: &UnitConfig,
+) -> Result<(u32, Child)> {
     let unit_name = config.unit_name.clone();
     let svc = config
         .service
@@ -77,7 +81,7 @@ pub async fn start_service(registry: ServiceRegistry, config: &UnitConfig) -> Re
         }
     }
 
-    Ok(pid)
+    Ok((pid, child))
 }
 
 /// Monitor a child process and return when it exits.

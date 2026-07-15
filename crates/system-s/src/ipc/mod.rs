@@ -26,7 +26,7 @@ use common::proto::{
     UnitConfig, WorkerRegistration,
 };
 
-use crate::process::{is_alive, start_service, stop_service};
+use crate::process::{start_service, stop_service};
 use crate::state::{new_registry, ServiceRegistry, ServiceState};
 
 const ALLOCATOR_SOCKET: &str = common::paths::IPC_SOCKET_PATH;
@@ -280,7 +280,7 @@ async fn execute_task(
             let config = unit_config
                 .ok_or_else(|| anyhow::anyhow!("No UnitConfig in task for {}", task.unit_name))?;
 
-            let pid = start_service(registry.clone(), config).await?;
+            let (pid, child) = start_service(registry.clone(), config).await?;
 
             // Notify System A that the service is running.
             queue_event(
@@ -290,11 +290,13 @@ async fn execute_task(
                 serde_json::json!({ "pid": pid }).to_string().as_bytes(),
             )?;
 
-            // Spawn a background monitor that will report unexpected exits.
+            // Spawn a background monitor that will detect exit and report
+            // failures to System A.
             tokio::spawn(monitor_service(
                 registry.clone(),
                 task.unit_name.clone(),
                 out_tx.clone(),
+                child,
             ));
         }
 
@@ -317,7 +319,7 @@ async fn execute_task(
             stop_service(registry.clone(), &task.unit_name, timeout).await?;
 
             if let Some(config) = unit_config {
-                let pid = start_service(registry.clone(), config).await?;
+                let (pid, child) = start_service(registry.clone(), config).await?;
                 queue_event(
                     out_tx,
                     "service.started",
@@ -328,6 +330,7 @@ async fn execute_task(
                     registry.clone(),
                     task.unit_name.clone(),
                     out_tx.clone(),
+                    child,
                 ));
             }
         }
@@ -364,26 +367,31 @@ async fn execute_task(
 // Background monitor
 // ---------------------------------------------------------------------------
 
-/// Poll a service every second and report unexpected exits to System A via
-/// the outgoing-message channel.
+/// Monitor a service process every second and handle exit (expected or
+/// unexpected).
 ///
-/// This task exits once the service stops (for any reason).  When the exit is
-/// NOT caused by an intentional `Stop` task (i.e. the service state is still
-/// `Running` when the PID disappears), a `service.failed` event is sent so
-/// System A can update its runtime state.
+/// When the process exits with a non‑zero code the service is marked as
+/// `Failed` and a `service.failed` event is sent to System A.  A zero exit
+/// code is treated as a normal termination (`Dead`, not `Failed`).
+///
+/// The task exits when:
+/// * the service is removed from the registry,
+/// * an external `Stop` task changes the state to `Stopping`,
+/// * or the child process exits.
 async fn monitor_service(
     registry: ServiceRegistry,
     unit_name: String,
     out_tx: mpsc::UnboundedSender<bytes::Bytes>,
+    mut child: tokio::process::Child,
 ) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-        let (pid, state) = {
+        let state = {
             let reg = registry.lock();
             match reg.get(&unit_name) {
                 None => break,
-                Some(inst) => (inst.main_pid, inst.state),
+                Some(inst) => inst.state,
             }
         };
 
@@ -395,9 +403,38 @@ async fn monitor_service(
             break;
         }
 
-        if let Some(pid) = pid {
-            if !is_alive(pid) {
-                info!("Service {} (PID {}) exited unexpectedly", unit_name, pid);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let pid = child.id().unwrap_or(0);
+                info!(
+                    "Service {} (PID {}) exited: code={:?}, success={}",
+                    unit_name,
+                    pid,
+                    status.code(),
+                    status.success()
+                );
+                let state = if status.success() {
+                    ServiceState::Dead
+                } else {
+                    ServiceState::Failed
+                };
+                {
+                    let mut reg = registry.lock();
+                    if let Some(inst) = reg.get_mut(&unit_name) {
+                        inst.state = state;
+                        inst.main_pid = None;
+                        inst.last_exit_code = status.code();
+                    }
+                }
+                if state == ServiceState::Failed {
+                    // Report the unexpected exit to System A.
+                    let _ = queue_event(&out_tx, "service.failed", &unit_name, b"");
+                }
+                break;
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                warn!("Error waiting for child process of {}: {}", unit_name, e);
                 {
                     let mut reg = registry.lock();
                     if let Some(inst) = reg.get_mut(&unit_name) {
@@ -405,13 +442,9 @@ async fn monitor_service(
                         inst.main_pid = None;
                     }
                 }
-                // Report the unexpected exit to System A.
                 let _ = queue_event(&out_tx, "service.failed", &unit_name, b"");
                 break;
             }
-        } else {
-            // No PID recorded — service is not running.
-            break;
         }
     }
 }
