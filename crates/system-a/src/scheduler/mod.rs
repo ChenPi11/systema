@@ -16,7 +16,7 @@ use crate::state::{
     JobKind, JobMode, JobNewInfo, JobResult, JobResultKind, JobStatus, StartLimitState,
     UnitRuntimeInfo, WorkerTask,
 };
-use crate::unit::types::{RestartPolicy, UnitFile, UnitKind, UnitSection};
+use crate::unit::types::{ExitKind, RestartPolicy, UnitFile, UnitKind, UnitSection};
 use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
@@ -805,10 +805,8 @@ pub fn handle_task_result(
     kind: JobKind,
 ) {
     let mut post_actions: Vec<PostAction> = Vec::new();
-    let mut should_restart = false;
-    let mut restart_delay = 0u64;
 
-    {
+    let task_restart_info: Option<(RestartPolicy, ExitKind)> = {
         let mut state = allocator.write();
 
         // Clean up the task_id → kind mapping.
@@ -952,51 +950,25 @@ pub fn handle_task_result(
             }
         }
 
-        // --- Restart policy: check if the failed unit should be restarted ---
-        // Extract info under the lock, then process after releasing it.
-        let restart_policy: Option<(RestartPolicy, u32)> = state
-            .units
-            .get(unit_name)
-            .and_then(|u| u.service.as_ref())
-            .map(|svc| (svc.restart.clone(), svc.restart_sec));
-        if let Some((ref policy, restart_sec_val)) = restart_policy {
+        // --- Restart policy: determine exit kind and check if restart needed ---
+        let task_restart_info: Option<(RestartPolicy, ExitKind)> =
             if !success && matches!(kind, JobKind::Start) {
-                let should = match policy {
-                    RestartPolicy::Always => true,
-                    RestartPolicy::OnFailure => {
-                        !matches!(
-                            message,
-                            "TimeoutStartSec exceeded" | "JobRunningTimeout exceeded"
-                        )
-                    }
-                    RestartPolicy::OnAbnormal => {
-                        !matches!(message, "exit code")
-                    }
-                    _ => false,
+                let exit_kind = if message.contains("Timeout") {
+                    ExitKind::Timeout
+                } else if message.contains("exit code") {
+                    ExitKind::ExitCode(-1)
+                } else {
+                    // Generic task failure — treat as non-zero exit.
+                    ExitKind::ExitCode(1)
                 };
-                if should {
-                    // Check rate limit (needs lock, will re-acquire)
-                    let interval = Duration::from_secs(10);
-                    let burst = 5u32;
-                    drop(state);
-                    let mut wstate = allocator.write();
-                    let limit_state = wstate
-                        .start_limit_state
-                        .entry(unit_name.to_string())
-                        .or_insert_with(StartLimitState::new);
-                    if limit_state.check_rate_limit(interval, burst) {
-                        should_restart = true;
-                        restart_delay = restart_sec_val as u64;
-                    } else {
-                        warn!(
-                            "Restart rate limit exceeded for {}, not restarting",
-                            unit_name
-                        );
-                    }
-                    // Note: wstate goes out of scope here and the write lock is released
-                }
-            }
-        }
+                state
+                    .units
+                    .get(unit_name)
+                    .and_then(|u| u.service.as_ref())
+                    .map(|svc| (svc.restart.clone(), exit_kind))
+            } else {
+                None
+            };
     } // drop write lock
 
     // Execute post-actions asynchronously.
@@ -1027,20 +999,10 @@ pub fn handle_task_result(
     }
 
     // Schedule restart if the restart policy triggered.
-    if should_restart {
-        let alloc = allocator.clone();
-        let name = unit_name.to_string();
-        tokio::spawn(async move {
-            if restart_delay > 0 {
-                tokio::time::sleep(Duration::from_secs(restart_delay)).await;
-            }
-            info!("Restarting {} per restart policy", name);
-            if let Err(e) =
-                enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace).await
-            {
-                warn!("Failed to restart {}: {}", name, e);
-            }
-        });
+    if let Some((ref policy, ref exit_kind)) = task_restart_info {
+        if should_restart_service(policy, exit_kind) {
+            schedule_automatic_restart(allocator.clone(), unit_name);
+        }
     }
 }
 
@@ -1103,6 +1065,92 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
         description: uf.unit.description.clone(),
         service,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unified restart-policy helpers
+// ---------------------------------------------------------------------------
+
+/// Determine whether a service should be restarted based on its `RestartPolicy`
+/// and how it exited.  Mirrors systemd's behaviour table:
+///
+/// | Policy       | ExitCode 0 | ExitCode != 0 | Signal | Timeout | Watchdog |
+/// |--------------|-----------|---------------|--------|---------|----------|
+/// | no           |     ✗     |       ✗       |   ✗    |    ✗    |    ✗     |
+/// | on-success   |     ✓     |       ✗       |   ✗    |    ✗    |    ✗     |
+/// | on-failure   |     ✗     |       ✓       |   ✓    |    ✓    |    ✗     |
+/// | on-abnormal  |     ✗     |       ✗       |   ✓    |    ✓    |    ✗     |
+/// | on-watchdog  |     ✗     |       ✗       |   ✗    |    ✗    |    ✓     |
+/// | on-abort     |     ✗     |       ✗       |   ✓    |    ✗    |    ✗     |
+/// | always       |     ✓     |       ✓       |   ✓    |    ✓    |    ✓     |
+pub fn should_restart_service(policy: &RestartPolicy, exit_kind: &ExitKind) -> bool {
+    use ExitKind::*;
+    match policy {
+        RestartPolicy::No => false,
+        RestartPolicy::Always => true,
+        RestartPolicy::OnSuccess => matches!(exit_kind, ExitCode(0)),
+        RestartPolicy::OnFailure => {
+            matches!(exit_kind, ExitCode(c) if *c != 0)
+                || matches!(exit_kind, Signal(_) | Timeout)
+        }
+        RestartPolicy::OnAbnormal => matches!(exit_kind, Signal(_) | Timeout),
+        RestartPolicy::OnWatchdog => matches!(exit_kind, Watchdog),
+        RestartPolicy::OnAbort => matches!(exit_kind, Signal(_)),
+    }
+}
+
+/// Check the start rate limit for `unit_name` and, if it passes, spawn an
+/// async task that waits `RestartSec` and then enqueues a `Start` job.
+///
+/// Rate-limit parameters are read from the unit's `[Service]` section
+/// (`StartLimitIntervalSec` / `StartLimitBurst`), falling back to 10 s / 5.
+///
+/// Returns `true` if the restart was scheduled, `false` if rate-limited.
+pub fn schedule_automatic_restart(
+    allocator: AllocatorHandle,
+    unit_name: &str,
+) -> bool {
+    let (interval_sec, burst, restart_sec) = {
+        let state = allocator.read();
+        let svc = state.units.get(unit_name).and_then(|u| u.service.as_ref());
+        (
+            svc.map(|s| s.start_limit_interval_sec).unwrap_or(10),
+            svc.map(|s| s.start_limit_burst).unwrap_or(5),
+            svc.map(|s| s.restart_sec as u64).unwrap_or(0),
+        )
+    };
+
+    let rate_ok = {
+        let mut state = allocator.write();
+        let limit_state = state
+            .start_limit_state
+            .entry(unit_name.to_string())
+            .or_insert_with(StartLimitState::new);
+        limit_state.check_rate_limit(Duration::from_secs(interval_sec as u64), burst)
+    };
+
+    if !rate_ok {
+        warn!(
+            "Restart rate limit exceeded for {} (interval={}s burst={}), not auto-restarting",
+            unit_name, interval_sec, burst
+        );
+        return false;
+    }
+
+    let alloc = allocator.clone();
+    let name = unit_name.to_string();
+    tokio::spawn(async move {
+        if restart_sec > 0 {
+            tokio::time::sleep(Duration::from_secs(restart_sec)).await;
+        }
+        info!("Auto-restarting {} after exit/failure", name);
+        if let Err(e) = enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace).await
+        {
+            warn!("Failed to auto-restart {}: {}", name, e);
+        }
+    });
+
+    true
 }
 
 // ---------------------------------------------------------------------------

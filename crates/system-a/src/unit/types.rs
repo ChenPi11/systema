@@ -342,6 +342,11 @@ pub struct ServiceSection {
     pub kill_mode: String,
     pub standard_output: String,
     pub standard_error: String,
+    pub start_limit_interval_sec: u32,
+    pub start_limit_burst: u32,
+    pub start_limit_action: StartLimitAction,
+    pub restart_steps: u32,
+    pub restart_max_delay_sec: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -423,6 +428,57 @@ impl From<&str> for RestartPolicy {
             _ => RestartPolicy::No,
         }
     }
+}
+
+/// Describes what action to take when the start rate limit is exceeded.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StartLimitAction {
+    #[default]
+    None,
+    Reboot,
+    RebootForce,
+    RebootImmediate,
+    Poweroff,
+    Exit,
+}
+
+impl StartLimitAction {
+    pub fn as_str(&self) -> &str {
+        match self {
+            StartLimitAction::None => "none",
+            StartLimitAction::Reboot => "reboot",
+            StartLimitAction::RebootForce => "reboot-force",
+            StartLimitAction::RebootImmediate => "reboot-immediate",
+            StartLimitAction::Poweroff => "poweroff",
+            StartLimitAction::Exit => "exit",
+        }
+    }
+}
+
+impl From<&str> for StartLimitAction {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "reboot" => StartLimitAction::Reboot,
+            "reboot-force" => StartLimitAction::RebootForce,
+            "reboot-immediate" => StartLimitAction::RebootImmediate,
+            "poweroff" => StartLimitAction::Poweroff,
+            "exit" => StartLimitAction::Exit,
+            _ => StartLimitAction::None,
+        }
+    }
+}
+
+/// Classifies how a service process terminated, for restart-policy evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitKind {
+    /// Process exited normally with a code.
+    ExitCode(i32),
+    /// Process was killed by a signal.
+    Signal(i32),
+    /// Operation timed out.
+    Timeout,
+    /// Watchdog triggered.
+    Watchdog,
 }
 
 /// A fully parsed systemd unit file.

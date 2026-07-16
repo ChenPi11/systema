@@ -856,6 +856,16 @@ fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> 
 
     svc.watchdog_sec = get_u32(config, "service", "watchdogusec", 0);
 
+    // --- Start limit fields ---
+    svc.start_limit_interval_sec = get_u32(config, "service", "startlimitintervalsec", 10);
+    svc.start_limit_burst = get_u32(config, "service", "startlimitburst", 5);
+
+    let sla = get_str(config, "service", "startlimitaction");
+    svc.start_limit_action = StartLimitAction::from(sla.as_str());
+
+    svc.restart_steps = get_u32(config, "service", "restartsteps", 0);
+    svc.restart_max_delay_sec = get_u32(config, "service", "restartmaxdelaysec", 0);
+
     Ok(())
 }
 

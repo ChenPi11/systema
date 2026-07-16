@@ -13,12 +13,12 @@ use tracing::{debug, error, info, warn};
 use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use common::proto::{Envelope, EventPublish, RegisterAck, TaskResult, WorkerRegistration};
 
-use crate::scheduler::{self, build_task_dispatch};
+use crate::scheduler::{self, build_task_dispatch, schedule_automatic_restart, should_restart_service};
 use crate::state::{
     next_request_id, ActiveState, AllocatorHandle, JobCompletion, JobKind, JobMode, JobResultKind,
     JobStatus, WorkerEntry, WorkerTask,
 };
-use crate::unit::types::RestartPolicy;
+use crate::unit::types::{ExitKind, RestartPolicy};
 
 pub const SOCKET_PATH: &str = common::paths::IPC_SOCKET_PATH;
 
@@ -288,80 +288,41 @@ async fn handle_event(allocator: AllocatorHandle, event: EventPublish) -> Result
     match event.event_type.as_str() {
         "process.exit" => {
             let unit_name = event.unit_name.clone();
-            let mut state = allocator.write();
-            let rt = state.runtime.entry(unit_name.clone()).or_default();
-            let was_active = rt.active_state == crate::state::ActiveState::Active;
-            if was_active {
-                rt.active_state = crate::state::ActiveState::Inactive;
-                rt.sub_state = "dead".to_string();
-            }
-            rt.main_pid = None;
-
-            // Check restart policy and trigger restart if applicable.
-            let should_restart = was_active
-                && state
-                    .units
-                    .get(&unit_name)
-                    .and_then(|u| u.service.as_ref())
-                    .map(|svc| match svc.restart {
-                        RestartPolicy::Always => true,
-                        RestartPolicy::OnFailure
-                        | RestartPolicy::OnAbnormal
-                        | RestartPolicy::OnAbort
-                        | RestartPolicy::OnWatchdog => true,
-                        RestartPolicy::OnSuccess => {
-                            // Only restart if the process exited with code 0
-                            serde_json::from_slice::<serde_json::Value>(&event.event_data)
-                                .ok()
-                                .and_then(|v| v["exit_code"].as_i64())
-                                .map(|code| code == 0)
-                                .unwrap_or(false)
-                        }
-                        RestartPolicy::No => false,
-                    })
-                    .unwrap_or(false);
-
-            if should_restart {
-                let restart_sec = state
-                    .units
-                    .get(&unit_name)
-                    .and_then(|u| u.service.as_ref())
-                    .map(|s| s.restart_sec as u64)
-                    .unwrap_or(0);
-
-                // Rate limiting
-                let interval = std::time::Duration::from_secs(10);
-                let burst = 5u32;
-                let rate_ok = state
-                    .start_limit_state
-                    .entry(unit_name.clone())
-                    .or_insert_with(crate::state::StartLimitState::new)
-                    .check_rate_limit(interval, burst);
-
-                if rate_ok {
-                    let alloc_clone = allocator.clone();
-                    tokio::spawn(async move {
-                        if restart_sec > 0 {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(restart_sec)).await;
-                        }
-                        info!("Auto-restarting {} after process.exit", unit_name);
-                        if let Err(e) = scheduler::enqueue_job(
-                            alloc_clone,
-                            &unit_name,
-                            JobKind::Start,
-                            JobMode::Replace,
-                        )
-                        .await
-                        {
-                            warn!("Failed to auto-restart {}: {}", unit_name, e);
-                        }
-                    });
-                } else {
-                    warn!(
-                        "Restart rate limit exceeded for {}, not auto-restarting",
-                        unit_name
-                    );
+            {
+                let mut state = allocator.write();
+                let rt = state.runtime.entry(unit_name.clone()).or_default();
+                if rt.active_state == crate::state::ActiveState::Active {
+                    rt.active_state = crate::state::ActiveState::Inactive;
+                    rt.sub_state = "dead".to_string();
                 }
+                rt.main_pid = None;
+            }
+
+            // Determine the exit kind from event_data if available.
+            let exit_kind = serde_json::from_slice::<serde_json::Value>(&event.event_data)
+                .ok()
+                .and_then(|v| v["exit_code"].as_i64())
+                .map(|code| {
+                    if code == 0 {
+                        ExitKind::ExitCode(0)
+                    } else {
+                        ExitKind::ExitCode(code as i32)
+                    }
+                })
+                .unwrap_or(ExitKind::ExitCode(-1)); // unknown code
+
+            let should = {
+                let state = allocator.read();
+                state
+                    .units
+                    .get(&unit_name)
+                    .and_then(|u| u.service.as_ref())
+                    .map(|svc| should_restart_service(&svc.restart, &exit_kind))
+                    .unwrap_or(false)
+            };
+
+            if should {
+                schedule_automatic_restart(allocator.clone(), &unit_name);
             }
         }
         "service.started" => {
@@ -376,11 +337,29 @@ async fn handle_event(allocator: AllocatorHandle, event: EventPublish) -> Result
             rt.main_pid = pid;
         }
         "service.failed" => {
-            let mut state = allocator.write();
-            let rt = state.runtime.entry(event.unit_name.clone()).or_default();
-            rt.active_state = crate::state::ActiveState::Failed;
-            rt.sub_state = "failed".to_string();
-            rt.main_pid = None;
+            let unit_name = event.unit_name.clone();
+            {
+                let mut state = allocator.write();
+                let rt = state.runtime.entry(unit_name.clone()).or_default();
+                rt.active_state = crate::state::ActiveState::Failed;
+                rt.sub_state = "failed".to_string();
+                rt.main_pid = None;
+            }
+
+            // Unexpected service crash — trigger restart if policy permits.
+            let should = {
+                let state = allocator.read();
+                state
+                    .units
+                    .get(&unit_name)
+                    .and_then(|u| u.service.as_ref())
+                    .map(|svc| should_restart_service(&svc.restart, &ExitKind::ExitCode(-1)))
+                    .unwrap_or(false)
+            };
+
+            if should {
+                schedule_automatic_restart(allocator.clone(), &unit_name);
+            }
         }
         _ => {}
     }
