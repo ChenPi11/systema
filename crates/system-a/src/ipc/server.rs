@@ -29,7 +29,18 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Remove stale socket file.
+    // Check if another allocator is already listening on the socket.
+    // We try connecting first — if it succeeds, a live allocator is already
+    // running and we should exit gracefully to avoid stealing its socket.
+    if let Ok(_) = tokio::net::UnixStream::connect(SOCKET_PATH).await {
+        warn!(
+            "Another allocator is already listening on {}. Exiting.",
+            SOCKET_PATH
+        );
+        return Ok(());
+    }
+
+    // Remove stale socket file (left by a previous crash).
     let _ = tokio::fs::remove_file(SOCKET_PATH).await;
 
     let listener = UnixListener::bind(SOCKET_PATH)?;
