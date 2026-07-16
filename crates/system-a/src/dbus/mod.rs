@@ -202,12 +202,16 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     // job-completion → JobRemoved signal
     let (completion_tx, mut completion_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::state::JobCompletion>();
+    // job-new → JobNew signal
+    let (job_new_tx, mut job_new_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::state::JobNewInfo>();
     // unit-loaded → register per-unit object
     let (unit_loaded_tx, mut unit_loaded_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     {
         let mut state = allocator.write();
         state.job_completion_tx = Some(completion_tx);
+        state.job_new_tx = Some(job_new_tx);
         state.unit_loaded_tx = Some(unit_loaded_tx);
     }
 
@@ -232,6 +236,31 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
                 }
                 Err(e) => {
                     warn!("Failed to create signal context: {}", e);
+                }
+            }
+        }
+    });
+
+    // Spawn task: emit JobNew when a new job is created.
+    let conn_for_job_new = conn.clone();
+    tokio::spawn(async move {
+        while let Some(info) = job_new_rx.recv().await {
+            let job_path = manager::job_object_path(info.job_id);
+            match zbus::SignalContext::new(&conn_for_job_new, "/org/freedesktop/systemd1") {
+                Ok(signal_ctx) => {
+                    if let Err(e) = manager::ManagerInterface::job_new(
+                        &signal_ctx,
+                        info.job_id as u32,
+                        job_path,
+                        info.unit_name,
+                    )
+                    .await
+                    {
+                        warn!("Failed to emit JobNew signal: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create signal context for JobNew: {}", e);
                 }
             }
         }

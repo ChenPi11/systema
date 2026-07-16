@@ -11,7 +11,7 @@ use zbus::interface;
 use zvariant::OwnedObjectPath;
 
 use crate::scheduler;
-use crate::state::{ActiveState, AllocatorHandle, DesiredState, JobKind, JobStatus};
+use crate::state::{ActiveState, AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
 
 // --------------------------------------------------------------------------
 // Helper: D-Bus path encoding
@@ -198,7 +198,8 @@ impl ManagerInterface {
         // so the object must be in place by then.
         self.ensure_unit_object(&name).await;
 
-        let job_id = scheduler::enqueue_start(alloc.clone(), &name)
+        let job_mode = JobMode::from_str(mode);
+        let job_id = scheduler::enqueue_start_with_mode(alloc.clone(), &name, job_mode)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
@@ -255,7 +256,7 @@ impl ManagerInterface {
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
-        let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload)
+        let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload, JobMode::Replace)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 

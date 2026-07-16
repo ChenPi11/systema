@@ -5,31 +5,43 @@
 //! 2. Creates Job records for each operation.
 //! 3. Dispatches WorkerTask messages to the appropriate workers.
 
-use anyhow::Result;
+use std::time::Duration;
+
+use anyhow::{bail, Result};
 use prost::Message;
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    next_job_id, next_task_id, ActiveState, AllocatorHandle, Job, JobCompletion, JobKind,
-    JobResult, JobResultKind, JobStatus, UnitRuntimeInfo, WorkerTask,
+    next_job_id, next_task_id, ActiveState, AllocatorHandle, AllocatorState, Job, JobCompletion,
+    JobKind, JobMode, JobNewInfo, JobResult, JobResultKind, JobStatus, StartLimitState,
+    UnitRuntimeInfo, WorkerTask,
 };
-use crate::unit::types::{UnitFile, UnitKind, UnitSection};
+use crate::unit::types::{RestartPolicy, UnitFile, UnitKind, UnitSection};
 use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
 /// Returns the primary job ID.
 pub async fn enqueue_start(allocator: AllocatorHandle, unit_name: &str) -> Result<u64> {
-    enqueue_job(allocator, unit_name, JobKind::Start).await
+    enqueue_job(allocator, unit_name, JobKind::Start, JobMode::Replace).await
 }
 
 /// Enqueue a stop job for the named unit.
 pub async fn enqueue_stop(allocator: AllocatorHandle, unit_name: &str) -> Result<u64> {
-    enqueue_job(allocator, unit_name, JobKind::Stop).await
+    enqueue_job(allocator, unit_name, JobKind::Stop, JobMode::Replace).await
 }
 
 /// Enqueue a restart job for the named unit.
 pub async fn enqueue_restart(allocator: AllocatorHandle, unit_name: &str) -> Result<u64> {
-    enqueue_job(allocator, unit_name, JobKind::Restart).await
+    enqueue_job(allocator, unit_name, JobKind::Restart, JobMode::Replace).await
+}
+
+/// Enqueue a start job with explicit mode.
+pub async fn enqueue_start_with_mode(
+    allocator: AllocatorHandle,
+    unit_name: &str,
+    mode: JobMode,
+) -> Result<u64> {
+    enqueue_job(allocator, unit_name, JobKind::Start, mode).await
 }
 
 /// Core job enqueueing logic.
@@ -37,11 +49,44 @@ pub async fn enqueue_job(
     allocator: AllocatorHandle,
     unit_name: &str,
     kind: JobKind,
+    mode: JobMode,
 ) -> Result<u64> {
-    info!("Scheduling {:?} for {}", kind, unit_name);
+    info!("Scheduling {:?} for {} (mode={:?})", kind, unit_name, mode);
+
+    // --- Flush mode: cancel all pending jobs first ---
+    if mode == JobMode::Flush {
+        let to_cancel: Vec<u64> = {
+            let state = allocator.read();
+            state
+                .jobs
+                .values()
+                .filter(|j| matches!(j.status, JobStatus::Waiting | JobStatus::Running))
+                .map(|j| j.id)
+                .collect()
+        };
+        for jid in to_cancel {
+            let mut state = allocator.write();
+            let name = state
+                .jobs
+                .get(&jid)
+                .map(|j| j.unit_name.clone())
+                .unwrap_or_default();
+            if let Some(job) = state.jobs.get_mut(&jid) {
+                job.status = JobStatus::Cancelled;
+            }
+            if let Some(ref tx) = state.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id: jid,
+                    unit_name: name,
+                    result: JobResultKind::Cancelled,
+                });
+            }
+        }
+    }
 
     // --- Condition checks: skip start (not failure) if conditions not met ---
-    if matches!(kind, JobKind::Start | JobKind::Restart) {
+    let ignore_deps = mode == JobMode::IgnoreDependencies || mode == JobMode::IgnoreRequirements;
+    if matches!(kind, JobKind::Start | JobKind::Restart) && !ignore_deps {
         let conditions_met = {
             let state = allocator.read();
             state
@@ -67,12 +112,13 @@ pub async fn enqueue_job(
                     result: JobResultKind::Skipped,
                 });
             }
+            emit_job_new(&mut state, job_id, unit_name, kind);
             return Ok(job_id);
         }
     }
 
     // --- Assert checks: fail start if asserts not met ---
-    if matches!(kind, JobKind::Start | JobKind::Restart) {
+    if matches!(kind, JobKind::Start | JobKind::Restart) && !ignore_deps {
         let asserts_met = {
             let state = allocator.read();
             state
@@ -98,12 +144,13 @@ pub async fn enqueue_job(
                     result: JobResultKind::Dependency,
                 });
             }
+            emit_job_new(&mut state, job_id, unit_name, kind);
             return Ok(job_id);
         }
     }
 
     // --- Requisite check: all Requisite= deps must already be active ---
-    if matches!(kind, JobKind::Start | JobKind::Restart) {
+    if matches!(kind, JobKind::Start | JobKind::Restart) && mode != JobMode::IgnoreRequirements {
         let requisite_check = {
             let state = allocator.read();
             if let Some(unit) = state.units.get(unit_name) {
@@ -144,6 +191,7 @@ pub async fn enqueue_job(
                     result: JobResultKind::Dependency,
                 });
             }
+            emit_job_new(&mut state, job_id, unit_name, kind);
             return Ok(job_id);
         }
     }
@@ -177,8 +225,45 @@ pub async fn enqueue_job(
                     "Stopping conflicting unit {} before starting {}",
                     conflict, unit_name
                 );
-                // Use Box::pin to handle the recursive async call.
-                Box::pin(enqueue_job(allocator.clone(), &conflict, JobKind::Stop)).await?;
+                Box::pin(enqueue_job(allocator.clone(), &conflict, JobKind::Stop, JobMode::Replace)).await?;
+            }
+        }
+    }
+
+    // --- Job conflict detection ---
+    {
+        let read_state = allocator.read();
+        let existing: Option<(u64, String)> = read_state
+            .jobs
+            .values()
+            .find(|j| {
+                j.unit_name == unit_name
+                    && j.kind == kind
+                    && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+            })
+            .map(|j| (j.id, j.unit_name.clone()));
+        drop(read_state);
+
+        if let Some((existing_id, _)) = existing {
+            match mode {
+                JobMode::Fail => {
+                    bail!(
+                        "Job already exists for unit {} (kind={:?}, id={})",
+                        unit_name,
+                        kind,
+                        existing_id
+                    );
+                }
+                JobMode::Queue => {
+                    return Ok(existing_id);
+                }
+                JobMode::Replace => {
+                    let mut wstate = allocator.write();
+                    if let Some(job) = wstate.jobs.get_mut(&existing_id) {
+                        job.status = JobStatus::Cancelled;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -187,21 +272,33 @@ pub async fn enqueue_job(
     let units_to_process = {
         let state = allocator.read();
         match kind {
+            JobKind::Start | JobKind::Restart
+                if mode == JobMode::IgnoreDependencies || mode == JobMode::IgnoreRequirements =>
+            {
+                vec![unit_name.to_string()]
+            }
             JobKind::Start | JobKind::Restart => compute_start_order(&state.units, unit_name),
             JobKind::Stop => {
-                // For stop, compute reverse dependencies to propagate the stop.
                 compute_stop_order(&state.units, &state.runtime, unit_name)
             }
             JobKind::Reload => {
-                // Propagate reload to units declared in PropagatesReloadTo=.
                 compute_reload_order(&state.units, unit_name)
             }
         }
     };
 
+    // --- Isolate mode: stop all running units not in the dependency tree ---
+    if mode == JobMode::Isolate && matches!(kind, JobKind::Start) {
+        handle_isolate(allocator.clone(), &units_to_process).await;
+    }
+
     debug!("Processing order: {:?}", units_to_process);
 
     let primary_job_id = next_job_id();
+    let serial_mode = mode == JobMode::Replace;
+
+    // For serial execution, chain tasks so each waits for the previous.
+    let mut serial_chain_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
 
     // Create job records and dispatch tasks.
     for name in units_to_process.iter() {
@@ -286,8 +383,6 @@ pub async fn enqueue_job(
         }
 
         // Target units are handled internally (no external worker needed).
-        // Check under a short-lived read lock and drop it before calling
-        // activate_target_internally, which needs a write lock on the same handle.
         let is_target = {
             let state = allocator.read();
             state
@@ -297,8 +392,7 @@ pub async fn enqueue_job(
         };
         if is_target {
             activate_target_internally(allocator.clone(), name);
-            // If this is the directly-requested unit, immediately notify the D-Bus
-            // layer so callers (e.g. systemctl) receive JobRemoved and don't hang.
+            emit_job_new_after_lock(allocator.clone(), job_id, name, kind);
             if is_root {
                 if let Some(ref tx) = allocator.read().job_completion_tx {
                     let _ = tx.send(JobCompletion {
@@ -336,13 +430,11 @@ pub async fn enqueue_job(
                         unit_type, name
                     );
                     if is_root {
-                        // No worker available — mark the unit as failed and emit
-                        // a failure completion so callers (e.g. systemctl) are
-                        // not left waiting forever for a JobRemoved signal.
                         let mut state = allocator.write();
                         let rt = state.runtime.entry(name.clone()).or_default();
                         rt.active_state = ActiveState::Failed;
                         rt.sub_state = "failed".to_string();
+                        emit_job_new(&mut state, job_id, name, kind);
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id: primary_job_id,
@@ -361,13 +453,14 @@ pub async fn enqueue_job(
             state.units.get(name.as_str()).cloned()
         };
 
+        // Create a serial chain entry for this task.
+        let (next_serial_tx, next_serial_rx) = tokio::sync::oneshot::channel::<()>();
+
         // Record the job and the task_id → job_kind mapping.
         {
             let mut state = allocator.write();
             let rt = state.runtime.entry(name.clone()).or_default();
             rt.load_state = "loaded".to_string();
-            // Mark as activating/deactivating so the disconnect-cleanup code
-            // can transition the unit to Failed if the worker disconnects.
             match kind {
                 JobKind::Start | JobKind::Restart => {
                     rt.active_state = ActiveState::Activating;
@@ -386,10 +479,80 @@ pub async fn enqueue_job(
                     unit_name: name.clone(),
                     kind,
                     status: JobStatus::Running,
-                    completion_tx: None, // set by D-Bus layer if waiting
+                    completion_tx: None,
                 },
             );
             state.task_kinds.insert(task_id, kind);
+            if serial_mode {
+                state.serial_completion_txs.insert(task_id, next_serial_tx);
+            }
+        }
+
+        // Emit JobNew signal for this job.
+        emit_job_new_after_lock(allocator.clone(), job_id, name, kind);
+
+        // --- Start timeout monitoring ---
+        if matches!(kind, JobKind::Start | JobKind::Restart) {
+            let timeout_secs = unit_file
+                .as_ref()
+                .and_then(|u| u.service.as_ref())
+                .map(|s| s.timeout_start_sec)
+                .filter(|&t| t > 0)
+                .unwrap_or(0);
+            if timeout_secs > 0 {
+                let alloc = allocator.clone();
+                let name_clone = name.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(timeout_secs as u64)).await;
+                    let mut state = alloc.write();
+                    if let Some(job) = state.jobs.get_mut(&job_id) {
+                        if matches!(job.status, JobStatus::Running) {
+                            job.status = JobStatus::Failed("TimeoutStartSec exceeded".to_string());
+                            let rt = state.runtime.entry(name_clone.clone()).or_default();
+                            rt.active_state = ActiveState::Failed;
+                            rt.sub_state = "failed".to_string();
+                            if let Some(ref tx) = state.job_completion_tx {
+                                let _ = tx.send(JobCompletion {
+                                    job_id,
+                                    unit_name: name_clone,
+                                    result: JobResultKind::Timeout,
+                                });
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // --- Job running timeout monitoring ---
+        if matches!(kind, JobKind::Start) {
+            let timeout_secs = unit_file
+                .as_ref()
+                .and_then(|u| u.service.as_ref())
+                .map(|s| s.timeout_start_sec)
+                .filter(|&t| t > 0)
+                .unwrap_or(90);
+            let alloc = allocator.clone();
+            let name_clone = name.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(timeout_secs as u64 * 2)).await;
+                let mut state = alloc.write();
+                if let Some(job) = state.jobs.get_mut(&job_id) {
+                    if matches!(job.status, JobStatus::Running) {
+                        job.status = JobStatus::Failed("JobRunningTimeout exceeded".to_string());
+                        let rt = state.runtime.entry(name_clone.clone()).or_default();
+                        rt.active_state = ActiveState::Failed;
+                        rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.job_completion_tx {
+                            let _ = tx.send(JobCompletion {
+                                job_id,
+                                unit_name: name_clone,
+                                result: JobResultKind::Timeout,
+                            });
+                        }
+                    }
+                }
+            });
         }
 
         let task = WorkerTask {
@@ -400,6 +563,20 @@ pub async fn enqueue_job(
             unit_file,
         };
 
+        // In serial mode, wait for the previous task to complete before
+        // sending the next one.  The previous task's handle_task_result
+        // will signal through the serial chain channel.
+        if serial_mode && is_root && serial_chain_rx.is_some() {
+            if let Some(rx) = serial_chain_rx.take() {
+                let _ = rx.await;
+            }
+        }
+        if serial_mode && !is_root {
+            if let Some(rx) = serial_chain_rx.take() {
+                let _ = rx.await;
+            }
+        }
+
         if worker_task_tx.send(task).await.is_err() {
             warn!("Worker channel closed for unit {}", name);
             let mut state = allocator.write();
@@ -409,8 +586,6 @@ pub async fn enqueue_job(
             let rt = state.runtime.entry(name.clone()).or_default();
             rt.active_state = ActiveState::Failed;
             rt.sub_state = "failed".to_string();
-            // Emit failure so the caller (e.g. systemctl) doesn't hang
-            // waiting for a JobRemoved signal that will never arrive.
             if is_root {
                 if let Some(ref tx) = state.job_completion_tx {
                     let _ = tx.send(JobCompletion {
@@ -421,9 +596,59 @@ pub async fn enqueue_job(
                 }
             }
         }
+
+        // Set up for the next iteration: the current task's serial_rx
+        // will be consumed after the next task completes.
+        serial_chain_rx = Some(next_serial_rx);
     }
 
     Ok(primary_job_id)
+}
+
+/// Handle isolate mode: stop all running units not in the dependency tree.
+async fn handle_isolate(allocator: AllocatorHandle, keep_units: &[String]) {
+    let to_stop: Vec<String> = {
+        let state = allocator.read();
+        state
+            .runtime
+            .iter()
+            .filter(|(name, rt)| {
+                matches!(rt.active_state, ActiveState::Active | ActiveState::Activating)
+                    && !keep_units.contains(name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    for name in to_stop {
+        info!("Isolate mode: stopping unit {}", name);
+        if let Err(e) = Box::pin(enqueue_job(allocator.clone(), &name, JobKind::Stop, JobMode::Replace)).await
+        {
+            warn!("Failed to stop {} during isolate: {}", name, e);
+        }
+    }
+}
+
+/// Emit a JobNew signal for a newly created job (must hold the write lock).
+fn emit_job_new(state: &mut AllocatorState, job_id: u64, unit_name: &str, kind: JobKind) {
+    if let Some(ref tx) = state.job_new_tx {
+        let _ = tx.send(JobNewInfo {
+            job_id,
+            unit_name: unit_name.to_string(),
+            kind,
+        });
+    }
+}
+
+/// Emit JobNew without holding the write lock (acquires it briefly).
+fn emit_job_new_after_lock(allocator: AllocatorHandle, job_id: u64, unit_name: &str, kind: JobKind) {
+    let state = allocator.read();
+    if let Some(ref tx) = state.job_new_tx {
+        let _ = tx.send(JobNewInfo {
+            job_id,
+            unit_name: unit_name.to_string(),
+            kind,
+        });
+    }
 }
 
 /// Compute the order in which units should be stopped.
@@ -579,15 +804,20 @@ pub fn handle_task_result(
     unit_name: &str,
     kind: JobKind,
 ) {
-    // Collect dependency-related actions that need async scheduling BEFORE
-    // taking the write lock.  We'll collect them and spawn them afterwards.
     let mut post_actions: Vec<PostAction> = Vec::new();
+    let mut should_restart = false;
+    let mut restart_delay = 0u64;
 
     {
         let mut state = allocator.write();
 
         // Clean up the task_id → kind mapping.
         state.task_kinds.remove(&task_id);
+
+        // Signal serial chain continuation if this task was part of one.
+        if let Some(tx) = state.serial_completion_txs.remove(&task_id) {
+            let _ = tx.send(());
+        }
 
         // Update active state based on task kind and success.
         let rt = state.runtime.entry(unit_name.to_string()).or_default();
@@ -631,13 +861,10 @@ pub fn handle_task_result(
                 } else {
                     JobStatus::Failed(message.to_string())
                 };
-                // Notify D-Bus waiter if present.
                 if let Some(tx) = job.completion_tx.take() {
                     let _ = tx.send(result);
                 }
             }
-            // Notify the D-Bus signal emitter so it can send JobRemoved to subscribers
-            // (e.g. systemctl waits for this signal before returning to the user).
             if let Some(ref tx) = state.job_completion_tx {
                 let _ = tx.send(JobCompletion {
                     job_id: jid,
@@ -648,7 +875,6 @@ pub fn handle_task_result(
         }
 
         // --- BindsTo= lifecycle binding ---
-        // If a unit that others BindsTo stops or fails, stop those units.
         if matches!(kind, JobKind::Stop) || !success {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.binds_to.contains(unit_name) {
@@ -670,7 +896,6 @@ pub fn handle_task_result(
         }
 
         // --- PartOf= stop propagation ---
-        // If a unit stops, stop all units that have PartOf= pointing to it.
         if matches!(kind, JobKind::Stop) {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.part_of.contains(unit_name) {
@@ -706,7 +931,6 @@ pub fn handle_task_result(
         }
 
         // --- Upholds= continuous activation ---
-        // If a unit that someone Upholds= becomes inactive/failed, restart it.
         if (!success || matches!(kind, JobKind::Stop))
             && matches!(
                 state.runtime.get(unit_name).map(|rt| &rt.active_state),
@@ -715,7 +939,6 @@ pub fn handle_task_result(
         {
             for (_other_name, other_unit) in &state.units {
                 if other_unit.unit.upholds.contains(unit_name) {
-                    // The upholder wants this unit to stay active — restart it.
                     let upholder_active = state
                         .runtime
                         .get(_other_name.as_str())
@@ -723,14 +946,60 @@ pub fn handle_task_result(
                         .unwrap_or(false);
                     if upholder_active {
                         post_actions.push(PostAction::Start(unit_name.to_string()));
-                        break; // one restart is enough
+                        break;
                     }
+                }
+            }
+        }
+
+        // --- Restart policy: check if the failed unit should be restarted ---
+        // Extract info under the lock, then process after releasing it.
+        let restart_policy: Option<(RestartPolicy, u32)> = state
+            .units
+            .get(unit_name)
+            .and_then(|u| u.service.as_ref())
+            .map(|svc| (svc.restart.clone(), svc.restart_sec));
+        if let Some((ref policy, restart_sec_val)) = restart_policy {
+            if !success && matches!(kind, JobKind::Start) {
+                let should = match policy {
+                    RestartPolicy::Always => true,
+                    RestartPolicy::OnFailure => {
+                        !matches!(
+                            message,
+                            "TimeoutStartSec exceeded" | "JobRunningTimeout exceeded"
+                        )
+                    }
+                    RestartPolicy::OnAbnormal => {
+                        !matches!(message, "exit code")
+                    }
+                    _ => false,
+                };
+                if should {
+                    // Check rate limit (needs lock, will re-acquire)
+                    let interval = Duration::from_secs(10);
+                    let burst = 5u32;
+                    drop(state);
+                    let mut wstate = allocator.write();
+                    let limit_state = wstate
+                        .start_limit_state
+                        .entry(unit_name.to_string())
+                        .or_insert_with(StartLimitState::new);
+                    if limit_state.check_rate_limit(interval, burst) {
+                        should_restart = true;
+                        restart_delay = restart_sec_val as u64;
+                    } else {
+                        warn!(
+                            "Restart rate limit exceeded for {}, not restarting",
+                            unit_name
+                        );
+                    }
+                    // Note: wstate goes out of scope here and the write lock is released
                 }
             }
         }
     } // drop write lock
 
-    // Execute post-actions asynchronously (these need the lock released).
+    // Execute post-actions asynchronously.
     if !post_actions.is_empty() {
         let alloc = allocator.clone();
         tokio::spawn(async move {
@@ -738,17 +1007,38 @@ pub fn handle_task_result(
                 match action {
                     PostAction::Stop(name) => {
                         info!("Propagating stop to {}", name);
-                        if let Err(e) = enqueue_job(alloc.clone(), &name, JobKind::Stop).await {
+                        if let Err(e) =
+                            enqueue_job(alloc.clone(), &name, JobKind::Stop, JobMode::Replace).await
+                        {
                             warn!("Failed to propagate stop to {}: {}", name, e);
                         }
                     }
                     PostAction::Start(name) => {
                         info!("Triggering start for {}", name);
-                        if let Err(e) = enqueue_job(alloc.clone(), &name, JobKind::Start).await {
+                        if let Err(e) =
+                            enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace).await
+                        {
                             warn!("Failed to trigger start for {}: {}", name, e);
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // Schedule restart if the restart policy triggered.
+    if should_restart {
+        let alloc = allocator.clone();
+        let name = unit_name.to_string();
+        tokio::spawn(async move {
+            if restart_delay > 0 {
+                tokio::time::sleep(Duration::from_secs(restart_delay)).await;
+            }
+            info!("Restarting {} per restart policy", name);
+            if let Err(e) =
+                enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace).await
+            {
+                warn!("Failed to restart {}: {}", name, e);
             }
         });
     }
@@ -998,4 +1288,441 @@ fn is_on_ac_power() -> bool {
 /// Heuristic: `/run/systemd/first-boot` or `/run/machine-id` does not exist.
 fn is_first_boot() -> bool {
     std::path::Path::new(common::paths::SYSTEMD_FIRST_BOOT_FILE).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Allocator, StartLimitState};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    // =========================================================================
+    // JobMode tests
+    // =========================================================================
+
+    #[test]
+    fn test_job_mode_from_str_default() {
+        assert_eq!(JobMode::from_str("unknown"), JobMode::Replace);
+        assert_eq!(JobMode::from_str(""), JobMode::Replace);
+    }
+
+    #[test]
+    fn test_job_mode_from_str_all() {
+        assert_eq!(JobMode::from_str("replace"), JobMode::Replace);
+        assert_eq!(JobMode::from_str("fail"), JobMode::Fail);
+        assert_eq!(JobMode::from_str("queue"), JobMode::Queue);
+        assert_eq!(JobMode::from_str("isolate"), JobMode::Isolate);
+        assert_eq!(JobMode::from_str("flush"), JobMode::Flush);
+        assert_eq!(JobMode::from_str("ignore-dependencies"), JobMode::IgnoreDependencies);
+        assert_eq!(JobMode::from_str("ignore-requirements"), JobMode::IgnoreRequirements);
+    }
+
+    #[test]
+    fn test_job_mode_as_str_roundtrip() {
+        for mode in &[
+            JobMode::Replace,
+            JobMode::Fail,
+            JobMode::Queue,
+            JobMode::Isolate,
+            JobMode::Flush,
+            JobMode::IgnoreDependencies,
+            JobMode::IgnoreRequirements,
+        ] {
+            assert_eq!(JobMode::from_str(mode.as_str()), *mode);
+        }
+    }
+
+    #[test]
+    fn test_job_mode_equality() {
+        assert_eq!(JobMode::Replace, JobMode::Replace);
+        assert_ne!(JobMode::Replace, JobMode::Fail);
+        assert_ne!(JobMode::Isolate, JobMode::Flush);
+    }
+
+    // =========================================================================
+    // StartLimitState tests
+    // =========================================================================
+
+    #[test]
+    fn test_start_limit_state_allows_first_attempt() {
+        let mut state = StartLimitState::new();
+        assert!(state.check_rate_limit(Duration::from_secs(10), 3));
+    }
+
+    #[test]
+    fn test_start_limit_state_within_burst() {
+        let mut state = StartLimitState::new();
+        assert!(state.check_rate_limit(Duration::from_secs(10), 3));
+        assert!(state.check_rate_limit(Duration::from_secs(10), 3));
+        assert!(state.check_rate_limit(Duration::from_secs(10), 3));
+    }
+
+    #[test]
+    fn test_start_limit_state_exceeds_burst() {
+        let mut state = StartLimitState::new();
+        assert!(state.check_rate_limit(Duration::from_secs(10), 3));
+        assert!(state.check_rate_limit(Duration::from_secs(10), 3));
+        assert!(state.check_rate_limit(Duration::from_secs(10), 3));
+        // The 4th attempt should be rate-limited
+        assert!(!state.check_rate_limit(Duration::from_secs(10), 3));
+    }
+
+    #[test]
+    fn test_start_limit_state_prunes_old_timestamps() {
+        let mut state = StartLimitState::new();
+        // Add some timestamps far in the past
+        state.timestamps.push(std::time::Instant::now() - Duration::from_secs(100));
+        state.timestamps.push(std::time::Instant::now() - Duration::from_secs(100));
+        // With short interval, they should be pruned
+        assert!(state.check_rate_limit(Duration::from_secs(1), 5));
+        assert_eq!(state.timestamps.len(), 1); // only the new one remains
+    }
+
+    // =========================================================================
+    // compute_start_order tests
+    // =========================================================================
+
+    fn make_unit(name: &str) -> UnitFile {
+        UnitFile::new(name)
+    }
+
+    fn make_unit_after(name: &str, after: &[&str]) -> UnitFile {
+        let mut u = make_unit(name);
+        for dep in after {
+            u.unit.after.insert(dep.to_string());
+        }
+        u
+    }
+
+    fn make_unit_before(name: &str, before: &[&str]) -> UnitFile {
+        let mut u = make_unit(name);
+        for dep in before {
+            u.unit.before.insert(dep.to_string());
+        }
+        u
+    }
+
+    #[test]
+    fn test_compute_start_order_single_unit() {
+        let mut units = HashMap::new();
+        units.insert("foo.service".to_string(), make_unit("foo.service"));
+        let order = compute_start_order(&units, "foo.service");
+        assert_eq!(order, vec!["foo.service"]);
+    }
+
+    #[test]
+    fn test_compute_start_order_with_after() {
+        let mut units = HashMap::new();
+        units.insert("a.service".to_string(), make_unit("a.service"));
+        units.insert("b.service".to_string(), make_unit_after("b.service", &["a.service"]));
+        units.insert("c.service".to_string(), make_unit_after("c.service", &["b.service"]));
+        let order = compute_start_order(&units, "c.service");
+        // a must come before b, b before c
+        let pos_a = order.iter().position(|x| x == "a.service").unwrap();
+        let pos_b = order.iter().position(|x| x == "b.service").unwrap();
+        let pos_c = order.iter().position(|x| x == "c.service").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn test_compute_start_order_with_requires_expansion() {
+        let mut units = HashMap::new();
+        let a = make_unit("a.service");
+        let mut b = make_unit("b.service");
+        b.unit.requires.insert("a.service".to_string());
+        let mut c = make_unit("c.service");
+        c.unit.requires.insert("b.service".to_string());
+        units.insert("a.service".to_string(), a);
+        units.insert("b.service".to_string(), b);
+        units.insert("c.service".to_string(), c);
+        // compute_start_order BFS from root through requires/wants
+        let order = compute_start_order(&units, "c.service");
+        assert!(order.contains(&"a.service".to_string()));
+        assert!(order.contains(&"b.service".to_string()));
+        assert!(order.contains(&"c.service".to_string()));
+    }
+
+    #[test]
+    fn test_compute_start_order_root_last() {
+        let mut units = HashMap::new();
+        units.insert("dep.service".to_string(), make_unit("dep.service"));
+        units.insert("root.service".to_string(), make_unit_after("root.service", &["dep.service"]));
+        let order = compute_start_order(&units, "root.service");
+        assert_eq!(order.last().unwrap(), "root.service");
+    }
+
+    // =========================================================================
+    // compute_stop_order tests
+    // =========================================================================
+
+    #[test]
+    fn test_compute_stop_order_single_unit() {
+        let units = HashMap::new();
+        let mut runtime = HashMap::new();
+        runtime.insert(
+            "foo.service".to_string(),
+            UnitRuntimeInfo {
+                active_state: ActiveState::Active,
+                ..Default::default()
+            },
+        );
+        let order = compute_stop_order(&units, &runtime, "foo.service");
+        assert_eq!(order, vec!["foo.service"]);
+    }
+
+    #[test]
+    fn test_compute_stop_order_propagates_requires() {
+        // B Requires=A, so stopping A should include B
+        let mut units = HashMap::new();
+        let mut b = make_unit("b.service");
+        b.unit.requires.insert("a.service".to_string());
+        units.insert("a.service".to_string(), make_unit("a.service"));
+        units.insert("b.service".to_string(), b);
+
+        let mut runtime = HashMap::new();
+        runtime.insert(
+            "a.service".to_string(),
+            UnitRuntimeInfo {
+                active_state: ActiveState::Active,
+                ..Default::default()
+            },
+        );
+        runtime.insert(
+            "b.service".to_string(),
+            UnitRuntimeInfo {
+                active_state: ActiveState::Active,
+                ..Default::default()
+            },
+        );
+
+        let order = compute_stop_order(&units, &runtime, "a.service");
+        assert!(order.contains(&"a.service".to_string()));
+        assert!(order.contains(&"b.service".to_string()));
+    }
+
+    #[test]
+    fn test_compute_stop_order_propagates_binds_to() {
+        let mut units = HashMap::new();
+        let mut b = make_unit("b.service");
+        b.unit.binds_to.insert("a.service".to_string());
+        units.insert("a.service".to_string(), make_unit("a.service"));
+        units.insert("b.service".to_string(), b);
+
+        let mut runtime = HashMap::new();
+        runtime.insert("a.service".to_string(), UnitRuntimeInfo {
+            active_state: ActiveState::Active,
+            ..Default::default()
+        });
+        runtime.insert("b.service".to_string(), UnitRuntimeInfo {
+            active_state: ActiveState::Active,
+            ..Default::default()
+        });
+
+        let order = compute_stop_order(&units, &runtime, "a.service");
+        assert!(order.contains(&"b.service".to_string()));
+    }
+
+    #[test]
+    fn test_compute_stop_order_propagates_part_of() {
+        let mut units = HashMap::new();
+        let mut b = make_unit("b.service");
+        b.unit.part_of.insert("a.service".to_string());
+        units.insert("a.service".to_string(), make_unit("a.service"));
+        units.insert("b.service".to_string(), b);
+
+        let mut runtime = HashMap::new();
+        runtime.insert("a.service".to_string(), UnitRuntimeInfo {
+            active_state: ActiveState::Active,
+            ..Default::default()
+        });
+        runtime.insert("b.service".to_string(), UnitRuntimeInfo {
+            active_state: ActiveState::Active,
+            ..Default::default()
+        });
+
+        let order = compute_stop_order(&units, &runtime, "a.service");
+        assert!(order.contains(&"b.service".to_string()));
+    }
+
+    #[test]
+    fn test_compute_stop_order_skips_inactive_dependents() {
+        let mut units = HashMap::new();
+        let mut b = make_unit("b.service");
+        b.unit.requires.insert("a.service".to_string());
+        units.insert("a.service".to_string(), make_unit("a.service"));
+        units.insert("b.service".to_string(), b);
+
+        let mut runtime = HashMap::new();
+        runtime.insert("a.service".to_string(), UnitRuntimeInfo {
+            active_state: ActiveState::Active,
+            ..Default::default()
+        });
+        // B is not active, so it should NOT be in the stop list
+        runtime.insert("b.service".to_string(), UnitRuntimeInfo {
+            active_state: ActiveState::Inactive,
+            ..Default::default()
+        });
+
+        let order = compute_stop_order(&units, &runtime, "a.service");
+        assert_eq!(order, vec!["a.service"]);
+    }
+
+    // =========================================================================
+    // compute_reload_order tests
+    // =========================================================================
+
+    #[test]
+    fn test_compute_reload_order_single() {
+        let units = HashMap::new();
+        let order = compute_reload_order(&units, "foo.service");
+        assert_eq!(order, vec!["foo.service"]);
+    }
+
+    #[test]
+    fn test_compute_reload_order_propagates() {
+        let mut units = HashMap::new();
+        let mut a = make_unit("a.service");
+        a.unit.propagates_reload_to.insert("b.service".to_string());
+        a.unit.propagates_reload_to.insert("c.service".to_string());
+        units.insert("a.service".to_string(), a);
+        let order = compute_reload_order(&units, "a.service");
+        assert!(order.contains(&"a.service".to_string()));
+        assert!(order.contains(&"b.service".to_string()));
+        assert!(order.contains(&"c.service".to_string()));
+        assert_eq!(order.len(), 3);
+    }
+
+    // =========================================================================
+    // Helper function tests
+    // =========================================================================
+
+    #[test]
+    fn test_strip_negate_normal() {
+        let (neg, val) = strip_negate("/some/path");
+        assert!(!neg);
+        assert_eq!(val, "/some/path");
+    }
+
+    #[test]
+    fn test_strip_negate_negated() {
+        let (neg, val) = strip_negate("!/some/path");
+        assert!(neg);
+        assert_eq!(val, "/some/path");
+    }
+
+    #[test]
+    fn test_eval_condition_bool_normal() {
+        assert!(eval_condition_bool("true", |_| true));
+        assert!(!eval_condition_bool("false", |_| false));
+    }
+
+    #[test]
+    fn test_eval_condition_bool_negated() {
+        assert!(eval_condition_bool("!false", |_| false));
+        assert!(!eval_condition_bool("!true", |_| true));
+    }
+
+    #[test]
+    fn test_simple_glob_match_exact() {
+        assert!(simple_glob_match("foo.service", "foo.service"));
+        assert!(!simple_glob_match("foo.service", "bar.service"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_wildcard() {
+        assert!(simple_glob_match("*.service", "foo.service"));
+        assert!(simple_glob_match("foo.*", "foo.service"));
+        assert!(!simple_glob_match("*.service", "foo.txt"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_question_mark() {
+        assert!(simple_glob_match("foo.???????", "foo.service"));
+        assert!(!simple_glob_match("foo.??????", "foo.service"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_empty() {
+        assert!(simple_glob_match("", ""));
+        assert!(!simple_glob_match("", "foo"));
+        assert!(!simple_glob_match("foo", ""));
+    }
+
+    // =========================================================================
+    // check_conditions / check_asserts tests
+    // =========================================================================
+
+    #[test]
+    fn test_check_conditions_no_conditions() {
+        let unit = UnitSection::default();
+        assert!(check_conditions(&unit));
+    }
+
+    #[test]
+    fn test_check_asserts_no_asserts() {
+        let unit = UnitSection::default();
+        assert!(check_asserts(&unit));
+    }
+
+    // =========================================================================
+    // build_task_dispatch / build_unit_config tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_task_dispatch_start() {
+        let uf = make_unit("test.service");
+        let task = WorkerTask {
+            task_id: 42,
+            unit_name: "test.service".to_string(),
+            unit_type: "service".to_string(),
+            kind: JobKind::Start,
+            unit_file: Some(uf),
+        };
+        let dispatch = build_task_dispatch(&task);
+        assert_eq!(dispatch.task_id, 42);
+        assert_eq!(dispatch.unit_name, "test.service");
+        assert_eq!(dispatch.unit_type, "service");
+    }
+
+    #[test]
+    fn test_task_kind_to_proto() {
+        use common::proto::TaskKind;
+        assert_eq!(task_kind_to_proto(JobKind::Start), TaskKind::Start);
+        assert_eq!(task_kind_to_proto(JobKind::Stop), TaskKind::Stop);
+        assert_eq!(task_kind_to_proto(JobKind::Restart), TaskKind::Restart);
+        assert_eq!(task_kind_to_proto(JobKind::Reload), TaskKind::Reload);
+    }
+
+    // =========================================================================
+    // Job conflict detection logic
+    // =========================================================================
+
+    #[test]
+    fn test_job_mode_from_str_is_idempotent() {
+        for s in &["replace", "fail", "queue", "isolate", "flush", "ignore-dependencies", "ignore-requirements"] {
+            let mode = JobMode::from_str(s);
+            assert_eq!(mode.as_str(), *s);
+        }
+    }
+
+    // =========================================================================
+    // Serial execution helpers
+    // =========================================================================
+
+    #[test]
+    fn test_enqueue_job_emit_job_new() {
+        // Verify emit_job_new doesn't panic with None channel
+        let mut state = AllocatorState::new();
+        emit_job_new(&mut state, 1, "test.service", JobKind::Start);
+        // No panic is the success case
+    }
+
+    #[test]
+    fn test_emit_job_new_after_lock() {
+        let alloc = Allocator::new();
+        emit_job_new_after_lock(alloc.clone(), 1, "test.service", JobKind::Start);
+        // No panic is the success case
+    }
 }

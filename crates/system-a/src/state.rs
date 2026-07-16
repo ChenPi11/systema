@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -48,6 +49,56 @@ impl JobKind {
     }
 }
 
+// --------------------------------------------------------------------------
+// Job mode
+// --------------------------------------------------------------------------
+
+/// Describes how a job should behave when another job for the same unit
+/// already exists, and which dependencies to expand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobMode {
+    /// Replace any existing job for the same unit (default).
+    Replace,
+    /// Fail if a job for the same unit already exists.
+    Fail,
+    /// Queue behind the existing job.
+    Queue,
+    /// Start the unit and stop all other running units.
+    Isolate,
+    /// Flush all pending jobs first.
+    Flush,
+    /// Start the unit but ignore ordering dependencies.
+    IgnoreDependencies,
+    /// Start the unit but ignore requirement dependencies.
+    IgnoreRequirements,
+}
+
+impl JobMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "fail" => JobMode::Fail,
+            "isolate" => JobMode::Isolate,
+            "flush" => JobMode::Flush,
+            "ignore-dependencies" => JobMode::IgnoreDependencies,
+            "ignore-requirements" => JobMode::IgnoreRequirements,
+            "queue" => JobMode::Queue,
+            _ => JobMode::Replace,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobMode::Replace => "replace",
+            JobMode::Fail => "fail",
+            JobMode::Queue => "queue",
+            JobMode::Isolate => "isolate",
+            JobMode::Flush => "flush",
+            JobMode::IgnoreDependencies => "ignore-dependencies",
+            JobMode::IgnoreRequirements => "ignore-requirements",
+        }
+    }
+}
+
 /// The current status of a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
@@ -84,6 +135,42 @@ pub struct JobCompletion {
     pub job_id: u64,
     pub unit_name: String,
     pub result: JobResultKind,
+}
+
+/// Notification sent when a new job is created, so the D-Bus layer can emit
+/// the `JobNew` signal.
+#[derive(Debug, Clone)]
+pub struct JobNewInfo {
+    pub job_id: u64,
+    pub unit_name: String,
+    pub kind: JobKind,
+}
+
+/// Tracks start attempts for restart rate-limiting.
+#[derive(Debug, Clone)]
+pub struct StartLimitState {
+    /// Timestamps of recent start attempts (within the interval).
+    pub timestamps: Vec<Instant>,
+}
+
+impl StartLimitState {
+    pub fn new() -> Self {
+        StartLimitState {
+            timestamps: Vec::new(),
+        }
+    }
+
+    /// Prune timestamps older than `interval` and check if the burst limit
+    /// has been exceeded.
+    pub fn check_rate_limit(&mut self, interval: std::time::Duration, burst: u32) -> bool {
+        let now = Instant::now();
+        self.timestamps.retain(|t| now.duration_since(*t) < interval);
+        if self.timestamps.len() >= burst as usize {
+            return false;
+        }
+        self.timestamps.push(now);
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +283,15 @@ pub struct AllocatorState {
     /// Channel to notify the D-Bus layer when a new unit is loaded so it can
     /// register a per-unit D-Bus object.  Set by the D-Bus server at startup.
     pub unit_loaded_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Channel to notify the D-Bus layer when a new job is created so it can
+    /// emit the `JobNew` signal.
+    pub job_new_tx: Option<tokio::sync::mpsc::UnboundedSender<JobNewInfo>>,
+    /// Completion senders for serial task execution — keyed by task_id.
+    /// When a task completes, `handle_task_result` sends `()` through the
+    /// corresponding channel so the next task in the serial chain proceeds.
+    pub serial_completion_txs: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
+    /// Restart rate-limiting state, keyed by unit name.
+    pub start_limit_state: HashMap<String, StartLimitState>,
 }
 
 impl AllocatorState {
@@ -209,6 +305,9 @@ impl AllocatorState {
             task_kinds: HashMap::new(),
             job_completion_tx: None,
             unit_loaded_tx: None,
+            job_new_tx: None,
+            serial_completion_txs: HashMap::new(),
+            start_limit_state: HashMap::new(),
         }
     }
 }

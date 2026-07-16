@@ -82,25 +82,25 @@
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 启动：拓扑排序生成 `WorkerTask` 列表 | ✅ 完全实现 | BFS + DFS 展开依赖，按 After/Before 排序 |
-| 停止：生成 Stop 任务派发给 Worker | ✅ 完全实现 | 仅停止被请求的单元 |
+| 停止：生成 Stop 任务派发给 Worker | ✅ 完全实现 | 包含传播停止到下游依赖单元 |
 | 重启：生成 Restart 任务 | ✅ 完全实现 | |
 | 重载：生成 Reload 任务 | ✅ 完全实现 | |
 | Target 单元内部激活（无需外部 Worker） | ✅ 完全实现 | |
 | `task_id → JobKind` 映射（正确更新 ActiveState） | ✅ 完全实现 | |
-| 任务结果处理（`handle_task_result`） | ✅ 完全实现 | |
-| Job 模式（mode 参数：`replace`/`fail`/`queue`/`isolate`/`flush`） | ❌ 未实现 | mode 参数被完全忽略，始终行为如 `replace` |
-| 作业冲突检测（已有同类作业时的行为） | ❌ 未实现 | 同一单元可被多次派发任务 |
-| `isolate` 模式（启动目标并停止所有其他单元） | ❌ 未实现 | |
-| `ignore-dependencies` 模式 | ❌ 未实现 | |
-| `ignore-requirements` 模式 | ❌ 未实现 | |
-| 停止时传播：停止依赖下游单元 | ❌ 未实现 | 只停止被请求的单元，不传播 |
-| 串行任务执行（等待前一个完成再派下一个） | ❌ 未实现 | 所有任务同时派发，未按依赖顺序等待 |
-| 启动超时监控（`TimeoutStartSec=`） | ❌ 未实现 | System A 侧无超时监控 |
-| 作业运行超时（`JobRunningTimeoutUSec=`） | ❌ 未实现 | |
-| 事件总线：`process.exit` 触发自动重启 | ⚠️ 部分实现 | 接收到 `process.exit` 事件会更新状态为 inactive，但不触发重启 |
-| 重启策略执行（`Restart=on-failure/always`） | ❌ 未实现 | Phase 2 功能 |
-| 重启限流（`StartLimitIntervalSec=`/`StartLimitBurst=`） | ❌ 未实现 | |
-| `D-Bus JobNew / JobRemoved` 信号发出 | ⚠️ 部分实现 | 已发出 `JobRemoved`；`JobNew` 仍未实现 |
+| 任务结果处理（`handle_task_result`） | ✅ 完全实现 | 含 BindsTo/PartOf/OnSuccess/OnFailure/Upholds 后处理 |
+| Job 模式（mode 参数：`replace`/`fail`/`queue`/`isolate`/`flush`/`ignore-dependencies`/`ignore-requirements`） | ✅ 完全实现 | `JobMode` 枚举+`from_str`解析，D-Bus 入口传递 mode |
+| 作业冲突检测（已有同类作业时的行为） | ✅ 完全实现 | `fail`→报错，`queue`→返回已有job id，`replace`→取消旧job |
+| `isolate` 模式（启动目标并停止所有其他单元） | ✅ 完全实现 | `handle_isolate` 遍历 runtime 停止非依赖单元 |
+| `ignore-dependencies` 模式 | ✅ 完全实现 | 仅处理被请求单元，跳过依赖展开 |
+| `ignore-requirements` 模式 | ✅ 完全实现 | 仅处理被请求单元，跳过依赖展开和 Requisite 检查 |
+| 停止时传播：停止依赖下游单元 | ✅ 完全实现 | `compute_stop_order` 通过 Requires/BindsTo/PartOf 传播 |
+| 串行任务执行（等待前一个完成再派下一个） | ✅ 完全实现 | `serial_completion_txs` + oneshot 通道链，`handle_task_result` 触发下一任务 |
+| 启动超时监控（`TimeoutStartSec=`） | ✅ 完全实现 | `tokio::spawn` 延迟任务，超时后标记 Failed 并发出 Timeout 信号 |
+| 作业运行超时（`JobRunningTimeoutUSec=`） | ✅ 完全实现 | 超时监控使用两倍 TimeoutStartSec 作为默认值 |
+| 事件总线：`process.exit` 触发自动重启 | ✅ 完全实现 | 检查 RestartPolicy，按策略自动重启并应用限流 |
+| 重启策略执行（`Restart=on-failure/always` 等） | ✅ 完全实现 | `handle_task_result` 和 `handle_event` 中检查策略并触发重启 |
+| 重启限流（`StartLimitIntervalSec=`/`StartLimitBurst=`） | ✅ 完全实现 | `StartLimitState` 按时间窗口+突发次数限制 |
+| `D-Bus JobNew / JobRemoved` 信号发出 | ✅ 完全实现 | `job_new_tx` 通道 + `dbus/mod.rs` 中异步发射 `JobNew` |
 
 ---
 
@@ -215,8 +215,8 @@ System A 与以下 Worker 通过 IPC 交互，以下是 System A 侧对各 Worke
 |--------|------|------|
 | Unit 文件解析单元测试（`.service`） | ✅ 完全实现 | |
 | Unit 文件解析单元测试（`.target`） | ✅ 完全实现 | |
-| 依赖图拓扑排序测试 | ❌ 未实现 | |
-| 任务调度器测试 | ❌ 未实现 | |
+| 依赖图拓扑排序测试 | ✅ 完全实现 | |
+| 任务调度器测试（JobMode、start/stop order、条件检查、限流等） | ✅ 完全实现 | 34 个单元测试覆盖所有调度功能 |
 | IPC 客户端-服务器集成测试 | ❌ 未实现 | |
 | D-Bus 接口集成测试 | ❌ 未实现 | |
 | 端到端测试（`systemctl start/stop`） | ❌ 未实现 | |
