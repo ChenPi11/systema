@@ -53,6 +53,29 @@ pub async fn enqueue_job(
 ) -> Result<u64> {
     info!("Scheduling {:?} for {} (mode={:?})", kind, unit_name, mode);
 
+    // --- Early check: ensure at least one worker exists for the root unit ---
+    // Target units are handled internally and don't need a worker.
+    {
+        let state = allocator.read();
+        let unit = state.units.get(unit_name);
+        let requires_worker = unit
+            .map(|u| !matches!(u.kind, UnitKind::Target))
+            .unwrap_or(true);
+        if requires_worker {
+            let unit_type = unit
+                .map(|u| u.kind.worker_type().to_string())
+                .unwrap_or_else(|| "service".to_string());
+            let has_worker = state.workers.values().any(|w| w.unit_types.contains(&unit_type));
+            if !has_worker {
+                bail!(
+                    "No worker available for unit type '{}' (unit: {}). \
+                     Cannot execute {:?} operation. Is the corresponding System Worker running?",
+                    unit_type, unit_name, kind
+                );
+            }
+        }
+    }
+
     // --- Flush mode: cancel all pending jobs first ---
     if mode == JobMode::Flush {
         let to_cancel: Vec<u64> = {
