@@ -8,6 +8,7 @@
 //! - Expose a systemd1-compatible D-Bus interface for external tooling.
 
 mod dbus;
+mod event;
 mod graph;
 mod ipc;
 mod scheduler;
@@ -35,6 +36,19 @@ async fn main() -> Result<()> {
 
     // Load unit files from the default search paths.
     unit::loader::load_default_units(allocator.clone()).await?;
+
+    // Register in-process event-bus subscribers.
+    {
+        use std::sync::Arc;
+        let bus = allocator.read().event_bus.clone();
+        let mut bus_w = bus.write().await;
+        bus_w.subscribe(Arc::new(
+            event::StateUpdater::new(allocator.clone()),
+        ));
+        bus_w.subscribe(Arc::new(
+            event::RestartHandler::new(allocator.clone()),
+        ));
+    }
 
     // Start the IPC server (accepts System Worker connections).
     let ipc_handle = tokio::spawn(ipc::server::run(allocator.clone()));

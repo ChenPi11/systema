@@ -5,6 +5,7 @@
 //! - IPC framing utilities (length-delimited codec over Unix sockets)
 //! - Shared error types
 
+pub mod event_bus;
 pub mod ipc;
 pub mod paths {
     //! Compile-time configurable paths for system-alphabet.

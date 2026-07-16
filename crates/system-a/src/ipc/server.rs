@@ -13,12 +13,12 @@ use tracing::{debug, error, info, warn};
 use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use common::proto::{Envelope, EventPublish, RegisterAck, TaskResult, WorkerRegistration};
 
-use crate::scheduler::{self, build_task_dispatch, schedule_automatic_restart, should_restart_service};
+use crate::scheduler::{self, build_task_dispatch};
 use crate::state::{
-    next_request_id, ActiveState, AllocatorHandle, JobCompletion, JobKind, JobMode, JobResultKind,
+    next_request_id, ActiveState, AllocatorHandle, JobCompletion, JobKind, JobResultKind,
     JobStatus, WorkerEntry, WorkerTask,
 };
-use crate::unit::types::{ExitKind, RestartPolicy};
+use common::event_bus::{Event, EventTopic};
 
 pub const SOCKET_PATH: &str = common::paths::IPC_SOCKET_PATH;
 
@@ -278,91 +278,24 @@ fn parse_task_kind_from_context(allocator: &AllocatorHandle, task_id: u64) -> Jo
         .unwrap_or(JobKind::Start)
 }
 
-/// Handle an event published by a worker.
+/// Handle an event published by a worker by dispatching it through the
+/// in-process event bus.  Subscribers (StateUpdater, RestartHandler, etc.)
+/// react to the event and update `AllocatorState` or schedule tasks as needed.
 async fn handle_event(allocator: AllocatorHandle, event: EventPublish) -> Result<()> {
-    info!(
-        "Event from worker: type={}, unit={}",
-        event.event_type, event.unit_name
-    );
+    let topic = EventTopic::from_str(&event.event_type);
 
-    match event.event_type.as_str() {
-        "process.exit" => {
-            let unit_name = event.unit_name.clone();
-            {
-                let mut state = allocator.write();
-                let rt = state.runtime.entry(unit_name.clone()).or_default();
-                if rt.active_state == crate::state::ActiveState::Active {
-                    rt.active_state = crate::state::ActiveState::Inactive;
-                    rt.sub_state = "dead".to_string();
-                }
-                rt.main_pid = None;
-            }
+    let ev = Event {
+        topic,
+        unit_name: event.unit_name,
+        worker_id: String::new(),
+        timestamp: tokio::time::Instant::now(),
+        data: bytes::Bytes::from(event.event_data),
+    };
 
-            // Determine the exit kind from event_data if available.
-            let exit_kind = serde_json::from_slice::<serde_json::Value>(&event.event_data)
-                .ok()
-                .and_then(|v| v["exit_code"].as_i64())
-                .map(|code| {
-                    if code == 0 {
-                        ExitKind::ExitCode(0)
-                    } else {
-                        ExitKind::ExitCode(code as i32)
-                    }
-                })
-                .unwrap_or(ExitKind::ExitCode(-1)); // unknown code
-
-            let should = {
-                let state = allocator.read();
-                state
-                    .units
-                    .get(&unit_name)
-                    .and_then(|u| u.service.as_ref())
-                    .map(|svc| should_restart_service(&svc.restart, &exit_kind))
-                    .unwrap_or(false)
-            };
-
-            if should {
-                schedule_automatic_restart(allocator.clone(), &unit_name);
-            }
-        }
-        "service.started" => {
-            let pid = serde_json::from_slice::<serde_json::Value>(&event.event_data)
-                .ok()
-                .and_then(|v| v["pid"].as_u64())
-                .map(|p| p as u32);
-            let mut state = allocator.write();
-            let rt = state.runtime.entry(event.unit_name.clone()).or_default();
-            rt.active_state = crate::state::ActiveState::Active;
-            rt.sub_state = "running".to_string();
-            rt.main_pid = pid;
-        }
-        "service.failed" => {
-            let unit_name = event.unit_name.clone();
-            {
-                let mut state = allocator.write();
-                let rt = state.runtime.entry(unit_name.clone()).or_default();
-                rt.active_state = crate::state::ActiveState::Failed;
-                rt.sub_state = "failed".to_string();
-                rt.main_pid = None;
-            }
-
-            // Unexpected service crash — trigger restart if policy permits.
-            let should = {
-                let state = allocator.read();
-                state
-                    .units
-                    .get(&unit_name)
-                    .and_then(|u| u.service.as_ref())
-                    .map(|svc| should_restart_service(&svc.restart, &ExitKind::ExitCode(-1)))
-                    .unwrap_or(false)
-            };
-
-            if should {
-                schedule_automatic_restart(allocator.clone(), &unit_name);
-            }
-        }
-        _ => {}
-    }
+    // Clone the Arc under the parking_lot lock, then dispatch through the
+    // tokio RwLock so the Send requirement of tokio::spawn is satisfied.
+    let bus = allocator.read().event_bus.clone();
+    bus.read().await.dispatch(&ev).await;
 
     Ok(())
 }

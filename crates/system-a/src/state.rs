@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use common::event_bus::EventBus;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock as TokioRwLock;
 
 use crate::unit::types::UnitFile;
 
@@ -292,6 +294,10 @@ pub struct AllocatorState {
     pub serial_completion_txs: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
     /// Restart rate-limiting state, keyed by unit name.
     pub start_limit_state: HashMap<String, StartLimitState>,
+    /// In-process event bus for pub/sub event distribution.
+    /// Wrapped in `Arc<TokioRwLock>` so it can be accessed across `.await` points
+    /// inside `tokio::spawn`-ed tasks (parking_lot guards are not `Send`).
+    pub event_bus: Arc<TokioRwLock<EventBus>>,
 }
 
 impl AllocatorState {
@@ -308,6 +314,7 @@ impl AllocatorState {
             job_new_tx: None,
             serial_completion_txs: HashMap::new(),
             start_limit_state: HashMap::new(),
+            event_bus: Arc::new(TokioRwLock::new(EventBus::new())),
         }
     }
 }

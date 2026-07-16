@@ -951,7 +951,7 @@ pub fn handle_task_result(
         }
 
         // --- Restart policy: determine exit kind and check if restart needed ---
-        let task_restart_info: Option<(RestartPolicy, ExitKind)> =
+        let restart_info_inner: Option<(RestartPolicy, ExitKind)> =
             if !success && matches!(kind, JobKind::Start) {
                 let exit_kind = if message.contains("Timeout") {
                     ExitKind::Timeout
@@ -969,7 +969,8 @@ pub fn handle_task_result(
             } else {
                 None
             };
-    } // drop write lock
+        restart_info_inner
+    }; // drop write lock
 
     // Execute post-actions asynchronously.
     if !post_actions.is_empty() {
