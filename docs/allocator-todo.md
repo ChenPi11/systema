@@ -191,7 +191,7 @@ System A 与以下 Worker 通过 IPC 交互，以下是 System A 侧对各 Worke
 
 | Worker | 状态 | 说明 |
 |--------|------|------|
-| **System S**（Service Worker） | ⚠️ 部分实现 | IPC 通信已实现；System S 已实现基础状态机和进程管理；重启策略、cgroup、看门狗等未实现 |
+| **System S**（Service Worker） | ⚠️ 部分实现 | IPC 通信已实现；System S 已实现基础状态机和进程管理；systemd 兼容的 ExecStart 解析（前缀、分词、% 说明符、$VAR 展开、| shell 调用）；重启策略、cgroup、看门狗等未实现 |
 | **System T**（Target Worker） | ⚠️ 部分实现 | Target 内部激活逻辑已内嵌于 System A，无独立 Worker；但不能响应来自 Target 的事件 |
 | **System M**（Mount Worker） | ❌ 未实现 | `crates/system-m` 不存在 |
 | **System C**（Cron/Timer Worker） | ❌ 未实现 | `crates/system-c` 不存在 |
