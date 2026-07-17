@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use prost::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 use crate::state::{
     next_job_id, next_task_id, ActiveState, AllocatorHandle, AllocatorState, Job, JobCompletion,
@@ -318,6 +318,7 @@ pub async fn enqueue_job(
     let mut serial_chain_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
 
     // Create job records and dispatch tasks.
+    let mut created_job_ids: Vec<(u64, String)> = Vec::new();
     for name in units_to_process.iter() {
         // The primary job ID belongs to the unit that was directly requested.
         let is_root = name.as_str() == unit_name;
@@ -326,6 +327,7 @@ pub async fn enqueue_job(
         } else {
             next_job_id()
         };
+        created_job_ids.push((job_id, name.clone()));
 
         // Idempotency: skip if the unit is already in the desired state,
         // or if there is already an in-flight job of the same kind for it.
@@ -400,7 +402,9 @@ pub async fn enqueue_job(
         }
 
         // Find the appropriate worker.
-        let (worker_task_tx, task_id, unit_type) = {
+        // NOTE: read lock is dropped before match so the error path can
+        // acquire the write lock without deadlocking.
+        let (worker_chan, task_id, unit_type) = {
             let state = allocator.read();
             let unit = state.units.get(name.as_str());
             let unit_type = unit
@@ -412,33 +416,44 @@ pub async fn enqueue_job(
                 .values()
                 .find(|w| w.unit_types.contains(&unit_type));
 
-            match worker {
-                Some(w) => {
-                    let tx = w.task_tx.clone();
-                    let tid = next_task_id();
-                    (tx, tid, unit_type)
-                }
-                None => {
-                    warn!(
-                        "No worker registered for unit type '{}' (unit: {})",
-                        unit_type, name
-                    );
-                    if is_root {
-                        let mut state = allocator.write();
-                        let rt = state.runtime.entry(name.clone()).or_default();
-                        rt.active_state = ActiveState::Failed;
-                        rt.sub_state = "failed".to_string();
-                        emit_job_new(&mut state, job_id, name, kind);
-                        if let Some(ref tx) = state.job_completion_tx {
-                            let _ = tx.send(JobCompletion {
-                                job_id: primary_job_id,
-                                unit_name: name.clone(),
-                                result: JobResultKind::Failed,
-                            });
+            let tid = next_task_id();
+            (worker.map(|w| w.task_tx.clone()), tid, unit_type)
+        };
+
+        let (worker_task_tx, task_id) = match (worker_chan, task_id) {
+            (Some(tx), tid) => (tx, tid),
+            (None, _) => {
+                let err = format!(
+                    "No worker registered for unit type '{}' (unit: {}). \
+                     Cannot process dependency chain for '{}'.",
+                    unit_type, name, unit_name
+                );
+                warn!("{}", err);
+                {
+                    let mut state = allocator.write();
+                    let rt = state.runtime.entry(name.clone()).or_default();
+                    rt.active_state = ActiveState::Failed;
+                    rt.sub_state = "failed".to_string();
+                    emit_job_new(&mut state, job_id, name, kind);
+
+                    // Cancel all jobs already created for this request.
+                    for (jid, _) in &created_job_ids {
+                        if let Some(job) = state.jobs.get_mut(jid) {
+                            job.status = JobStatus::Cancelled;
                         }
+                        state.serial_completion_txs.remove(jid);
                     }
-                    continue;
+
+                    // Notify the caller that the root job has failed.
+                    if let Some(ref tx) = state.job_completion_tx {
+                        let _ = tx.send(JobCompletion {
+                            job_id: primary_job_id,
+                            unit_name: unit_name.to_string(),
+                            result: JobResultKind::Failed,
+                        });
+                    }
                 }
+                bail!("{}", err);
             }
         };
 
