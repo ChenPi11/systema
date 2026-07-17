@@ -16,7 +16,7 @@ use crate::state::{
     JobKind, JobMode, JobNewInfo, JobResult, JobResultKind, JobStatus, StartLimitState,
     UnitRuntimeInfo, WorkerTask,
 };
-use crate::unit::types::{ExitKind, RestartPolicy, UnitFile, UnitKind, UnitSection};
+use crate::unit::types::{ExitKind, RestartPolicy, UnitFile, UnitSection};
 use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
@@ -54,25 +54,19 @@ pub async fn enqueue_job(
     info!("Scheduling {:?} for {} (mode={:?})", kind, unit_name, mode);
 
     // --- Early check: ensure at least one worker exists for the root unit ---
-    // Target units are handled internally and don't need a worker.
     {
         let state = allocator.read();
         let unit = state.units.get(unit_name);
-        let requires_worker = unit
-            .map(|u| !matches!(u.kind, UnitKind::Target))
-            .unwrap_or(true);
-        if requires_worker {
-            let unit_type = unit
-                .map(|u| u.kind.worker_type().to_string())
-                .unwrap_or_else(|| "service".to_string());
-            let has_worker = state.workers.values().any(|w| w.unit_types.contains(&unit_type));
-            if !has_worker {
-                bail!(
-                    "No worker available for unit type '{}' (unit: {}). \
-                     Cannot execute {:?} operation. Is the corresponding System Worker running?",
-                    unit_type, unit_name, kind
-                );
-            }
+        let unit_type = unit
+            .map(|u| u.kind.worker_type().to_string())
+            .unwrap_or_else(|| "service".to_string());
+        let has_worker = state.workers.values().any(|w| w.unit_types.contains(&unit_type));
+        if !has_worker {
+            bail!(
+                "No worker available for unit type '{}' (unit: {}). \
+                 Cannot execute {:?} operation. Is the corresponding System Worker running?",
+                unit_type, unit_name, kind
+            );
         }
     }
 
@@ -403,29 +397,6 @@ pub async fn enqueue_job(
                 }
                 continue;
             }
-        }
-
-        // Target units are handled internally (no external worker needed).
-        let is_target = {
-            let state = allocator.read();
-            state
-                .units
-                .get(name.as_str())
-                .map_or(false, |u| matches!(u.kind, UnitKind::Target))
-        };
-        if is_target {
-            activate_target_internally(allocator.clone(), name);
-            emit_job_new_after_lock(allocator.clone(), job_id, name, kind);
-            if is_root {
-                if let Some(ref tx) = allocator.read().job_completion_tx {
-                    let _ = tx.send(JobCompletion {
-                        job_id: primary_job_id,
-                        unit_name: unit_name.to_string(),
-                        result: JobResultKind::Done,
-                    });
-                }
-            }
-            continue;
         }
 
         // Find the appropriate worker.
@@ -806,16 +777,6 @@ fn compute_start_order(
     }
 
     result
-}
-
-/// Activate a target unit inline in System A (no external worker needed).
-fn activate_target_internally(allocator: AllocatorHandle, name: &str) {
-    let mut state = allocator.write();
-    let rt = state.runtime.entry(name.to_string()).or_default();
-    rt.active_state = ActiveState::Active;
-    rt.sub_state = "active".to_string();
-    rt.load_state = "loaded".to_string();
-    debug!("Target {} activated internally", name);
 }
 
 /// Update unit runtime state from a task result received from a worker.

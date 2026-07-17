@@ -3,6 +3,7 @@ members = [
     "crates/common",
     "crates/system-a",
     "crates/system-s",
+    "crates/system-t",
 ]
 resolver = "2"
 
