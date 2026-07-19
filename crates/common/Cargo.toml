@@ -15,6 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+libc = "0.2"
 
 [build-dependencies]
 prost-build = "0.13"

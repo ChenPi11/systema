@@ -4,9 +4,14 @@
 //! sends a `WorkerRegistration`, then receives dispatched `TaskDispatch`
 //! messages and sends back `TaskResult` / `EventPublish` messages.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::Result;
+use parking_lot::Mutex;
 use prost::Message as ProstMessage;
 use tokio::net::UnixListener;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -23,11 +28,18 @@ use crate::state::{
 use common::event_bus::{Event, EventTopic};
 
 pub const SOCKET_PATH: &str = common::paths::IPC_SOCKET_PATH;
+pub const FD_PASS_SOCKET_PATH: &str = "/run/system-alphabet/fdpass.sock";
+
+/// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
+pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
 
 /// Run the IPC server — accepts System Worker connections indefinitely.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     // Ensure the socket directory exists.
     if let Some(parent) = std::path::Path::new(SOCKET_PATH).parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if let Some(parent) = std::path::Path::new(FD_PASS_SOCKET_PATH).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
@@ -42,18 +54,34 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         return Ok(());
     }
 
-    // Remove stale socket file (left by a previous crash).
+    // Remove stale socket files.
     let _ = tokio::fs::remove_file(SOCKET_PATH).await;
+    let _ = tokio::fs::remove_file(FD_PASS_SOCKET_PATH).await;
 
     let listener = UnixListener::bind(SOCKET_PATH)?;
     info!("IPC server listening on {}", SOCKET_PATH);
 
+    let fdpass_listener = UnixListener::bind(FD_PASS_SOCKET_PATH)?;
+    info!("FD-Pass server listening on {}", FD_PASS_SOCKET_PATH);
+
+    let fdpass_map: FdPassMap = Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn fdpass acceptor.
+    let fpm = fdpass_map.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_fdpass_acceptor(fdpass_listener, fpm).await {
+            error!("FD-Pass acceptor error: {}", e);
+        }
+    });
+
+    // Main accept loop.
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let alloc = allocator.clone();
+                let fpm = fdpass_map.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_worker(stream, alloc).await {
+                    if let Err(e) = handle_worker(stream, alloc, fpm).await {
                         error!("Worker connection error: {}", e);
                     }
                 });
@@ -65,8 +93,46 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     }
 }
 
+/// Accept connections on the fdpass socket, read worker_id, store stream.
+async fn run_fdpass_acceptor(
+    listener: UnixListener,
+    fdpass_map: FdPassMap,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let fpm = fdpass_map.clone();
+        tokio::spawn(async move {
+            // Read worker_id (null-terminated or newline-terminated).
+            let mut buf = [0u8; 128];
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("fdpass read error: {}", e);
+                    return;
+                }
+            };
+            let worker_id = String::from_utf8_lossy(&buf[..n])
+                .trim()
+                .to_string();
+            if worker_id.is_empty() {
+                warn!("fdpass connection with empty worker_id");
+                return;
+            }
+            fpm.lock().insert(worker_id.clone(), stream);
+            info!("fdpass channel registered for '{}'", worker_id);
+        });
+    }
+}
+
 /// Handle a single worker connection from registration through task dispatch.
-async fn handle_worker(stream: tokio::net::UnixStream, allocator: AllocatorHandle) -> Result<()> {
+async fn handle_worker(
+    stream: tokio::net::UnixStream,
+    allocator: AllocatorHandle,
+    _fdpass_map: FdPassMap,
+) -> Result<()> {
     let mut framed = frame_stream(stream);
 
     // --- Step 1: receive WorkerRegistration ---

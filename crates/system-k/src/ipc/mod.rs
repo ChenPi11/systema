@@ -14,6 +14,7 @@ use common::proto::{
 use crate::socket::{self, SocketManager};
 
 const ALLOCATOR_SOCKET: &str = common::paths::IPC_SOCKET_PATH;
+const FD_PASS_SOCKET_PATH: &str = "/run/system-alphabet/fdpass.sock";
 const WORKER_ID: &str = "system-k-1";
 const WORKER_UNIT_TYPES: &[&str] = &["socket"];
 
@@ -52,6 +53,24 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
         .with_context(|| format!("Cannot connect to {}", ALLOCATOR_SOCKET))?;
 
     info!("Connected to System A");
+
+    // --- Connect to fd-pass channel ---
+    let fdpass_stream = match tokio::net::UnixStream::connect(FD_PASS_SOCKET_PATH).await {
+        Ok(s) => {
+            // Identify ourselves by sending worker_id via raw write.
+            use tokio::io::AsyncWriteExt;
+            let ident = format!("{}\n", WORKER_ID);
+            let mut s_ref = s;
+            if let Err(e) = s_ref.write_all(ident.as_bytes()).await {
+                warn!("Failed to send id on fdpass channel: {}", e);
+            }
+            Some(s_ref)
+        }
+        Err(e) => {
+            warn!("Cannot connect to fdpass socket ({}): {}", FD_PASS_SOCKET_PATH, e);
+            None
+        }
+    };
 
     let mut framed = frame_stream(stream);
 
@@ -209,6 +228,29 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
                             }
                         }
                     }
+                    "socket.request_fd" => {
+                        // System A is asking for a listening socket's raw fd.
+                        // We respond by sending the fd over the fdpass channel.
+                        let unit_name =
+                            String::from_utf8(env.payload).unwrap_or_default();
+                        if let Some(ref fdpass) = fdpass_stream {
+                            if let Some(fd) = socket::get_listener_fd(
+                                &socket_manager,
+                                &unit_name,
+                            ) {
+                                info!("Sending fd for '{}' via SCM_RIGHTS", unit_name);
+                                if let Err(e) =
+                                    common::ipc::send_fd(fdpass, fd).await
+                                {
+                                    warn!("Failed to send fd: {}", e);
+                                }
+                            } else {
+                                warn!("No listener fd found for '{}'", unit_name);
+                            }
+                        } else {
+                            warn!("No fdpass channel available");
+                        }
+                    }
                     other => {
                         warn!("Unexpected method from System A: {}", other);
                         continue;
@@ -235,7 +277,7 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
 async fn execute_task(
     socket_manager: &SocketManager,
     task: &TaskDispatch,
-    event_tx: &mpsc::UnboundedSender<bytes::Bytes>,
+    _event_tx: &mpsc::UnboundedSender<bytes::Bytes>,
 ) -> Result<()> {
     let kind = TaskKind::try_from(task.kind).unwrap_or(TaskKind::Start);
 
@@ -250,22 +292,23 @@ async fn execute_task(
                 anyhow::bail!("Empty unit config for '{}'", task.unit_name);
             };
 
-            socket::start_socket(socket_manager, &task.unit_name, &config, &{
-                let (tx, _) = mpsc::unbounded_channel();
-                tx
-            })?;
+            socket::start_socket(socket_manager, &task.unit_name, &config)?;
+            if config.accept {
+                socket::spawn_accept_loops(
+                    socket_manager,
+                    &task.unit_name,
+                );
+            }
             info!("Socket '{}' started successfully", task.unit_name);
         }
 
         TaskKind::Stop => {
-            let (tx, _) = mpsc::unbounded_channel();
-            socket::stop_socket(socket_manager, &task.unit_name, &tx)?;
+            socket::stop_socket(socket_manager, &task.unit_name)?;
             info!("Socket '{}' stopped successfully", task.unit_name);
         }
 
         TaskKind::Restart => {
-            let (tx, _) = mpsc::unbounded_channel();
-            let _ = socket::stop_socket(socket_manager, &task.unit_name, &tx);
+            let _ = socket::stop_socket(socket_manager, &task.unit_name);
             let config = if !task.unit_config.is_empty() {
                 let uc = UnitConfig::decode(task.unit_config.as_slice())?;
                 uc.socket.ok_or_else(|| {
@@ -274,27 +317,31 @@ async fn execute_task(
             } else {
                 anyhow::bail!("Empty unit config for '{}'", task.unit_name);
             };
-            socket::start_socket(socket_manager, &task.unit_name, &config, &{
-                let (tx, _) = mpsc::unbounded_channel();
-                tx
-            })?;
+            socket::start_socket(socket_manager, &task.unit_name, &config)?;
+            if config.accept {
+                socket::spawn_accept_loops(
+                    socket_manager,
+                    &task.unit_name,
+                );
+            }
             info!("Socket '{}' restarted successfully", task.unit_name);
         }
 
         TaskKind::Reload => {
-            // For socket units, reload is effectively a restart:
-            // close old sockets and re-bind with existing config.
-            let (tx, _) = mpsc::unbounded_channel();
             let config = {
                 let guard = socket_manager.lock();
                 guard.get(&task.unit_name).map(|m| m.config.clone())
             };
-            let _ = socket::stop_socket(socket_manager, &task.unit_name, &tx);
+            let _ = socket::stop_socket(socket_manager, &task.unit_name);
             if let Some(cfg) = config {
-                socket::start_socket(socket_manager, &task.unit_name, &cfg, &{
-                    let (tx, _) = mpsc::unbounded_channel();
-                    tx
-                })?;
+                let accept = cfg.accept;
+                socket::start_socket(socket_manager, &task.unit_name, &cfg)?;
+                if accept {
+                    socket::spawn_accept_loops(
+                        socket_manager,
+                        &task.unit_name,
+                    );
+                }
             }
             info!("Socket '{}' reloaded successfully", task.unit_name);
         }
