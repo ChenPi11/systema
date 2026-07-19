@@ -86,7 +86,7 @@ Task 与 Event 消息的具体结构在实现时按需定义。
 - 支持 `systemctl start/stop sshd.service`，能正确启动和停止一个简单服务。
 - 实现 `target` 的基本激活（System T 可作为 System A 内部逻辑，暂不独立）。
 
-### Phase 2：事件总线与故障恢复
+### Phase 2：事件总线与故障恢复 [已完成]
 
 - 实现事件总线：pub/sub 机制，System S 发布 `process.exit`，SysA 触发 restart。
 - 实现重启策略（on-failure, always）。
@@ -111,18 +111,4 @@ Task 与 Event 消息的具体结构在实现时按需定义。
 - 代码风格遵循 Rust 社区惯例，注重错误处理和日志。
 - 所有 IPC 消息使用 protobuf 定义，放在独立的 `proto/` 目录。
 
-现在，请开始你的理解和 Phase 2 的设计方案。
-
-Phase 2 实施顺序:
-
-1. 模块 B（重启策略完善）— 改动最小，单元测试覆盖
-   - 解析 StartLimitIntervalSec/StartLimitBurst
-   - 统一重启逻辑，修正 Restart= 策略表
-2. 模块 A（事件总线）— 架构增强
-   - 实现 EventBus，重构 handle_event
-3. 模块 C（崩溃恢复）— 依赖模块 A/B，改动最大
-   - 状态持久化
-   - IPC 新增同步方法
-   - Worker 侧响应同步
-   - 启动恢复流程
-   - Reconciliation loop
+现在，请开始你的理解和 Phase 3 的设计方案。

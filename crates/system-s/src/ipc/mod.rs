@@ -22,12 +22,14 @@ use tracing::{debug, info, warn};
 
 use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use common::proto::{
-    Envelope, EventPublish, RegisterAck, TaskDispatch, TaskKind, TaskResult, TaskResultKind,
-    UnitConfig, WorkerRegistration,
+    Envelope, EventPublish, RegisterAck, StateSyncReport, SyncUnitState, TaskDispatch, TaskKind,
+    TaskResult, TaskResultKind, UnitConfig, WorkerRegistration,
 };
 
 use crate::process::{start_service, stop_service};
 use crate::state::{new_registry, ServiceRegistry, ServiceState};
+
+
 
 const ALLOCATOR_SOCKET: &str = common::paths::IPC_SOCKET_PATH;
 const WORKER_ID: &str = "system-s-1";
@@ -180,66 +182,73 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
                     }
                 };
 
-                if env.method != "task.dispatch" {
-                    warn!("Unexpected method from System A: {}", env.method);
-                    continue;
-                }
+                match env.method.as_str() {
+                    "task.dispatch" => {
+                        let task = match TaskDispatch::decode(env.payload.as_slice()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!("Failed to decode TaskDispatch: {}", e);
+                                continue;
+                            }
+                        };
+                        debug!(
+                            "Received task {} for {} (kind={:?})",
+                            task.task_id, task.unit_name, task.kind
+                        );
 
-                let task = match TaskDispatch::decode(env.payload.as_slice()) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("Failed to decode TaskDispatch: {}", e);
-                        continue;
-                    }
-                };
-                debug!(
-                    "Received task {} for {} (kind={:?})",
-                    task.task_id, task.unit_name, task.kind
-                );
-
-                let unit_config = if !task.unit_config.is_empty() {
-                    match UnitConfig::decode(task.unit_config.as_slice()) {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            warn!("Failed to decode UnitConfig: {}", e);
+                        let unit_config = if !task.unit_config.is_empty() {
+                            match UnitConfig::decode(task.unit_config.as_slice()) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    warn!("Failed to decode UnitConfig: {}", e);
+                                    None
+                                }
+                            }
+                        } else {
                             None
+                        };
+
+                        let result =
+                            execute_task(&registry, &task, unit_config.as_ref(), &out_tx).await;
+
+                        let (success, message, result_kind) = match result {
+                            Ok(()) => (true, String::new(), TaskResultKind::TaskResultDone),
+                            Err(e) => (false, e.to_string(), TaskResultKind::TaskResultFailed),
+                        };
+
+                        let task_result = TaskResult {
+                            task_id: task.task_id,
+                            unit_name: task.unit_name.clone(),
+                            success,
+                            message,
+                            result_kind: result_kind as i32,
+                        };
+                        match make_envelope(
+                            env.request_id,
+                            WORKER_ID,
+                            "system-a",
+                            "task.result",
+                            task_result,
+                        )
+                        .and_then(encode_envelope)
+                        {
+                            Ok(encoded) => {
+                                if out_tx.send(encoded).is_err() {
+                                    warn!("Outgoing channel closed; cannot send task result");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to encode task result: {}", e);
+                            }
                         }
                     }
-                } else {
-                    None
-                };
-
-                let result = execute_task(&registry, &task, unit_config.as_ref(), &out_tx).await;
-
-                let (success, message, result_kind) = match result {
-                    Ok(()) => (true, String::new(), TaskResultKind::TaskResultDone),
-                    Err(e) => (false, e.to_string(), TaskResultKind::TaskResultFailed),
-                };
-
-                let task_result = TaskResult {
-                    task_id: task.task_id,
-                    unit_name: task.unit_name.clone(),
-                    success,
-                    message,
-                    result_kind: result_kind as i32,
-                };
-                match make_envelope(
-                    env.request_id,
-                    WORKER_ID,
-                    "system-a",
-                    "task.result",
-                    task_result,
-                )
-                .and_then(encode_envelope)
-                {
-                    Ok(encoded) => {
-                        if out_tx.send(encoded).is_err() {
-                            warn!("Outgoing channel closed; cannot send task result");
-                            break;
-                        }
+                    "state.sync_request" => {
+                        handle_sync_request(&registry, &out_tx, env.request_id);
                     }
-                    Err(e) => {
-                        warn!("Failed to encode task result: {}", e);
+                    other => {
+                        warn!("Unexpected method from System A: {}", other);
+                        continue;
                     }
                 }
             }
@@ -267,6 +276,44 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
 /// Execute a single task, queuing events onto `out_tx` instead of writing
 /// them directly to the socket (so background monitor tasks can share the
 /// same sender).
+
+/// Handle a `state.sync_request` from System A by snapshotting every
+/// registered service and sending back a `state.sync_report`.
+fn handle_sync_request(
+    registry: &ServiceRegistry,
+    out_tx: &mpsc::UnboundedSender<bytes::Bytes>,
+    request_id: u64,
+) {
+    let guard = registry.lock();
+    let units: Vec<SyncUnitState> = guard
+        .values()
+        .map(|inst| {
+            let state_str = inst.state.as_str();
+            SyncUnitState {
+                unit_name: inst.unit_name.clone(),
+                main_pid: inst.main_pid.unwrap_or(0),
+                state: state_str.to_string(),
+                last_exit_code: inst.last_exit_code.unwrap_or(0),
+            }
+        })
+        .collect();
+
+    let report = StateSyncReport { units };
+
+    match make_envelope(request_id, WORKER_ID, "system-a", "state.sync_report", report)
+        .and_then(encode_envelope)
+    {
+        Ok(encoded) => {
+            if out_tx.send(encoded).is_err() {
+                warn!("Outgoing channel closed; cannot send state sync report");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to encode state sync report: {}", e);
+        }
+    }
+}
+
 async fn execute_task(
     registry: &ServiceRegistry,
     task: &TaskDispatch,

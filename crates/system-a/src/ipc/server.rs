@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use common::proto::{Envelope, EventPublish, RegisterAck, TaskResult, WorkerRegistration};
+use common::proto::{
+    Envelope, EventPublish, RegisterAck, StateSyncReport, TaskResult, WorkerRegistration,
+};
 
 use crate::scheduler::{self, build_task_dispatch};
 use crate::state::{
@@ -93,7 +95,21 @@ async fn handle_worker(stream: tokio::net::UnixStream, allocator: AllocatorHandl
     let ack_env = make_envelope(next_request_id(), "system-a", &worker_id, "worker.ack", ack)?;
     send_envelope(&mut framed, &ack_env).await?;
 
-    // --- Step 3: create task channel and register worker ---
+    // --- Step 3: send state.sync_request so the worker reports its snapshot ---
+    {
+        use common::proto::StateSyncRequest;
+        let sync = StateSyncRequest {};
+        let sync_env = make_envelope(
+            next_request_id(),
+            "system-a",
+            &worker_id,
+            "state.sync_request",
+            sync,
+        )?;
+        send_envelope(&mut framed, &sync_env).await?;
+    }
+
+    // --- Step 4: create task channel and register worker ---
     let (task_tx, mut task_rx) = mpsc::channel::<WorkerTask>(64);
     {
         let mut state = allocator.write();
@@ -272,6 +288,15 @@ async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<
             );
             handle_event(allocator, event).await?;
         }
+        "state.sync_report" => {
+            let report = StateSyncReport::decode(env.payload.as_slice())?;
+            info!(
+                "Received state.sync_report from '{}': {} units reported",
+                env.source,
+                report.units.len()
+            );
+            handle_state_sync_report(allocator, report).await?;
+        }
         other => {
             warn!("Unknown method from worker: {}", other);
         }
@@ -287,6 +312,44 @@ fn parse_task_kind_from_context(allocator: &AllocatorHandle, task_id: u64) -> Jo
         .get(&task_id)
         .copied()
         .unwrap_or(JobKind::Start)
+}
+
+/// Process a `StateSyncReport` from a (re-)connecting worker and update
+/// `AllocatorState.runtime` with the worker's reported unit states.
+///
+/// This is the core of crash recovery: after System A restarts or a worker
+/// reconnects, the runtime table starts empty; this report populates it so
+/// that D-Bus queries (`ListUnits`, `GetUnit`) return correct live status.
+async fn handle_state_sync_report(
+    allocator: AllocatorHandle,
+    report: StateSyncReport,
+) -> Result<()> {
+    let mut state = allocator.write();
+    for unit in &report.units {
+        let rt = state.runtime.entry(unit.unit_name.clone()).or_default();
+        rt.main_pid = if unit.main_pid > 0 { Some(unit.main_pid) } else { None };
+        rt.load_state = "loaded".to_string();
+        // Map worker state strings → ActiveState
+        match unit.state.as_str() {
+            "running" => {
+                rt.active_state = ActiveState::Active;
+                rt.sub_state = "running".to_string();
+            }
+            "dead" => {
+                rt.active_state = ActiveState::Inactive;
+                rt.sub_state = "dead".to_string();
+            }
+            "failed" => {
+                rt.active_state = ActiveState::Failed;
+                rt.sub_state = "failed".to_string();
+            }
+            other => {
+                rt.active_state = ActiveState::Inactive;
+                rt.sub_state = other.to_string();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Handle an event published by a worker by dispatching it through the

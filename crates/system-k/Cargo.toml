@@ -1,0 +1,22 @@
+[package]
+name = "system-k"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "system-k"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+
+tokio.workspace = true
+tokio-util.workspace = true
+prost.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+parking_lot.workspace = true

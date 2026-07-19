@@ -83,12 +83,66 @@ message RegisterAck {
     string message = 2;
 }
 
+// Sent by System A to a Worker to request a full state snapshot of all units
+// managed by that Worker.  The Worker replies with a StateSyncReport.
+message StateSyncRequest {
+    // Empty — reserved for future filter fields.
+}
+
+// Describes one unit's runtime state as seen by the Worker that manages it.
+message SyncUnitState {
+    // Unit name, e.g. "nginx.service".
+    string unit_name = 1;
+    // Worker-side state string, e.g. "running", "dead", "failed".
+    string state = 2;
+    // PID of the main process (0 if not running).
+    uint32 main_pid = 3;
+    // Last exit code (positive) or signal (negative), 0 if unknown.
+    int32 last_exit_code = 4;
+}
+
+// Sent by a Worker in response to StateSyncRequest.
+message StateSyncReport {
+    repeated SyncUnitState units = 1;
+}
+
+// Configuration for a .socket unit, sent inside UnitConfig.
+message SocketConfig {
+    // Addresses to listen on — see SocketAddress below.
+    repeated SocketAddress listen = 1;
+    // Accept=yes -> per-connection service; Accept=no -> passive socket.
+    bool accept = 2;
+    // listen() backlog (kernel default if 0).
+    uint32 backlog = 3;
+    // Socket file mode (numeric, e.g. "0666").
+    string socket_mode = 4;
+    // Socket user/group for Unix sockets.
+    string socket_user = 5;
+    string socket_group = 6;
+    // Associated service unit name.
+    string service = 7;
+}
+
+// One listen address in a SocketConfig.
+message SocketAddress {
+    // ListenStream= address, e.g. "0.0.0.0:8080", "/run/foo.sock".
+    string stream = 1;
+    // ListenDatagram= address.
+    string datagram = 2;
+    // ListenSequentialPacket= address.
+    string sequential_packet = 3;
+    // ListenFIFO= path.
+    string fifo = 4;
+}
+
 // Minimal unit configuration sent from System A to System Workers.
 message UnitConfig {
     string unit_name = 1;
     string description = 2;
     // For service units.
     ServiceConfig service = 3;
+    // For socket units.
+    SocketConfig socket = 4;
 }
 
 message ServiceConfig {

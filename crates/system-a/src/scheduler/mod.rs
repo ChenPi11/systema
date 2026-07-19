@@ -17,7 +17,7 @@ use crate::state::{
     UnitRuntimeInfo, WorkerTask,
 };
 use crate::unit::types::{ExitKind, RestartPolicy, UnitFile, UnitSection};
-use common::proto::{ServiceConfig, TaskDispatch, TaskKind, UnitConfig};
+use common::proto::{ServiceConfig, SocketAddress, SocketConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
 /// Returns the primary job ID.
@@ -1060,10 +1060,52 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
         timeout_stop_secs: svc.timeout_stop_sec,
     });
 
+    let socket = uf.socket.as_ref().map(|sk| {
+        let mut listen: Vec<SocketAddress> = Vec::new();
+        for addr in &sk.listen_stream {
+            listen.push(SocketAddress {
+                stream: addr.clone(),
+                ..Default::default()
+            });
+        }
+        for addr in &sk.listen_datagram {
+            listen.push(SocketAddress {
+                datagram: addr.clone(),
+                ..Default::default()
+            });
+        }
+        for addr in &sk.listen_sequential_packet {
+            listen.push(SocketAddress {
+                sequential_packet: addr.clone(),
+                ..Default::default()
+            });
+        }
+        for addr in &sk.listen_fifo {
+            listen.push(SocketAddress {
+                fifo: addr.clone(),
+                ..Default::default()
+            });
+        }
+        // Derive the associated service name per systemd convention:
+        // "foo.socket" -> "foo.service".
+        let svc_name = uf.name.replace(".socket", ".service");
+
+        SocketConfig {
+            listen,
+            accept: sk.accept,
+            backlog: sk.backlog,
+            socket_mode: sk.socket_mode.clone(),
+            socket_user: sk.socket_user.clone(),
+            socket_group: sk.socket_group.clone(),
+            service: svc_name,
+        }
+    });
+
     UnitConfig {
         unit_name: uf.name.clone(),
         description: uf.unit.description.clone(),
         service,
+        socket,
     }
 }
 
