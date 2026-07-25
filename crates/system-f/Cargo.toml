@@ -1,0 +1,17 @@
+[package]
+name = "system-f"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+configparser.workspace = true
+async-trait.workspace = true
+
+[build-dependencies]

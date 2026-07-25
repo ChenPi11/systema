@@ -1075,6 +1075,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "system-f",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1083,6 +1084,20 @@ dependencies = [
  "uuid",
  "zbus",
  "zvariant",
+]
+
+[[package]]
+name = "system-f"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "common",
+ "configparser",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

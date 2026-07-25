@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 common = { path = "../common" }
+system-f = { path = "../system-f" }
 
 tokio.workspace = true
 tokio-util.workspace = true
