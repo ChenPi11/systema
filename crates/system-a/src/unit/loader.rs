@@ -19,9 +19,9 @@ use crate::state::AllocatorHandle;
 
 /// Standard systemd unit file search directories, in priority order.
 ///
-/// Populated from `common::paths::UNIT_SEARCH_PATHS` (compile-time configurable).
-pub use common::paths::UNIT_SEARCH_PATHS;
-pub use common::paths::GENERATOR_SEARCH_PATHS;
+/// Populated from `libsysa::paths::UNIT_SEARCH_PATHS` (compile-time configurable).
+pub use libsysa::paths::UNIT_SEARCH_PATHS;
+pub use libsysa::paths::GENERATOR_SEARCH_PATHS;
 
 /// Load all unit files from the default search paths into the allocator.
 pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {

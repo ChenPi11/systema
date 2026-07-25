@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-use common::proto::UnitConfig;
+use libsysa::proto::UnitConfig;
 
 use crate::state::{ServiceInstance, ServiceRegistry, ServiceState};
 

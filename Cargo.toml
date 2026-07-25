@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/common",
+    "crates/libsysa",
     "crates/system-f",
     "crates/system-a",
     "crates/system-s",

@@ -20,8 +20,8 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
-use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use common::proto::{
+use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
+use libsysa::proto::{
     Envelope, EventPublish, RegisterAck, StateSyncReport, SyncUnitState, TaskDispatch, TaskKind,
     TaskResult, TaskResultKind, UnitConfig, WorkerRegistration,
 };
@@ -31,7 +31,7 @@ use crate::state::{new_registry, ServiceRegistry, ServiceState};
 
 
 
-const ALLOCATOR_SOCKET: &str = common::paths::IPC_SOCKET_PATH;
+const ALLOCATOR_SOCKET: &str = libsysa::paths::IPC_SOCKET_PATH;
 const WORKER_ID: &str = "system-s-1";
 const WORKER_UNIT_TYPES: &[&str] = &["service"];
 

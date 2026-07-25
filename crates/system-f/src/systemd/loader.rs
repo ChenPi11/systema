@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 use super::parser::parse_unit_from_path;
 use super::types::UnitFile;
-use common::paths::UNIT_SEARCH_PATHS;
+use libsysa::paths::UNIT_SEARCH_PATHS;
 
 pub fn is_known_extension(name: &str) -> bool {
     matches!(

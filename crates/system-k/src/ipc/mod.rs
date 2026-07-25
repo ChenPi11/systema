@@ -5,15 +5,15 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
-use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use common::proto::{
+use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
+use libsysa::proto::{
     Envelope, RegisterAck, StateSyncReport, SyncUnitState, TaskDispatch, TaskKind,
     TaskResult, TaskResultKind, UnitConfig, WorkerRegistration,
 };
 
 use crate::socket::{self, SocketManager};
 
-const ALLOCATOR_SOCKET: &str = common::paths::IPC_SOCKET_PATH;
+const ALLOCATOR_SOCKET: &str = libsysa::paths::IPC_SOCKET_PATH;
 const FD_PASS_SOCKET_PATH: &str = "/run/system-alphabet/fdpass.sock";
 const WORKER_ID: &str = "system-k-1";
 const WORKER_UNIT_TYPES: &[&str] = &["socket"];
@@ -240,7 +240,7 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
                             ) {
                                 info!("Sending fd for '{}' via SCM_RIGHTS", unit_name);
                                 if let Err(e) =
-                                    common::ipc::send_fd(fdpass, fd).await
+                                    libsysa::ipc::send_fd(fdpass, fd).await
                                 {
                                     warn!("Failed to send fd: {}", e);
                                 }

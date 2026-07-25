@@ -199,24 +199,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "futures",
- "libc",
- "prost",
- "prost-build",
- "prost-types",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -558,6 +540,24 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "libsysa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "libc",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -1066,9 +1066,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "common",
  "configparser",
  "futures",
+ "libsysa",
  "once_cell",
  "parking_lot",
  "petgraph 0.6.5",
@@ -1092,8 +1092,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "common",
  "configparser",
+ "libsysa",
  "serde",
  "thiserror",
  "tokio",
@@ -1106,9 +1106,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "common",
  "futures",
  "libc",
+ "libsysa",
  "parking_lot",
  "prost",
  "tokio",
@@ -1124,8 +1124,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "common",
  "futures",
+ "libsysa",
  "nix",
  "parking_lot",
  "prost",
@@ -1144,8 +1144,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "common",
  "futures",
+ "libsysa",
  "parking_lot",
  "prost",
  "tokio",

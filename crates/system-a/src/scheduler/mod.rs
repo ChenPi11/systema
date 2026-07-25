@@ -17,7 +17,7 @@ use crate::state::{
     UnitRuntimeInfo, WorkerTask,
 };
 use crate::unit::types::{ExitKind, RestartPolicy, UnitFile, UnitSection};
-use common::proto::{ServiceConfig, SocketAddress, SocketConfig, TaskDispatch, TaskKind, UnitConfig};
+use libsysa::proto::{ServiceConfig, SocketAddress, SocketConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
 /// Returns the primary job ID.
@@ -1377,7 +1377,7 @@ fn is_on_ac_power() -> bool {
 /// Returns `true` if this appears to be the first boot of the system.
 /// Heuristic: `/run/systemd/first-boot` or `/run/machine-id` does not exist.
 fn is_first_boot() -> bool {
-    std::path::Path::new(common::paths::SYSTEMD_FIRST_BOOT_FILE).exists()
+    std::path::Path::new(libsysa::paths::SYSTEMD_FIRST_BOOT_FILE).exists()
 }
 
 #[cfg(test)]
@@ -1778,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_task_kind_to_proto() {
-        use common::proto::TaskKind;
+        use libsysa::proto::TaskKind;
         assert_eq!(task_kind_to_proto(JobKind::Start), TaskKind::Start);
         assert_eq!(task_kind_to_proto(JobKind::Stop), TaskKind::Stop);
         assert_eq!(task_kind_to_proto(JobKind::Restart), TaskKind::Restart);

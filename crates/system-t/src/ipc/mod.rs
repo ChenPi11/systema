@@ -15,14 +15,14 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
-use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use common::proto::{
+use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
+use libsysa::proto::{
     Envelope, RegisterAck, TaskDispatch, TaskKind, TaskResult, TaskResultKind, WorkerRegistration,
 };
 
 use crate::state::{new_registry, TargetRegistry, TargetState};
 
-const ALLOCATOR_SOCKET: &str = common::paths::IPC_SOCKET_PATH;
+const ALLOCATOR_SOCKET: &str = libsysa::paths::IPC_SOCKET_PATH;
 const WORKER_ID: &str = "system-t-1";
 const WORKER_UNIT_TYPES: &[&str] = &["target"];
 

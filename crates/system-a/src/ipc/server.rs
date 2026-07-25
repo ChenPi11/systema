@@ -15,8 +15,8 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use common::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use common::proto::{
+use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
+use libsysa::proto::{
     Envelope, EventPublish, RegisterAck, StateSyncReport, TaskResult, WorkerRegistration,
 };
 
@@ -25,9 +25,9 @@ use crate::state::{
     next_request_id, ActiveState, AllocatorHandle, JobCompletion, JobKind, JobResultKind,
     JobStatus, WorkerEntry, WorkerTask,
 };
-use common::event_bus::{Event, EventTopic};
+use libsysa::event_bus::{Event, EventTopic};
 
-pub const SOCKET_PATH: &str = common::paths::IPC_SOCKET_PATH;
+pub const SOCKET_PATH: &str = libsysa::paths::IPC_SOCKET_PATH;
 pub const FD_PASS_SOCKET_PATH: &str = "/run/system-alphabet/fdpass.sock";
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
@@ -163,7 +163,7 @@ async fn handle_worker(
 
     // --- Step 3: send state.sync_request so the worker reports its snapshot ---
     {
-        use common::proto::StateSyncRequest;
+        use libsysa::proto::StateSyncRequest;
         let sync = StateSyncRequest {};
         let sync_env = make_envelope(
             next_request_id(),

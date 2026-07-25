@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{info, warn};
 
-use common::proto::SocketConfig;
+use libsysa::proto::SocketConfig;
 
 const ABSTRACT_PREFIX: char = '@';
 

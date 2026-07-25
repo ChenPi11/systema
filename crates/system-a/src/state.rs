@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use common::event_bus::EventBus;
+use libsysa::event_bus::EventBus;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock as TokioRwLock;

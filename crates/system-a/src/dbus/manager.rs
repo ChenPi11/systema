@@ -498,7 +498,7 @@ impl ManagerInterface {
             Ok(file_state.to_string())
         } else {
             // Unit not loaded — try to find it on disk without loading it fully.
-            for dir in common::paths::UNIT_SEARCH_PATHS {
+            for dir in libsysa::paths::UNIT_SEARCH_PATHS {
                 let path = std::path::Path::new(dir).join(name);
                 if path.exists() {
                     // File exists but isn't loaded; report as "static".
@@ -734,7 +734,7 @@ impl ManagerInterface {
 
     #[zbus(property)]
     fn unit_path(&self) -> Vec<String> {
-        common::paths::UNIT_SEARCH_PATHS
+        libsysa::paths::UNIT_SEARCH_PATHS
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -865,7 +865,7 @@ pub(super) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<
     use crate::unit::parser::parse_unit;
 
     // Check all search paths.
-    for dir in common::paths::UNIT_SEARCH_PATHS {
+    for dir in libsysa::paths::UNIT_SEARCH_PATHS {
         let path = std::path::Path::new(dir).join(name);
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
@@ -970,7 +970,7 @@ where
             };
             if predicate(name, file_state) {
                 Some((
-                    format!("{}/{}", common::paths::SYSTEMD_LIB_UNIT_DIR, name),
+                    format!("{}/{}", libsysa::paths::SYSTEMD_LIB_UNIT_DIR, name),
                     file_state.to_string(),
                 ))
             } else {

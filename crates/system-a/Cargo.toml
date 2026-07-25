@@ -9,7 +9,7 @@ name = "system-a"
 path = "src/main.rs"
 
 [dependencies]
-common = { path = "../common" }
+libsysa = { path = "../libsysa" }
 system-f = { path = "../system-f" }
 
 tokio.workspace = true
