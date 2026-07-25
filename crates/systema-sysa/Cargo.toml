@@ -1,16 +1,16 @@
 [package]
-name = "system-a"
+name = "systema-sysa"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "system-a"
+name = "systema-sysa"
 path = "src/main.rs"
 
 [dependencies]
 libsysa = { path = "../libsysa" }
-system-f = { path = "../system-f" }
+systema-sysf = { path = "../systema-sysf" }
 
 tokio.workspace = true
 tokio-util.workspace = true

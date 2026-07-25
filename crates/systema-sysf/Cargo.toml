@@ -1,5 +1,5 @@
 [package]
-name = "system-f"
+name = "systema-sysf"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

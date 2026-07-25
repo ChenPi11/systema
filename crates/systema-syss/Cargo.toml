@@ -1,11 +1,11 @@
 [package]
-name = "system-s"
+name = "systema-syss"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "system-s"
+name = "systema-syss"
 path = "src/main.rs"
 
 [dependencies]

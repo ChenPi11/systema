@@ -1,11 +1,11 @@
 [workspace]
 members = [
     "crates/libsysa",
-    "crates/system-f",
-    "crates/system-a",
-    "crates/system-s",
-    "crates/system-t",
-    "crates/system-k",
+    "crates/systema-sysf",
+    "crates/systema-sysa",
+    "crates/systema-syss",
+    "crates/systema-syst",
+    "crates/systema-sysk",
 ]
 resolver = "2"
 

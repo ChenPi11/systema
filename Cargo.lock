@@ -1060,7 +1060,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-a"
+name = "systema-sysa"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1075,7 +1075,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
- "system-f",
+ "systema-sysf",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1087,7 +1087,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-f"
+name = "systema-sysf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1101,7 +1101,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-k"
+name = "systema-sysk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1118,7 +1118,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-s"
+name = "systema-syss"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1139,7 +1139,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-t"
+name = "systema-syst"
 version = "0.1.0"
 dependencies = [
  "anyhow",
