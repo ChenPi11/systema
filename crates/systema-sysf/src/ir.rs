@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 /// Unified unit type, abstracted across all init systems.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnitType {
     Service,
     Target,
@@ -36,7 +38,7 @@ impl UnitType {
 }
 
 /// Dependency relationships between units.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DependencySet {
     /// Units that must start before this one.
     pub after: HashSet<String>,
@@ -66,7 +68,7 @@ pub struct DependencySet {
 }
 
 /// The command line and modifiers for an executable directive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecCommand {
     /// Full raw command string (with any format-specific prefixes).
     pub raw: String,
@@ -81,7 +83,7 @@ pub struct ExecCommand {
 }
 
 /// Service-specific configuration in a unified form.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub exec_start: Vec<ExecCommand>,
     pub exec_stop: Vec<ExecCommand>,
@@ -104,7 +106,7 @@ pub struct ServiceConfig {
     pub kill_mode: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RestartPolicy {
     #[default]
     No,
@@ -131,7 +133,7 @@ impl RestartPolicy {
 }
 
 /// Mount-specific configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MountConfig {
     pub what: String,
     pub where_: String,
@@ -141,7 +143,7 @@ pub struct MountConfig {
 }
 
 /// Timer-specific configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TimerConfig {
     pub on_active_sec: Option<u32>,
     pub on_boot_sec: Option<u32>,
@@ -156,7 +158,7 @@ pub struct TimerConfig {
 }
 
 /// Socket-specific configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SocketConfig {
     pub listen_stream: Vec<String>,
     pub listen_datagram: Vec<String>,
@@ -173,7 +175,7 @@ pub struct SocketConfig {
 ///
 /// Every Finder (systemd, SysV, OpenRC, Runit, etc.) produces this type.
 /// System Allocator works exclusively with `UnitIR`, never with raw config files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitIR {
     /// Canonical unit identifier, e.g. "nginx.service", "network", "sshd".
     pub id: String,
@@ -205,7 +207,7 @@ pub struct UnitIR {
 }
 
 /// A condition or assert directive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Condition {
     /// The condition type, e.g. "PathExists", "Virtualization", "Host".
     pub kind: String,
