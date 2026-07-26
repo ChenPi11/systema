@@ -16,17 +16,26 @@ mod state;
 mod unit;
 
 use anyhow::Result;
-use tracing::{info, warn};
+use clap::Parser;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "systema-sysa", about = "System A — System Allocator")]
+struct Args {
+    #[arg(long, short = 'D', help = "Enable debug-level logging")]
+    debug: bool,
+
+    #[arg(long, default_value = "info", help = "Log level (trace, debug, info, warn, error)")]
+    log_level: String,
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Initialise structured logging.
+    let args = Args::parse();
+    let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("system_a=debug".parse()?)
-                .add_directive("common=debug".parse()?),
-        )
+        .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
 
     libsysa::paths::init();
@@ -35,9 +44,6 @@ async fn main() -> Result<()> {
 
     // Shared allocator state accessible from both the IPC server and D-Bus server.
     let allocator = state::Allocator::new();
-
-    // Load unit files from the default search paths.
-    unit::loader::load_default_units(allocator.clone()).await?;
 
     // Register in-process event-bus subscribers.
     {
@@ -53,16 +59,14 @@ async fn main() -> Result<()> {
     }
 
     // Start the IPC server (accepts System Worker & Finder connections).
+    // The Finder (System F) may connect at any time — each commit replaces
+    // the entire unit set.  There is no "first load" special case.
     let ipc_handle = tokio::spawn(ipc::server::run(allocator.clone()));
 
-    // Start the D-Bus server (exposes systemd1-compatible interface).
-    // If D-Bus is not available on this system (e.g., no `/run/dbus/system_bus_socket`),
-    // the server logs a warning and continues — IPC-based management still works.
-    tokio::spawn(async move {
-        if let Err(e) = dbus::run(allocator.clone()).await {
-            warn!("D-Bus server exited (non-fatal): {:?}", e);
-        }
-    });
+    // Start the D-Bus server with automatic reconnection.
+    // If the system D-Bus bus is not yet available (early boot, containers,
+    // or after a transient outage), it retries with exponential backoff.
+    tokio::spawn(dbus::run(allocator.clone()));
 
     // Wait for the IPC server (runs until killed).
     ipc_handle.await??;

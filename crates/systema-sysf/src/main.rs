@@ -1,19 +1,15 @@
 //! systema-sysf — System F (Finder)
 //!
-//! A oneshot binary that discovers systemd unit files, converts them to
-//! the unified [`UnitIR`] representation, sends them to System A for
-//! registration, then commits them into the active dependency graph.
+//! Discovers systemd unit files and interacts with System A's staging area.
 //!
-//! Expected flow:
-//! 1. Parse all unit files from the systemd search paths.
-//! 2. Connect to System A's IPC socket.
-//! 3. Send a `RegisterUnits` envelope with JSON-serialized units.
-//! 4. Send a `CommitUnits` envelope to trigger the graph rebuild.
-//! 5. Wait for `UnitRegistrationAck` and exit.
+//! Subcommands:
+//!   (default)  discover + RegisterUnits — stage units without committing
+//!   commit     CommitUnits — commit previously staged units into the active set
 
 use std::collections::HashMap;
 
 use anyhow::Result;
+use clap::Parser;
 use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use libsysa::proto::{CommitUnits, RegisterUnits, UnitRegistrationAck};
 use prost::Message;
@@ -21,20 +17,46 @@ use systema_sysf::ir::UnitIR;
 use systema_sysf::systemd::finder::SystemdFinder;
 use systema_sysf::FinderRegistry;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "systema-sysf", about = "System F — Finder")]
+struct Args {
+    #[arg(long, short = 'D', help = "Enable debug-level logging")]
+    debug: bool,
+
+    #[arg(long, default_value = "info", help = "Log level (trace, debug, info, warn, error)")]
+    log_level: String,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Commit previously staged units into the active set
+    Commit,
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+    let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("system_f=info".parse()?)
-                .add_directive("libsysa=info".parse()?),
-        )
+        .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
 
     libsysa::paths::init();
 
-    info!("System F (Finder) starting");
+    match args.command {
+        Some(Command::Commit) => run_commit().await,
+        None => run_register().await,
+    }
+}
+
+/// Discover all systemd units and stage them in System A.
+async fn run_register() -> Result<()> {
+    info!("System F (Finder) registering units");
 
     // ------------------------------------------------------------------
     // 1. Discover all units via the SystemdFinder.
@@ -45,7 +67,7 @@ async fn main() -> Result<()> {
     info!("Discovered {} units", units.len());
 
     // ------------------------------------------------------------------
-    // 2. Connect to System A.
+    // 2. Connect to System A and send RegisterUnits.
     // ------------------------------------------------------------------
     let socket_path = libsysa::paths::instance().ipc_socket_path;
     info!("Connecting to System A at {}", socket_path);
@@ -55,46 +77,66 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {}", e))?;
     let mut framed = frame_stream(stream);
 
-    // ------------------------------------------------------------------
-    // 3. Serialize units as JSON and send RegisterUnits.
-    // ------------------------------------------------------------------
     let json = serde_json::to_vec(&units)?;
-    let reg_msg = RegisterUnits {
-        units_json: json,
-    };
+    let reg_msg = RegisterUnits { units_json: json };
     let reg_env = make_envelope(1, "system-f", "system-a", "finder.register_units", reg_msg)?;
     send_envelope(&mut framed, &reg_env).await?;
     info!("Sent {} units to System A (staging)", units.len());
 
     // ------------------------------------------------------------------
-    // 4. Send CommitUnits.
-    // ------------------------------------------------------------------
-    let commit_msg = CommitUnits {};
-    let commit_env = make_envelope(2, "system-f", "system-a", "finder.commit_units", commit_msg)?;
-    send_envelope(&mut framed, &commit_env).await?;
-    info!("Sent commit request");
-
-    // ------------------------------------------------------------------
-    // 5. Wait for acknowledgment.
+    // 3. Wait for acknowledgment.
     // ------------------------------------------------------------------
     let ack_env = recv_envelope(&mut framed)
         .await?
         .ok_or_else(|| anyhow::anyhow!("System A disconnected before sending ack"))?;
 
     if ack_env.method != "finder.ack" {
-        anyhow::bail!(
-            "Expected 'finder.ack', got '{}'",
-            ack_env.method
-        );
+        anyhow::bail!("Expected 'finder.ack', got '{}'", ack_env.method);
     }
 
     let ack = UnitRegistrationAck::decode(ack_env.payload.as_slice())?;
     if ack.success {
-        info!("Registration successful: {} units committed", ack.unit_count);
+        info!("Staging successful: {} units registered", ack.unit_count);
     } else {
-        anyhow::bail!("Registration failed: {}", ack.message);
+        anyhow::bail!("Staging failed: {}", ack.message);
     }
 
-    info!("System F completed successfully");
+    info!("System F register complete");
+    Ok(())
+}
+
+/// Tell System A to commit the currently staged units into the active set.
+async fn run_commit() -> Result<()> {
+    info!("System F (Finder) committing staging");
+
+    let socket_path = libsysa::paths::instance().ipc_socket_path;
+    info!("Connecting to System A at {}", socket_path);
+
+    let stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {}", e))?;
+    let mut framed = frame_stream(stream);
+
+    let commit_msg = CommitUnits {};
+    let commit_env = make_envelope(1, "system-f", "system-a", "finder.commit_units", commit_msg)?;
+    send_envelope(&mut framed, &commit_env).await?;
+    info!("Sent commit request");
+
+    let ack_env = recv_envelope(&mut framed)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("System A disconnected before sending ack"))?;
+
+    if ack_env.method != "finder.ack" {
+        anyhow::bail!("Expected 'finder.ack', got '{}'", ack_env.method);
+    }
+
+    let ack = UnitRegistrationAck::decode(ack_env.payload.as_slice())?;
+    if ack.success {
+        info!("Commit successful: {} units committed", ack.unit_count);
+    } else {
+        anyhow::bail!("Commit failed: {}", ack.message);
+    }
+
+    info!("System F commit complete");
     Ok(())
 }

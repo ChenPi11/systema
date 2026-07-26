@@ -13,6 +13,8 @@ pub mod unit_obj;
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 use tracing::{info, warn};
@@ -134,9 +136,50 @@ pub(super) async fn register_unit_object(
     }
 }
 
-/// Run the D-Bus server.
-pub async fn run(allocator: AllocatorHandle) -> Result<()> {
+/// Try to connect to D-Bus and serve the systemd1-compatible interface.
+///
+/// Returns `Ok(())` only if the connection eventually drops (unlikely —
+/// we sit on `pending().await`).  Returns `Err` when the initial
+/// connection or bus-name acquisition fails.
+async fn try_run(allocator: AllocatorHandle) -> Result<()> {
     info!("Starting D-Bus server as '{}'", BUS_NAME);
+
+    // Safety check: verify no other process already owns our bus name.
+    // This prevents accidentally conflicting with a real systemd init.
+    //
+    // We use a throw-away connection so the check is independent of the
+    // name-claim that follows.
+    {
+        let probe = zbus::Connection::system()
+            .await
+            .map_err(|e| anyhow::anyhow!(
+                "D-Bus safety check failed (cannot connect to system bus): {}", e
+            ))?;
+        let has_owner: bool = probe
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "NameHasOwner",
+                &(BUS_NAME,),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(
+                "D-Bus safety check failed (NameHasOwner query): {}", e
+            ))?
+            .body()
+            .deserialize()
+            .map_err(|e| anyhow::anyhow!(
+                "D-Bus safety check failed (parse reply): {}", e
+            ))?;
+        if has_owner {
+            anyhow::bail!(
+                "D-Bus name '{}' is already owned by another process. \
+                 Refusing to run to avoid conflicting with an existing init system.",
+                BUS_NAME,
+            );
+        }
+    }
 
     // Shared connection cell: set after the connection is built so that
     // ManagerInterface methods can register unit objects synchronously.
@@ -278,4 +321,30 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     // Keep the connection alive indefinitely.
     futures::future::pending::<()>().await;
     Ok(())
+}
+
+/// Run the D-Bus server, retrying the initial connection with exponential
+/// backoff if the D-Bus system bus is not yet available.
+///
+/// This mirrors the reconnection pattern used by [`systema_syss::ipc::run`]
+/// and ensures System A does not crash when D-Bus starts later than
+/// the allocator itself (e.g. during early boot or in containers).
+pub async fn run(allocator: AllocatorHandle) -> Result<()> {
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        match try_run(allocator.clone()).await {
+            Ok(()) => {
+                info!("D-Bus server exited cleanly");
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    "D-Bus connection failed: {}; retrying in {:?}",
+                    e, backoff
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
 }

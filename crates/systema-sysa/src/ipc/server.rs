@@ -35,7 +35,7 @@ pub fn SOCKET_PATH() -> &'static str {
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
 pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
 
-/// Run the IPC server — accepts System Worker connections indefinitely.
+/// Run the IPC server — accepts System Worker & Finder connections indefinitely.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     // Ensure the socket directory exists.
     if let Some(parent) = std::path::Path::new(SOCKET_PATH()).parent() {
@@ -144,10 +144,11 @@ async fn handle_worker(
 
     match env.method.as_str() {
         "worker.register" => handle_worker_session(framed, env, allocator).await,
-        "finder.register_units" => handle_finder_session(framed, env, allocator).await,
+        "finder.register_units" => handle_finder_register(framed, env, allocator).await,
+        "finder.commit_units" => handle_finder_commit(framed, env, allocator).await,
         other => {
             anyhow::bail!(
-                "Expected 'worker.register' or 'finder.register_units', got '{}'",
+                "Expected 'worker.register', 'finder.register_units', or 'finder.commit_units', got '{}'",
                 other
             )
         }
@@ -341,23 +342,18 @@ async fn handle_worker_session(
     Ok(())
 }
 
-/// Handle a System F Finder connection.
+/// Handle a System F `RegisterUnits` request.
 ///
-/// Flow:
-/// 1. Receive `RegisterUnits` (JSON-serialized `HashMap<String, UnitIR>`)
-/// 2. Store in staging
-/// 3. Receive `CommitUnits`
-/// 4. Commit staging into the active unit set
-/// 5. Send `UnitRegistrationAck` back
-/// 6. Disconnect
-async fn handle_finder_session(
+/// Deserialises the JSON payload and places the units into the staging
+/// area.  The caller must issue a separate `CommitUnits` request to make
+/// them live.
+async fn handle_finder_register(
     mut framed: libsysa::ipc::EnvelopeFramed,
     env: Envelope,
     allocator: AllocatorHandle,
 ) -> Result<()> {
-    info!("Finder (System F) connected — registering units");
+    info!("Finder (System F) registering units into staging");
 
-    // --- Step 1: process RegisterUnits ---
     let reg_msg = RegisterUnits::decode(env.payload.as_slice())?;
     let json_bytes = reg_msg.units_json;
 
@@ -366,51 +362,51 @@ async fn handle_finder_session(
             .map_err(|e| anyhow::anyhow!("Failed to deserialize UnitIR JSON: {}", e))?;
 
     let unit_count = units.len();
-    info!("Finder registered {} units in staging area", unit_count);
-
     {
         let mut state = allocator.write();
         state.set_staging_units(units);
     }
+    info!("Finder staged {} units", unit_count);
 
-    // --- Step 2: wait for CommitUnits ---
-    let commit_env = recv_envelope(&mut framed)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Finder disconnected before CommitUnits"))?;
-
-    if commit_env.method != "finder.commit_units" {
-        anyhow::bail!(
-            "Expected 'finder.commit_units', got '{}'",
-            commit_env.method
-        );
-    }
-
-    // --- Step 3: commit staging into active unit set ---
-    {
-        let mut state = allocator.write();
-        state.commit_staging();
-    }
-    info!(
-        "Finder committed {} units into active set",
-        unit_count
-    );
-
-    // --- Step 4: send acknowledgment ---
     let ack = UnitRegistrationAck {
         success: true,
-        message: format!("{} units registered and committed", unit_count),
+        message: format!("{} units staged", unit_count),
         unit_count: unit_count as u32,
     };
-    let ack_env = make_envelope(
-        next_request_id(),
-        "system-a",
-        "system-f",
-        "finder.ack",
-        ack,
-    )?;
+    let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;
     send_envelope(&mut framed, &ack_env).await?;
 
-    info!("Finder session complete — disconnecting");
+    info!("Finder register session complete — disconnecting");
+    Ok(())
+}
+
+/// Handle a System F `CommitUnits` request.
+///
+/// Commits the currently staged units into the active unit set.
+async fn handle_finder_commit(
+    mut framed: libsysa::ipc::EnvelopeFramed,
+    _env: Envelope,
+    allocator: AllocatorHandle,
+) -> Result<()> {
+    info!("Finder (System F) committing staging into active set");
+
+    let unit_count = {
+        let mut state = allocator.write();
+        let count = state.staging_units.len();
+        state.commit_staging();
+        count
+    };
+    info!("Finder committed {} units into active set", unit_count);
+
+    let ack = UnitRegistrationAck {
+        success: true,
+        message: format!("{} units committed", unit_count),
+        unit_count: unit_count as u32,
+    };
+    let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;
+    send_envelope(&mut framed, &ack_env).await?;
+
+    info!("Finder commit session complete — disconnecting");
     Ok(())
 }
 

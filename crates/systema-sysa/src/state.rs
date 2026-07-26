@@ -13,6 +13,7 @@ use libsysa::event_bus::EventBus;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock as TokioRwLock;
+use tracing::{debug, info};
 
 use systema_sysf::ir::UnitIR;
 
@@ -341,6 +342,13 @@ impl AllocatorState {
     pub fn commit_staging(&mut self) {
         let staging = std::mem::take(&mut self.staging_units);
 
+        let mut names: Vec<&str> = staging.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        info!("commit_staging: loading {} units", names.len());
+        for name in &names {
+            info!("  loaded unit: {}", name);
+        }
+
         // Build the new unit map from UnitIR.
         let new_units: HashMap<String, UnitFile> =
             staging.values().map(|ir| unit_file_from_ir(ir)).collect();
@@ -356,7 +364,31 @@ impl AllocatorState {
 
     /// Replace the staging units (discards any prior staging set).
     pub fn set_staging_units(&mut self, units: HashMap<String, UnitIR>) {
-        self.staging_units = units;
+        let old = std::mem::replace(&mut self.staging_units, units);
+
+        let mut added: Vec<&str> = self.staging_units.keys()
+            .filter(|k| !old.contains_key(*k))
+            .map(String::as_str)
+            .collect();
+        added.sort_unstable();
+
+        let mut removed: Vec<&str> = old.keys()
+            .filter(|k| !self.staging_units.contains_key(*k))
+            .map(String::as_str)
+            .collect();
+        removed.sort_unstable();
+
+        if !added.is_empty() || !removed.is_empty() {
+            debug!("staging_units changed:");
+            if !added.is_empty() {
+                debug!("  added ({}) {}", added.len(), added.join(", "));
+            }
+            if !removed.is_empty() {
+                debug!("  removed ({}) {}", removed.len(), removed.join(", "));
+            }
+        } else {
+            debug!("staging_units replaced — {} units (no change in keys)", self.staging_units.len());
+        }
     }
 }
 
