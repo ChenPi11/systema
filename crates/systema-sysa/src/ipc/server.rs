@@ -28,7 +28,7 @@ use crate::state::{
 use libsysa::event_bus::{Event, EventTopic};
 
 pub const SOCKET_PATH: &str = libsysa::paths::IPC_SOCKET_PATH;
-pub const FD_PASS_SOCKET_PATH: &str = "/run/system-alphabet/fdpass.sock";
+pub const FD_PASS_SOCKET_PATH: &str = libsysa::paths::SYSTEMA_FDPASS_SOCK;
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
 pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;

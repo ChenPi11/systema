@@ -75,7 +75,7 @@ pub async fn start_service(
     let mut cmd = if parsed.flags.via_shell {
         // | prefix: route through sh -c
         let joined = build_shell_command_line(&parsed.program, &final_args);
-        let mut c = Command::new("/bin/sh");
+        let mut c = Command::new(libsysa::paths::SYSTEMA_SHELL_PATH);
         c.arg("-c");
         c.arg(&joined);
         c
@@ -531,7 +531,7 @@ fn expand_specifiers(s: &str, name: &str) -> String {
             .unwrap_or_default()
     };
     let machine_id = || {
-        std::fs::read_to_string("/etc/machine-id")
+        std::fs::read_to_string(libsysa::paths::SYSTEMD_MACHINE_ID_FILE)
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     };

@@ -14,7 +14,7 @@ use libsysa::proto::{
 use crate::socket::{self, SocketManager};
 
 const ALLOCATOR_SOCKET: &str = libsysa::paths::IPC_SOCKET_PATH;
-const FD_PASS_SOCKET_PATH: &str = "/run/system-alphabet/fdpass.sock";
+const FD_PASS_SOCKET_PATH: &str = libsysa::paths::SYSTEMA_FDPASS_SOCK;
 const WORKER_ID: &str = "system-k-1";
 const WORKER_UNIT_TYPES: &[&str] = &["socket"];
 
