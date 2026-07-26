@@ -23,6 +23,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    libsysa::paths::init();
+
     info!("System S (System Service) starting up");
 
     ipc::run().await?;

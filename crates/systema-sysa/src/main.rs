@@ -29,6 +29,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    libsysa::paths::init();
+
     info!("System A (System Allocator) starting up");
 
     // Shared allocator state accessible from both the IPC server and D-Bus server.

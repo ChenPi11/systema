@@ -414,7 +414,7 @@ async fn spawn_child_with_fd(unit_name: &str, fd: RawFd) -> Result<()> {
     // service unit's ExecStart.  Here we use a placeholder — the convention
     // is that the child reads from / writes to fd 3.
     let service_path = std::env::var("SYSTEMK_SERVICE_PATH")
-        .unwrap_or_else(|_| libsysa::paths::SYSTEMA_SOCKET_HANDLER_PATH.to_string());
+        .unwrap_or_else(|_| libsysa::paths::instance().systema_socket_handler_path.to_string());
 
     // Extract the raw fd value before the async move so the closure owns it.
     let raw_fd = fd;

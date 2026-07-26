@@ -416,12 +416,12 @@ pub fn expand_specifiers(s: &str, name: &str) -> String {
             })
     };
     let machine_id = || {
-        std::fs::read_to_string(libsysa::paths::SYSTEMD_MACHINE_ID_FILE)
+        std::fs::read_to_string(libsysa::paths::instance().systemd_machine_id_file)
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|e| {
                 tracing::debug!(
                     "expand_specifiers: failed to read {} for %m: {e}",
-                    libsysa::paths::SYSTEMD_MACHINE_ID_FILE
+libsysa::paths::instance().systemd_machine_id_file
                 );
                 String::new()
             })

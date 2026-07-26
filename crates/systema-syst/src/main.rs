@@ -22,6 +22,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    libsysa::paths::init();
+
     info!("System T (System Target) starting up");
 
     ipc::run().await?;

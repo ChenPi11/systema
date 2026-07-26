@@ -131,7 +131,7 @@ impl UnitObject {
 
     #[zbus(property)]
     fn fragment_path(&self) -> String {
-        for dir in libsysa::paths::UNIT_SEARCH_PATHS {
+        for dir in libsysa::paths::instance().unit_search_paths.iter() {
             let path = std::path::Path::new(dir).join(&self.unit_name);
             if path.exists() {
                 return path.to_string_lossy().into_owned();

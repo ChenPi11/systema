@@ -14,6 +14,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    libsysa::paths::init();
+
     info!("System K (Socket Worker) starting up");
 
     ipc::run().await?;

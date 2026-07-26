@@ -1377,7 +1377,7 @@ fn is_on_ac_power() -> bool {
 /// Returns `true` if this appears to be the first boot of the system.
 /// Heuristic: `/run/systemd/first-boot` or `/run/machine-id` does not exist.
 fn is_first_boot() -> bool {
-    std::path::Path::new(libsysa::paths::SYSTEMD_FIRST_BOOT_FILE).exists()
+    std::path::Path::new(libsysa::paths::instance().systemd_first_boot_file).exists()
 }
 
 #[cfg(test)]

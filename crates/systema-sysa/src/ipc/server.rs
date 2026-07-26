@@ -27,8 +27,9 @@ use crate::state::{
 };
 use libsysa::event_bus::{Event, EventTopic};
 
-pub const SOCKET_PATH: &str = libsysa::paths::IPC_SOCKET_PATH;
-pub const FD_PASS_SOCKET_PATH: &str = libsysa::paths::SYSTEMA_FDPASS_SOCK;
+pub fn SOCKET_PATH() -> &'static str {
+    libsysa::paths::instance().ipc_socket_path
+}
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
 pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
@@ -36,33 +37,33 @@ pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
 /// Run the IPC server — accepts System Worker connections indefinitely.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     // Ensure the socket directory exists.
-    if let Some(parent) = std::path::Path::new(SOCKET_PATH).parent() {
+    if let Some(parent) = std::path::Path::new(SOCKET_PATH()).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    if let Some(parent) = std::path::Path::new(FD_PASS_SOCKET_PATH).parent() {
+    if let Some(parent) = std::path::Path::new(libsysa::paths::instance().systema_fdpass_sock).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
     // Check if another allocator is already listening on the socket.
     // We try connecting first — if it succeeds, a live allocator is already
     // running and we should exit gracefully to avoid stealing its socket.
-    if let Ok(_) = tokio::net::UnixStream::connect(SOCKET_PATH).await {
+    if let Ok(_) = tokio::net::UnixStream::connect(SOCKET_PATH()).await {
         warn!(
             "Another allocator is already listening on {}. Exiting.",
-            SOCKET_PATH
+            SOCKET_PATH()
         );
         return Ok(());
     }
 
     // Remove stale socket files.
-    let _ = tokio::fs::remove_file(SOCKET_PATH).await;
-    let _ = tokio::fs::remove_file(FD_PASS_SOCKET_PATH).await;
+    let _ = tokio::fs::remove_file(SOCKET_PATH()).await;
+    let _ = tokio::fs::remove_file(libsysa::paths::instance().systema_fdpass_sock).await;
 
-    let listener = UnixListener::bind(SOCKET_PATH)?;
-    info!("IPC server listening on {}", SOCKET_PATH);
+    let listener = UnixListener::bind(SOCKET_PATH())?;
+    info!("IPC server listening on {}", SOCKET_PATH());
 
-    let fdpass_listener = UnixListener::bind(FD_PASS_SOCKET_PATH)?;
-    info!("FD-Pass server listening on {}", FD_PASS_SOCKET_PATH);
+    let fdpass_listener = UnixListener::bind(libsysa::paths::instance().systema_fdpass_sock)?;
+    info!("FD-Pass server listening on {}", libsysa::paths::instance().systema_fdpass_sock);
 
     let fdpass_map: FdPassMap = Arc::new(Mutex::new(HashMap::new()));
 

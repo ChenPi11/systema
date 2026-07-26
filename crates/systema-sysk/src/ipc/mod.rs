@@ -13,8 +13,6 @@ use libsysa::proto::{
 
 use crate::socket::{self, SocketManager};
 
-const ALLOCATOR_SOCKET: &str = libsysa::paths::IPC_SOCKET_PATH;
-const FD_PASS_SOCKET_PATH: &str = libsysa::paths::SYSTEMA_FDPASS_SOCK;
 const WORKER_ID: &str = "system-k-1";
 const WORKER_UNIT_TYPES: &[&str] = &["socket"];
 
@@ -46,16 +44,16 @@ pub async fn run() -> Result<()> {
 }
 
 async fn try_run(socket_manager: SocketManager) -> Result<()> {
-    info!("Connecting to System A at {}", ALLOCATOR_SOCKET);
+    info!("Connecting to System A at {}", libsysa::paths::instance().ipc_socket_path);
 
-    let stream = tokio::net::UnixStream::connect(ALLOCATOR_SOCKET)
+    let stream = tokio::net::UnixStream::connect(libsysa::paths::instance().ipc_socket_path)
         .await
-        .with_context(|| format!("Cannot connect to {}", ALLOCATOR_SOCKET))?;
+        .with_context(|| format!("Cannot connect to {}", libsysa::paths::instance().ipc_socket_path))?;
 
     info!("Connected to System A");
 
     // --- Connect to fd-pass channel ---
-    let fdpass_stream = match tokio::net::UnixStream::connect(FD_PASS_SOCKET_PATH).await {
+    let fdpass_stream = match tokio::net::UnixStream::connect(libsysa::paths::instance().systema_fdpass_sock).await {
         Ok(s) => {
             // Identify ourselves by sending worker_id via raw write.
             use tokio::io::AsyncWriteExt;
@@ -67,7 +65,7 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
             Some(s_ref)
         }
         Err(e) => {
-            warn!("Cannot connect to fdpass socket ({}): {}", FD_PASS_SOCKET_PATH, e);
+            warn!("Cannot connect to fdpass socket ({}): {}", libsysa::paths::instance().systema_fdpass_sock, e);
             None
         }
     };

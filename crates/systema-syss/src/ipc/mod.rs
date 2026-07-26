@@ -31,7 +31,6 @@ use crate::state::{new_registry, ServiceRegistry, ServiceState};
 
 
 
-const ALLOCATOR_SOCKET: &str = libsysa::paths::IPC_SOCKET_PATH;
 const WORKER_ID: &str = "system-s-1";
 const WORKER_UNIT_TYPES: &[&str] = &["service"];
 
@@ -95,11 +94,11 @@ pub async fn run() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn try_run(registry: ServiceRegistry) -> Result<()> {
-    info!("Connecting to System A at {}", ALLOCATOR_SOCKET);
+    info!("Connecting to System A at {}", libsysa::paths::instance().ipc_socket_path);
 
-    let stream = tokio::net::UnixStream::connect(ALLOCATOR_SOCKET)
+    let stream = tokio::net::UnixStream::connect(libsysa::paths::instance().ipc_socket_path)
         .await
-        .with_context(|| format!("Cannot connect to {}", ALLOCATOR_SOCKET))?;
+        .with_context(|| format!("Cannot connect to {}", libsysa::paths::instance().ipc_socket_path))?;
 
     info!("Connected to System A");
 

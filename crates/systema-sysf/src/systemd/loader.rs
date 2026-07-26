@@ -5,8 +5,6 @@ use tracing::{debug, info, warn};
 
 use super::parser::parse_unit_from_path;
 use super::types::UnitFile;
-use libsysa::paths::UNIT_SEARCH_PATHS;
-
 pub fn is_known_extension(name: &str) -> bool {
     matches!(
         name.rsplit('.').next().unwrap_or(""),
@@ -18,7 +16,7 @@ pub fn is_known_extension(name: &str) -> bool {
 /// Discover and parse all systemd unit files from standard search paths.
 pub fn discover_all() -> Result<Vec<UnitFile>> {
     let mut units = Vec::new();
-    for dir in UNIT_SEARCH_PATHS {
+    for dir in libsysa::paths::instance().unit_search_paths.iter() {
         let path = Path::new(dir);
         if path.exists() {
             load_units_from_dir_recursive(path, &mut units)
@@ -31,7 +29,7 @@ pub fn discover_all() -> Result<Vec<UnitFile>> {
 
 /// Find and parse a single named unit file from standard search paths.
 pub fn discover_one(name: &str) -> Result<Option<UnitFile>> {
-    for dir in UNIT_SEARCH_PATHS {
+    for dir in libsysa::paths::instance().unit_search_paths.iter() {
         let path = Path::new(dir).join(name);
         if path.exists() {
             match parse_unit_from_path(&path) {
