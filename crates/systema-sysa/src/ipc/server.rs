@@ -17,7 +17,8 @@ use tracing::{debug, error, info, warn};
 
 use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use libsysa::proto::{
-    Envelope, EventPublish, RegisterAck, StateSyncReport, TaskResult, WorkerRegistration,
+    Envelope, EventPublish, RegisterAck, RegisterUnits, StateSyncReport, TaskResult,
+    UnitRegistrationAck, WorkerRegistration,
 };
 
 use crate::scheduler::{self, build_task_dispatch};
@@ -128,7 +129,7 @@ async fn run_fdpass_acceptor(
     }
 }
 
-/// Handle a single worker connection from registration through task dispatch.
+/// Handle a single connection — either a System Worker or System F Finder.
 async fn handle_worker(
     stream: tokio::net::UnixStream,
     allocator: AllocatorHandle,
@@ -136,15 +137,29 @@ async fn handle_worker(
 ) -> Result<()> {
     let mut framed = frame_stream(stream);
 
-    // --- Step 1: receive WorkerRegistration ---
+    // Read the first envelope to determine the connection type.
     let env = recv_envelope(&mut framed)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("Worker disconnected before registration"))?;
+        .ok_or_else(|| anyhow::anyhow!("Client disconnected before registration"))?;
 
-    if env.method != "worker.register" {
-        anyhow::bail!("Expected 'worker.register', got '{}'", env.method);
+    match env.method.as_str() {
+        "worker.register" => handle_worker_session(framed, env, allocator).await,
+        "finder.register_units" => handle_finder_session(framed, env, allocator).await,
+        other => {
+            anyhow::bail!(
+                "Expected 'worker.register' or 'finder.register_units', got '{}'",
+                other
+            )
+        }
     }
+}
 
+/// Handle a System Worker connection (existing flow).
+async fn handle_worker_session(
+    mut framed: libsysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+) -> Result<()> {
     let reg = WorkerRegistration::decode(env.payload.as_slice())?;
     let worker_id = reg.worker_id.clone();
     let unit_types = reg.unit_types.clone();
@@ -323,6 +338,79 @@ async fn handle_worker(
     }
     info!("Worker '{}' deregistered", worker_id);
 
+    Ok(())
+}
+
+/// Handle a System F Finder connection.
+///
+/// Flow:
+/// 1. Receive `RegisterUnits` (JSON-serialized `HashMap<String, UnitIR>`)
+/// 2. Store in staging
+/// 3. Receive `CommitUnits`
+/// 4. Commit staging into the active unit set
+/// 5. Send `UnitRegistrationAck` back
+/// 6. Disconnect
+async fn handle_finder_session(
+    mut framed: libsysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+) -> Result<()> {
+    info!("Finder (System F) connected — registering units");
+
+    // --- Step 1: process RegisterUnits ---
+    let reg_msg = RegisterUnits::decode(env.payload.as_slice())?;
+    let json_bytes = reg_msg.units_json;
+
+    let units: std::collections::HashMap<String, systema_sysf::ir::UnitIR> =
+        serde_json::from_slice(&json_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize UnitIR JSON: {}", e))?;
+
+    let unit_count = units.len();
+    info!("Finder registered {} units in staging area", unit_count);
+
+    {
+        let mut state = allocator.write();
+        state.set_staging_units(units);
+    }
+
+    // --- Step 2: wait for CommitUnits ---
+    let commit_env = recv_envelope(&mut framed)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Finder disconnected before CommitUnits"))?;
+
+    if commit_env.method != "finder.commit_units" {
+        anyhow::bail!(
+            "Expected 'finder.commit_units', got '{}'",
+            commit_env.method
+        );
+    }
+
+    // --- Step 3: commit staging into active unit set ---
+    {
+        let mut state = allocator.write();
+        state.commit_staging();
+    }
+    info!(
+        "Finder committed {} units into active set",
+        unit_count
+    );
+
+    // --- Step 4: send acknowledgment ---
+    let ack = UnitRegistrationAck {
+        success: true,
+        message: format!("{} units registered and committed", unit_count),
+        unit_count: unit_count as u32,
+    };
+    let ack_env = make_envelope(
+        next_request_id(),
+        "system-a",
+        "system-f",
+        "finder.ack",
+        ack,
+    )?;
+    send_envelope(&mut framed, &ack_env).await?;
+
+    info!("Finder session complete — disconnecting");
     Ok(())
 }
 

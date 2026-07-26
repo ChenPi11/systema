@@ -4,13 +4,20 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "systema-sysf"
+path = "src/main.rs"
+
 [dependencies]
 libsysa = { path = "../libsysa" }
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+prost.workspace = true
 configparser.workspace = true
 async-trait.workspace = true
 

@@ -12,6 +12,7 @@ use petgraph::visit::EdgeRef;
 use tracing::{debug, warn};
 
 use crate::unit::types::UnitFile;
+use systema_sysf::ir::UnitIR;
 
 /// Edge weight indicating how strong the ordering dependency is.
 /// Used for cycle-breaking: weak edges (Wants, After) are removed first.
@@ -103,6 +104,72 @@ impl DependencyGraph {
             // `Requires=` and `Wants=` are dependency declarations but don't
             // imply ordering by themselves (ordering is via After/Before).
             // However, if combined with After, the edge is already present.
+        }
+
+        DependencyGraph { graph, index }
+    }
+
+    /// Build a dependency graph from a slice of [`UnitIR`] values.
+    ///
+    /// Unlike [`build`](Self::build) which takes `UnitFile` references, this
+    /// method works with the Finder-layer IR.  It is used when committing
+    /// discovered units from System F.
+    pub fn build_from_ir(units: &[UnitIR]) -> Self {
+        let mut graph = DiGraph::new();
+        let mut index: HashMap<String, NodeIndex> = HashMap::new();
+
+        // First pass: add all units as nodes.
+        for unit in units {
+            let node = graph.add_node(unit.id.clone());
+            index.insert(unit.id.clone(), node);
+        }
+
+        let get_or_create_node = |graph: &mut DiGraph<String, EdgeKind>,
+                                  index: &mut HashMap<String, NodeIndex>,
+                                  name: &str|
+         -> NodeIndex {
+            if let Some(&n) = index.get(name) {
+                n
+            } else {
+                let n = graph.add_node(name.to_string());
+                index.insert(name.to_string(), n);
+                n
+            }
+        };
+
+        // Second pass: add dependency edges from UnitIR.dependencies.
+        for unit in units {
+            let Some(&unit_node) = index.get(&unit.id) else {
+                continue;
+            };
+
+            for dep in &unit.dependencies.after {
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(dep_node, unit_node) {
+                    graph.add_edge(dep_node, unit_node, EdgeKind::Weak);
+                }
+            }
+
+            for dep in &unit.dependencies.before {
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(unit_node, dep_node) {
+                    graph.add_edge(unit_node, dep_node, EdgeKind::Weak);
+                }
+            }
+
+            for dep in &unit.dependencies.requisite {
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(dep_node, unit_node) {
+                    graph.add_edge(dep_node, unit_node, EdgeKind::Strong);
+                }
+            }
+
+            for dep in &unit.dependencies.binds_to {
+                let dep_node = get_or_create_node(&mut graph, &mut index, dep);
+                if !graph.contains_edge(dep_node, unit_node) {
+                    graph.add_edge(dep_node, unit_node, EdgeKind::Strong);
+                }
+            }
         }
 
         DependencyGraph { graph, index }

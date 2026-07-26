@@ -16,7 +16,7 @@ mod state;
 mod unit;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -52,21 +52,20 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Start the IPC server (accepts System Worker connections).
+    // Start the IPC server (accepts System Worker & Finder connections).
     let ipc_handle = tokio::spawn(ipc::server::run(allocator.clone()));
 
     // Start the D-Bus server (exposes systemd1-compatible interface).
-    let dbus_handle = tokio::spawn(dbus::run(allocator.clone()));
+    // If D-Bus is not available on this system (e.g., no `/run/dbus/system_bus_socket`),
+    // the server logs a warning and continues — IPC-based management still works.
+    tokio::spawn(async move {
+        if let Err(e) = dbus::run(allocator.clone()).await {
+            warn!("D-Bus server exited (non-fatal): {:?}", e);
+        }
+    });
 
-    // Wait for either task to exit (they run indefinitely).
-    tokio::select! {
-        res = ipc_handle => {
-            res??;
-        }
-        res = dbus_handle => {
-            res??;
-        }
-    }
+    // Wait for the IPC server (runs until killed).
+    ipc_handle.await??;
 
     Ok(())
 }
