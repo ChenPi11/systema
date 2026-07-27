@@ -418,7 +418,7 @@ async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<
                 "IPC task.result: task_id={} unit={} success={} message={:?}",
                 result.task_id, result.unit_name, result.success, result.message
             );
-            let kind = parse_task_kind_from_context(&allocator, result.task_id);
+            let kind = parse_task_kind_from_context(&allocator, result.task_id, &result.unit_name);
             scheduler::handle_task_result(
                 allocator,
                 result.task_id,
@@ -455,13 +455,35 @@ async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<
 }
 
 /// Look up what kind of task a task_id corresponds to using the tracked mapping.
-fn parse_task_kind_from_context(allocator: &AllocatorHandle, task_id: u64) -> JobKind {
-    allocator
-        .read()
-        .task_kinds
-        .get(&task_id)
-        .copied()
-        .unwrap_or(JobKind::Start)
+///
+/// Falls back to scanning running jobs for the given unit, then to `JobKind::Start`
+/// only as a last resort (with a warning).
+fn parse_task_kind_from_context(
+    allocator: &AllocatorHandle,
+    task_id: u64,
+    unit_name: &str,
+) -> JobKind {
+    let state = allocator.read();
+    if let Some(kind) = state.task_kinds.get(&task_id).copied() {
+        return kind;
+    }
+    // Recovery: find the running job for this unit.
+    if let Some(job) = state
+        .jobs
+        .values()
+        .find(|j| j.unit_name == unit_name && matches!(j.status, JobStatus::Running))
+    {
+        warn!(
+            "task_kind mapping missing for task_id={}, unit={}, recovered from job",
+            task_id, unit_name
+        );
+        return job.kind;
+    }
+    warn!(
+        "task_kind mapping missing for task_id={}, unit={}, no recovery possible",
+        task_id, unit_name
+    );
+    JobKind::Start
 }
 
 /// Process a `StateSyncReport` from a (re-)connecting worker and update
@@ -476,6 +498,30 @@ async fn handle_state_sync_report(
 ) -> Result<()> {
     let mut state = allocator.write();
     for unit in &report.units {
+        // Don't overwrite runtime state for units that have in-flight jobs
+        // or are in transitional states — the scheduler is actively managing them.
+        let has_running_job = state.jobs.values().any(|j| {
+            j.unit_name == unit.unit_name
+                && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+        });
+        let is_transitioning = state
+            .runtime
+            .get(&unit.unit_name)
+            .map(|rt| {
+                matches!(
+                    rt.active_state,
+                    ActiveState::Activating | ActiveState::Deactivating
+                )
+            })
+            .unwrap_or(false);
+        if has_running_job || is_transitioning {
+            debug!(
+                "Skipping sync_report for {} (in-flight job or transitional state)",
+                unit.unit_name
+            );
+            continue;
+        }
+
         let rt = state.runtime.entry(unit.unit_name.clone()).or_default();
         rt.main_pid = if unit.main_pid > 0 { Some(unit.main_pid) } else { None };
         rt.load_state = "loaded".to_string();

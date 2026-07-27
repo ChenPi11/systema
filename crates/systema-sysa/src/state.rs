@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::task::AbortHandle;
 
 use libsysa::event_bus::EventBus;
 use parking_lot::RwLock;
@@ -123,6 +124,8 @@ pub struct Job {
     pub status: JobStatus,
     /// One-shot channel used to notify D-Bus callers when the job completes.
     pub completion_tx: Option<tokio::sync::oneshot::Sender<JobResult>>,
+    /// Handle to abort the job's timeout task when the job completes normally.
+    pub timeout_abort: Option<AbortHandle>,
 }
 
 /// The result of a job, sent back to the D-Bus caller.
@@ -360,6 +363,13 @@ impl AllocatorState {
         self.desired.retain(|name, _| new_units.contains_key(name));
 
         self.units = new_units;
+
+        // Notify the D-Bus layer so UnitObject interfaces get registered.
+        if let Some(ref tx) = self.unit_loaded_tx {
+            for name in self.units.keys() {
+                let _ = tx.send(name.clone());
+            }
+        }
     }
 
     /// Replace the staging units (discards any prior staging set).
@@ -559,13 +569,54 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_job_id() -> u64 {
-    NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+    loop {
+        let current = NEXT_JOB_ID.load(Ordering::Relaxed);
+        let next = current.wrapping_add(1);
+        if next == 0 {
+            // Wrap from u64::MAX to 1 (skip 0).  On CAS failure another thread
+            // already advanced past MAX; just retry.
+            let _ = NEXT_JOB_ID.compare_exchange_weak(current, 1, Ordering::Relaxed, Ordering::Relaxed);
+            continue;
+        }
+        if NEXT_JOB_ID
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return current;
+        }
+    }
 }
 
 pub fn next_task_id() -> u64 {
-    NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed)
+    loop {
+        let current = NEXT_TASK_ID.load(Ordering::Relaxed);
+        let next = current.wrapping_add(1);
+        if next == 0 {
+            let _ = NEXT_TASK_ID.compare_exchange_weak(current, 1, Ordering::Relaxed, Ordering::Relaxed);
+            continue;
+        }
+        if NEXT_TASK_ID
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return current;
+        }
+    }
 }
 
 pub fn next_request_id() -> u64 {
-    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    loop {
+        let current = NEXT_REQUEST_ID.load(Ordering::Relaxed);
+        let next = current.wrapping_add(1);
+        if next == 0 {
+            let _ = NEXT_REQUEST_ID.compare_exchange_weak(current, 1, Ordering::Relaxed, Ordering::Relaxed);
+            continue;
+        }
+        if NEXT_REQUEST_ID
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return current;
+        }
+    }
 }

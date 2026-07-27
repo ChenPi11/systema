@@ -10,14 +10,15 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use libsysa::l10n;
 use prost::Message;
-use tracing::{debug, info, warn, error};
+use tokio::task::AbortHandle;
+use tracing::{debug, info, warn};
 
 use crate::state::{
     next_job_id, next_task_id, ActiveState, AllocatorHandle, AllocatorState, Job, JobCompletion,
     JobKind, JobMode, JobNewInfo, JobResult, JobResultKind, JobStatus, StartLimitState,
     UnitRuntimeInfo, WorkerTask,
 };
-use crate::unit::types::{ExitKind, RestartPolicy, UnitFile, UnitSection};
+use crate::unit::types::{ExitKind, RestartPolicy, StartLimitAction, UnitFile, UnitSection};
 use libsysa::proto::{ServiceConfig, SocketAddress, SocketConfig, TaskDispatch, TaskKind, UnitConfig};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
@@ -311,6 +312,23 @@ pub async fn enqueue_job(
 
     debug!("Processing order: {:?}", units_to_process);
 
+    // Before dispatching any dependencies, re-check that the root doesn't
+    // already have a running job (handles races after the conflict detection above).
+    {
+        let state = allocator.read();
+        if let Some(existing) = state.jobs.values().find(|j| {
+            j.unit_name == unit_name
+                && j.kind == kind
+                && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+        }) {
+            debug!(
+                "Root unit {} already has a {:?} job (id={}) — returning existing ID",
+                unit_name, kind, existing.id
+            );
+            return Ok(existing.id);
+        }
+    }
+
     let primary_job_id = next_job_id();
     let serial_mode = mode == JobMode::Replace;
 
@@ -489,6 +507,7 @@ pub async fn enqueue_job(
                     kind,
                     status: JobStatus::Running,
                     completion_tx: None,
+                    timeout_abort: None,
                 },
             );
             state.task_kinds.insert(task_id, kind);
@@ -500,68 +519,13 @@ pub async fn enqueue_job(
         // Emit JobNew signal for this job.
         emit_job_new_after_lock(allocator.clone(), job_id, name, kind);
 
-        // --- Start timeout monitoring ---
-        if matches!(kind, JobKind::Start | JobKind::Restart) {
-            let timeout_secs = unit_file
-                .as_ref()
-                .and_then(|u| u.service.as_ref())
-                .map(|s| s.timeout_start_sec)
-                .filter(|&t| t > 0)
-                .unwrap_or(0);
-            if timeout_secs > 0 {
-                let alloc = allocator.clone();
-                let name_clone = name.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(timeout_secs as u64)).await;
-                    let mut state = alloc.write();
-                    if let Some(job) = state.jobs.get_mut(&job_id) {
-                        if matches!(job.status, JobStatus::Running) {
-                            job.status = JobStatus::Failed("TimeoutStartSec exceeded".to_string());
-                            let rt = state.runtime.entry(name_clone.clone()).or_default();
-                            rt.active_state = ActiveState::Failed;
-                            rt.sub_state = "failed".to_string();
-                            if let Some(ref tx) = state.job_completion_tx {
-                                let _ = tx.send(JobCompletion {
-                                    job_id,
-                                    unit_name: name_clone,
-                                    result: JobResultKind::Timeout,
-                                });
-                            }
-                        }
-                    }
-                });
+        // --- Timeout monitoring ---
+        let abort_handle = spawn_job_timeout(allocator.clone(), job_id, name, kind, &unit_file);
+        if let Some(handle) = abort_handle {
+            let mut state = allocator.write();
+            if let Some(job) = state.jobs.get_mut(&job_id) {
+                job.timeout_abort = Some(handle);
             }
-        }
-
-        // --- Job running timeout monitoring ---
-        if matches!(kind, JobKind::Start) {
-            let timeout_secs = unit_file
-                .as_ref()
-                .and_then(|u| u.service.as_ref())
-                .map(|s| s.timeout_start_sec)
-                .filter(|&t| t > 0)
-                .unwrap_or(90);
-            let alloc = allocator.clone();
-            let name_clone = name.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(timeout_secs as u64 * 2)).await;
-                let mut state = alloc.write();
-                if let Some(job) = state.jobs.get_mut(&job_id) {
-                    if matches!(job.status, JobStatus::Running) {
-                        job.status = JobStatus::Failed("JobRunningTimeout exceeded".to_string());
-                        let rt = state.runtime.entry(name_clone.clone()).or_default();
-                        rt.active_state = ActiveState::Failed;
-                        rt.sub_state = "failed".to_string();
-                        if let Some(ref tx) = state.job_completion_tx {
-                            let _ = tx.send(JobCompletion {
-                                job_id,
-                                unit_name: name_clone,
-                                result: JobResultKind::Timeout,
-                            });
-                        }
-                    }
-                }
-            });
         }
 
         let task = WorkerTask {
@@ -760,7 +724,7 @@ fn compute_start_order(
         }
     }
 
-    // Simple DFS-based topological sort respecting After ordering.
+    // DFS-based topological sort respecting After and Before ordering.
     fn visit(
         name: &str,
         units: &std::collections::HashMap<String, UnitFile>,
@@ -771,25 +735,30 @@ fn compute_start_order(
             return;
         }
         visited.insert(name.to_string());
-        // Visit After-dependencies first.
+        // Visit After-dependencies first (they must start before us).
         if let Some(unit) = units.get(name) {
-            let afters: Vec<String> = unit.unit.after.iter().cloned().collect();
-            for dep in afters {
-                visit(&dep, units, visited, result);
+            for dep in &unit.unit.after {
+                visit(dep, units, visited, result);
             }
         }
         result.push(name.to_string());
+        // Visit Before-targets after us (we must start before them).
+        if let Some(unit) = units.get(name) {
+            for dep in &unit.unit.before {
+                visit(dep, units, visited, result);
+            }
+        }
     }
 
     for name in &reachable {
         visit(name, units, &mut visited, &mut result);
     }
 
-    // Ensure the root unit appears last.
-    if let Some(pos) = result.iter().position(|n| n == root) {
-        let last = result.len() - 1;
-        result.swap(pos, last);
-    }
+    // Ensure the root unit appears exactly once, at the end.
+    // The swap-based approach is incorrect when root appears multiple times
+    // due to DFS traversal through After=/Before= edges.
+    result.retain(|n| n != root);
+    result.push(root.to_string());
 
     result
 }
@@ -829,6 +798,10 @@ pub fn handle_task_result(
             } else {
                 "running".to_string()
             };
+            // Reset rate-limit state on successful start.
+            if matches!(kind, JobKind::Start | JobKind::Restart) {
+                state.start_limit_state.remove(unit_name);
+            }
         } else {
             rt.active_state = ActiveState::Failed;
             rt.sub_state = "failed".to_string();
@@ -847,19 +820,23 @@ pub fn handle_task_result(
             } else {
                 JobResultKind::Failed
             };
-            let result = JobResult {
+            let comp_result = JobResult {
                 job_id: jid,
                 unit_name: unit_name.to_string(),
                 result: result_kind.clone(),
             };
             if let Some(job) = state.jobs.get_mut(&jid) {
+                // Cancel the timeout so it doesn't race with this completion.
+                if let Some(abort) = job.timeout_abort.take() {
+                    abort.abort();
+                }
                 job.status = if success {
                     JobStatus::Done
                 } else {
                     JobStatus::Failed(message.to_string())
                 };
                 if let Some(tx) = job.completion_tx.take() {
-                    let _ = tx.send(result);
+                    let _ = tx.send(comp_result);
                 }
             }
             if let Some(ref tx) = state.job_completion_tx {
@@ -913,6 +890,48 @@ pub fn handle_task_result(
             }
         }
 
+        // --- BindsTo= start propagation ---
+        if success && matches!(kind, JobKind::Start | JobKind::Restart) {
+            for (other_name, other_unit) in &state.units {
+                if other_unit.unit.binds_to.contains(unit_name) {
+                    let is_inactive = state
+                        .runtime
+                        .get(other_name.as_str())
+                        .map(|rt| {
+                            matches!(
+                                rt.active_state,
+                                ActiveState::Inactive | ActiveState::Failed
+                            )
+                        })
+                        .unwrap_or(true);
+                    if is_inactive {
+                        post_actions.push(PostAction::Start(other_name.clone()));
+                    }
+                }
+            }
+        }
+
+        // --- PartOf= start propagation ---
+        if success && matches!(kind, JobKind::Start | JobKind::Restart) {
+            for (other_name, other_unit) in &state.units {
+                if other_unit.unit.part_of.contains(unit_name) {
+                    let is_inactive = state
+                        .runtime
+                        .get(other_name.as_str())
+                        .map(|rt| {
+                            matches!(
+                                rt.active_state,
+                                ActiveState::Inactive | ActiveState::Failed
+                            )
+                        })
+                        .unwrap_or(true);
+                    if is_inactive {
+                        post_actions.push(PostAction::Start(other_name.clone()));
+                    }
+                }
+            }
+        }
+
         // --- OnSuccess= / OnFailure= triggers ---
         if let Some(unit) = state.units.get(unit_name) {
             if success && matches!(kind, JobKind::Start | JobKind::Restart) {
@@ -951,11 +970,21 @@ pub fn handle_task_result(
 
         // --- Restart policy: determine exit kind and check if restart needed ---
         let restart_info_inner: Option<(RestartPolicy, ExitKind)> =
-            if !success && matches!(kind, JobKind::Start) {
+            if !success && matches!(kind, JobKind::Start | JobKind::Restart) {
                 let exit_kind = if message.contains("Timeout") {
                     ExitKind::Timeout
-                } else if message.contains("exit code") {
-                    ExitKind::ExitCode(-1)
+                } else if message.contains("Watchdog") || message.contains("watchdog") {
+                    ExitKind::Watchdog
+                } else if message.contains("Signal") || message.contains("signal") {
+                    ExitKind::Signal(-1)
+                } else if let Some(code_str) = message.to_lowercase().split("exit code").nth(1) {
+                    let code = code_str
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(1);
+                    ExitKind::ExitCode(code)
                 } else {
                     // Generic task failure — treat as non-zero exit.
                     ExitKind::ExitCode(1)
@@ -1110,6 +1139,122 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Job timeout helpers
+// ---------------------------------------------------------------------------
+
+/// Spawn a timeout task for a job, returning an `AbortHandle` that can be used
+/// to cancel the timeout if the job completes normally.
+///
+/// Start/Restart jobs use `TimeoutStartSec` (start timeout) plus a longer
+/// job-running watchdog.  Stop jobs use `TimeoutStopSec`.  Reload jobs use a
+/// default 60 s timeout.
+fn spawn_job_timeout(
+    allocator: AllocatorHandle,
+    job_id: u64,
+    name: &str,
+    kind: JobKind,
+    unit_file: &Option<UnitFile>,
+) -> Option<AbortHandle> {
+    let svc = unit_file.as_ref().and_then(|u| u.service.as_ref());
+
+    match kind {
+        JobKind::Start | JobKind::Restart => {
+            let start_timeout = svc.and_then(|s| {
+                let t = s.timeout_start_sec;
+                if t > 0 { Some(t as u64) } else { None }
+            });
+            if start_timeout.is_none() {
+                // No start timeout configured; no watchdog either.
+                return None;
+            }
+            let start_secs = start_timeout.unwrap();
+            let alloc = allocator.clone();
+            let name_clone = name.to_string();
+            let handle = tokio::spawn(async move {
+                // Start timeout
+                tokio::time::sleep(Duration::from_secs(start_secs)).await;
+                let mut state = alloc.write();
+                if let Some(job) = state.jobs.get_mut(&job_id) {
+                    if matches!(job.status, JobStatus::Running) {
+                        job.status = JobStatus::Failed("TimeoutStartSec exceeded".to_string());
+                        let rt = state.runtime.entry(name_clone.clone()).or_default();
+                        rt.active_state = ActiveState::Failed;
+                        rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.job_completion_tx {
+                            let _ = tx.send(JobCompletion {
+                                job_id,
+                                unit_name: name_clone,
+                                result: JobResultKind::Timeout,
+                            });
+                        }
+                    }
+                }
+            })
+            .abort_handle();
+            Some(handle)
+        }
+        JobKind::Stop => {
+            let stop_secs = svc
+                .and_then(|s| {
+                    let t = s.timeout_stop_sec;
+                    if t > 0 { Some(t as u64) } else { None }
+                })
+                .unwrap_or(30);
+            let alloc = allocator.clone();
+            let name_clone = name.to_string();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(stop_secs)).await;
+                let mut state = alloc.write();
+                if let Some(job) = state.jobs.get_mut(&job_id) {
+                    if matches!(job.status, JobStatus::Running) {
+                        job.status = JobStatus::Failed("TimeoutStopSec exceeded".to_string());
+                        let rt = state.runtime.entry(name_clone.clone()).or_default();
+                        rt.active_state = ActiveState::Failed;
+                        rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.job_completion_tx {
+                            let _ = tx.send(JobCompletion {
+                                job_id,
+                                unit_name: name_clone,
+                                result: JobResultKind::Timeout,
+                            });
+                        }
+                    }
+                }
+            })
+            .abort_handle();
+            Some(handle)
+        }
+        JobKind::Reload => {
+            // Reload timeout: default 60 seconds.
+            let reload_secs: u64 = 60;
+            let alloc = allocator.clone();
+            let name_clone = name.to_string();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(reload_secs)).await;
+                let mut state = alloc.write();
+                if let Some(job) = state.jobs.get_mut(&job_id) {
+                    if matches!(job.status, JobStatus::Running) {
+                        job.status = JobStatus::Failed("Reload timeout exceeded".to_string());
+                        let rt = state.runtime.entry(name_clone.clone()).or_default();
+                        rt.active_state = ActiveState::Failed;
+                        rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.job_completion_tx {
+                            let _ = tx.send(JobCompletion {
+                                job_id,
+                                unit_name: name_clone,
+                                result: JobResultKind::Timeout,
+                            });
+                        }
+                    }
+                }
+            })
+            .abort_handle();
+            Some(handle)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unified restart-policy helpers
 // ---------------------------------------------------------------------------
 
@@ -1176,6 +1321,36 @@ pub fn schedule_automatic_restart(
             "Restart rate limit exceeded for {} (interval={}s burst={}), not auto-restarting",
             unit_name, interval_sec, burst
         );
+        // Consult StartLimitAction.
+        let action = {
+            let state = allocator.read();
+            state
+                .units
+                .get(unit_name)
+                .and_then(|u| u.service.as_ref())
+                .map(|svc| svc.start_limit_action.clone())
+                .unwrap_or(StartLimitAction::None)
+        };
+        match action {
+            StartLimitAction::None => {}
+            StartLimitAction::Reboot
+            | StartLimitAction::RebootForce
+            | StartLimitAction::RebootImmediate => {
+                warn!("StartLimitAction={:?}: rebooting system", action);
+                let _ = std::process::Command::new("shutdown")
+                    .args(["-r", "now", "StartLimitAction triggered by systema"])
+                    .spawn();
+            }
+            StartLimitAction::Poweroff => {
+                warn!("StartLimitAction=poweroff: powering off system");
+                let _ = std::process::Command::new("shutdown")
+                    .args(["-P", "now", "StartLimitAction triggered by systema"])
+                    .spawn();
+            }
+            StartLimitAction::Exit => {
+                warn!("StartLimitAction=exit: exiting (no-op, logging only)");
+            }
+        }
         return false;
     }
 
