@@ -207,6 +207,28 @@ impl Properties {
             }
         };
 
+        // First check that the interface is known — return UnknownInterface
+        // before checking individual properties, per D-Bus spec.
+        let is_known_interface = matches!(
+            iface_name.as_str(),
+            "org.freedesktop.systemd1.Unit"
+                | "org.freedesktop.systemd1.Service"
+                | "org.freedesktop.systemd1.Socket"
+                | "org.freedesktop.systemd1.Slice"
+                | "org.freedesktop.DBus.Properties"
+                | "org.freedesktop.DBus.Peer"
+                | "org.freedesktop.DBus.Introspectable"
+                | "org.freedesktop.DBus.ObjectManager"
+        );
+        if !is_known_interface {
+            let err = fdo::Error::UnknownInterface(l10n::fmt(
+                l10n::t_("Unknown interface '{iface_name}'."),
+                &[("iface_name", &iface_name)],
+            ));
+            connection.reply_dbus_error(&msg.header(), err).await?;
+            return Ok(());
+        }
+
         let value = match iface_name.as_str() {
             "org.freedesktop.systemd1.Unit" => {
                 let obj = UnitObject {
@@ -230,7 +252,12 @@ impl Properties {
                 obj.get(&prop_name).await
             }
             "org.freedesktop.systemd1.Slice" => None,
-            _ => None,
+            // Standard built-in interfaces have no properties.
+            "org.freedesktop.DBus.Properties"
+            | "org.freedesktop.DBus.Peer"
+            | "org.freedesktop.DBus.Introspectable"
+            | "org.freedesktop.DBus.ObjectManager" => None,
+            _ => unreachable!(), // checked above
         };
 
         match value {

@@ -848,6 +848,11 @@ pub fn handle_task_result(
             }
         }
 
+        // Notify the D-Bus layer that this unit's properties changed.
+        if let Some(ref tx) = state.properties_changed_tx {
+            let _ = tx.send(unit_name.to_string());
+        }
+
         // --- BindsTo= lifecycle binding ---
         if matches!(kind, JobKind::Stop) || !success {
             for (other_name, other_unit) in &state.units {
@@ -1180,6 +1185,9 @@ fn spawn_job_timeout(
                         let rt = state.runtime.entry(name_clone.clone()).or_default();
                         rt.active_state = ActiveState::Failed;
                         rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.properties_changed_tx {
+                            let _ = tx.send(name_clone.clone());
+                        }
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,
@@ -1211,6 +1219,9 @@ fn spawn_job_timeout(
                         let rt = state.runtime.entry(name_clone.clone()).or_default();
                         rt.active_state = ActiveState::Failed;
                         rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.properties_changed_tx {
+                            let _ = tx.send(name_clone.clone());
+                        }
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,
@@ -1238,6 +1249,9 @@ fn spawn_job_timeout(
                         let rt = state.runtime.entry(name_clone.clone()).or_default();
                         rt.active_state = ActiveState::Failed;
                         rt.sub_state = "failed".to_string();
+                        if let Some(ref tx) = state.properties_changed_tx {
+                            let _ = tx.send(name_clone.clone());
+                        }
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,

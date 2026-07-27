@@ -7,7 +7,7 @@ use anyhow::Result;
 use libsysa::l10n;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zbus::interface;
 use zvariant::OwnedObjectPath;
 
@@ -405,7 +405,16 @@ impl ManagerInterface {
 
         for name in to_load {
             let alloc = self.allocator.clone();
-            let _ = tokio::task::spawn_blocking(move || load_unit_sync(&alloc, &name)).await;
+            let name_clone = name.clone();
+            match tokio::task::spawn_blocking(move || load_unit_sync(&alloc, &name_clone)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Failed to load unit '{}' in ListUnitsByNames: {}", name, e);
+                }
+                Err(e) => {
+                    warn!("Task panicked loading unit '{}' in ListUnitsByNames: {}", name, e);
+                }
+            }
         }
 
         let state = self.allocator.read();
@@ -491,11 +500,7 @@ impl ManagerInterface {
 
         let state = self.allocator.read();
         if let Some(unit) = state.units.get(name) {
-            let file_state = if !unit.install.wanted_by.is_empty() {
-                "enabled"
-            } else {
-                "static"
-            };
+            let file_state = unit_file_state(&unit.install);
             Ok(file_state.to_string())
         } else {
             // Unit not loaded — try to find it on disk without loading it fully.
@@ -530,6 +535,25 @@ impl ManagerInterface {
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Subscription management
+    // ------------------------------------------------------------------
+
+    /// Subscribe to signals (JobNew, JobRemoved, PropertiesChanged).
+    /// In systemd this adds a D-Bus match rule; with zbus the D-Bus daemon
+    /// handles signal routing automatically, so this is a no-op that must
+    /// exist so that `systemctl start --wait` and similar tools work.
+    async fn subscribe(&self) -> zbus::fdo::Result<()> {
+        debug!("D-Bus Subscribe (no-op)");
+        Ok(())
+    }
+
+    /// Unsubscribe from signals.
+    async fn unsubscribe(&self) -> zbus::fdo::Result<()> {
+        debug!("D-Bus Unsubscribe (no-op)");
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -967,11 +991,7 @@ where
         .keys()
         .filter_map(|name| {
             let unit = state.units.get(name)?;
-            let file_state = if !unit.install.wanted_by.is_empty() {
-                "enabled"
-            } else {
-                "static"
-            };
+            let file_state = unit_file_state(&unit.install);
             if predicate(name, file_state) {
                 Some((
                     format!("{}/{}", libsysa::paths::instance().systemd_lib_unit_dir, name),
@@ -982,6 +1002,24 @@ where
             }
         })
         .collect()
+}
+
+/// Determine the enablement state of a unit based on its install section.
+///
+/// Returns one of:
+/// - `"static"` — no `[Install]` section (cannot be enabled/disabled)
+/// - `"disabled"` — has `[Install]` section but no enable symlinks detected
+/// - `"enabled"` — has `[Install]` section and enable symlinks exist
+fn unit_file_state(install: &crate::unit::types::InstallSection) -> &'static str {
+    let has_install = !install.wanted_by.is_empty()
+        || !install.required_by.is_empty()
+        || !install.also.is_empty();
+    if !has_install {
+        return "static";
+    }
+    // Without symlink tracking we conservatively report "disabled".
+    // TODO: check actual symlinks in .wants/.requires directories.
+    "disabled"
 }
 
 /// Simple shell-style glob matcher supporting `*` (any sequence) and `?`

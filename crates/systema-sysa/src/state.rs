@@ -196,7 +196,7 @@ impl JobResultKind {
         match self {
             JobResultKind::Done => "done",
             JobResultKind::Failed => "failed",
-            JobResultKind::Cancelled => "canceled",
+            JobResultKind::Cancelled => "cancelled",
             JobResultKind::Timeout => "timeout",
             JobResultKind::Dependency => "dependency",
             JobResultKind::Skipped => "skipped",
@@ -294,6 +294,10 @@ pub struct AllocatorState {
     /// Channel to notify the D-Bus layer when a new job is created so it can
     /// emit the `JobNew` signal.
     pub job_new_tx: Option<tokio::sync::mpsc::UnboundedSender<JobNewInfo>>,
+    /// Channel to notify the D-Bus layer that a unit's runtime state changed,
+    /// so it can emit `org.freedesktop.DBus.Properties.PropertiesChanged`.
+    /// The payload is the unit name whose properties changed.
+    pub properties_changed_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Completion senders for serial task execution — keyed by task_id.
     /// When a task completes, `handle_task_result` sends `()` through the
     /// corresponding channel so the next task in the serial chain proceeds.
@@ -325,6 +329,7 @@ impl AllocatorState {
             job_completion_tx: None,
             unit_loaded_tx: None,
             job_new_tx: None,
+            properties_changed_tx: None,
             serial_completion_txs: HashMap::new(),
             start_limit_state: HashMap::new(),
             event_bus: Arc::new(TokioRwLock::new(EventBus::new())),

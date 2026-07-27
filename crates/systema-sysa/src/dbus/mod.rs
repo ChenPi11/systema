@@ -11,6 +11,7 @@ pub mod slice_obj;
 pub mod socket_obj;
 pub mod unit_obj;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -19,6 +20,7 @@ use anyhow::Result;
 use once_cell::sync::OnceCell;
 use tracing::{info, warn};
 use zbus::connection::Builder;
+use zvariant::OwnedValue;
 
 use crate::state::AllocatorHandle;
 use crate::unit::types::UnitKind;
@@ -252,12 +254,16 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
         tokio::sync::mpsc::unbounded_channel::<crate::state::JobNewInfo>();
     // unit-loaded → register per-unit object
     let (unit_loaded_tx, mut unit_loaded_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // properties-changed → emit PropertiesChanged signal
+    let (properties_changed_tx, mut properties_changed_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
 
     {
         let mut state = allocator.write();
         state.job_completion_tx = Some(completion_tx);
         state.job_new_tx = Some(job_new_tx);
         state.unit_loaded_tx = Some(unit_loaded_tx);
+        state.properties_changed_tx = Some(properties_changed_tx);
     }
 
     // Spawn task: emit JobRemoved when a job finishes.
@@ -317,6 +323,36 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
     tokio::spawn(async move {
         while let Some(unit_name) = unit_loaded_rx.recv().await {
             register_unit_object(&conn_for_units, alloc_for_units.clone(), &unit_name).await;
+        }
+    });
+
+    // Spawn task: emit PropertiesChanged when a unit's runtime state changes.
+    let conn_for_props = conn.clone();
+    tokio::spawn(async move {
+        while let Some(unit_name) = properties_changed_rx.recv().await {
+            let path = manager::unit_object_path(&unit_name);
+            let iface_name = "org.freedesktop.systemd1.Unit";
+            let changed: HashMap<String, OwnedValue> = HashMap::new();
+            let invalidated: Vec<String> =
+                vec!["ActiveState".to_string(), "SubState".to_string()];
+            match conn_for_props
+                .emit_signal(
+                    None::<&str>,
+                    &path,
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &(iface_name, changed, invalidated),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to emit PropertiesChanged for {}: {}",
+                        unit_name, e
+                    );
+                }
+            }
         }
     });
 
