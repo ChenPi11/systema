@@ -4,6 +4,7 @@
 //! `systemd` so that tools like `systemctl` can talk to us.
 
 use anyhow::Result;
+use libsysa::l10n;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -141,9 +142,9 @@ impl ManagerInterface {
         } else {
             // Return UnknownObject so that systemctl recognises the unit as
             // "not in memory" and automatically falls back to LoadUnit.
-            Err(zbus::fdo::Error::UnknownObject(format!(
-                "Unit {} is not loaded",
-                name
+            Err(zbus::fdo::Error::UnknownObject(l10n::fmt(
+                l10n::t_("Unit {name} is not loaded."),
+                &[("name", name)],
             )))
         }
     }
@@ -505,9 +506,9 @@ impl ManagerInterface {
                     return Ok("static".to_string());
                 }
             }
-            Err(zbus::fdo::Error::Failed(format!(
-                "Unit file {} not found",
-                name
+            Err(zbus::fdo::Error::Failed(l10n::fmt(
+                l10n::t_("Unit file {name} not found."),
+                &[("name", name)],
             )))
         }
     }
@@ -879,7 +880,10 @@ pub(super) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<
             return Ok(());
         }
     }
-    anyhow::bail!("Unit not found: {}", name)
+    anyhow::bail!(libsysa::l10n::fmt(
+        libsysa::l10n::t_("Unit not found: {name}"),
+        &[("name", name)],
+    ))
 }
 
 // --------------------------------------------------------------------------

@@ -54,3 +54,9 @@ parking_lot = "0.12"
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
+
+# Internationalization
+gettext-rs = { version = "0.7", features = ["gettext-system"] }
+
+[profile.release]
+strip = true

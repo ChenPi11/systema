@@ -1,4 +1,4 @@
-//! systema-sysf — System F (Finder)
+//! systema-sysf — System F (System Finder Worker)
 //!
 //! Discovers systemd unit files and interacts with System A's staging area.
 //!
@@ -20,7 +20,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "systema-sysf", about = "System F — Finder")]
+#[command(name = "systema-sysf", about = "System F — System Finder Worker")]
 struct Args {
     #[arg(long, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
@@ -40,13 +40,23 @@ enum Command {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    libsysa::paths::init();
+    libsysa::l10n::init();
+
+    let args = {
+        use clap::{CommandFactory, FromArgMatches};
+        let cmd = Args::command()
+            .about(libsysa::l10n::t_("System F — System Finder Worker"))
+            .mut_arg("debug", |a| a.help(libsysa::l10n::t_("Enable debug-level logging.")))
+            .mut_arg("log_level", |a| a.help(libsysa::l10n::t_("Log level (trace, debug, info, warn, error).")))
+            .mut_subcommand("commit", |cmd| cmd.about(libsysa::l10n::t_("Commit previously staged units into the active set.")));
+        Args::from_arg_matches(&cmd.get_matches())
+            .unwrap_or_else(|e| e.exit())
+    };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
         .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
-
-    libsysa::paths::init();
 
     match args.command {
         Some(Command::Commit) => run_commit().await,
@@ -56,7 +66,7 @@ async fn main() -> Result<()> {
 
 /// Discover all systemd units and stage them in System A.
 async fn run_register() -> Result<()> {
-    info!("System F (Finder) registering units");
+    info!("System F (System Finder Worker) registering units");
 
     // ------------------------------------------------------------------
     // 1. Discover all units via the SystemdFinder.
@@ -74,7 +84,7 @@ async fn run_register() -> Result<()> {
 
     let stream = tokio::net::UnixStream::connect(socket_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {}", e))?;
+        .map_err(|e| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("Failed to connect to System A: {e}."), &[("e", &e.to_string())])))?;
     let mut framed = frame_stream(stream);
 
     let json = serde_json::to_vec(&units)?;
@@ -88,17 +98,17 @@ async fn run_register() -> Result<()> {
     // ------------------------------------------------------------------
     let ack_env = recv_envelope(&mut framed)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("System A disconnected before sending ack"))?;
+        .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::t_("System A disconnected before sending ack.")))?;
 
     if ack_env.method != "finder.ack" {
-        anyhow::bail!("Expected 'finder.ack', got '{}'", ack_env.method);
+        anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Expected 'finder.ack', got '{method}'."), &[("method", &ack_env.method)]));
     }
 
     let ack = UnitRegistrationAck::decode(ack_env.payload.as_slice())?;
     if ack.success {
         info!("Staging successful: {} units registered", ack.unit_count);
     } else {
-        anyhow::bail!("Staging failed: {}", ack.message);
+        anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Staging failed: {message}."), &[("message", &ack.message)]));
     }
 
     info!("System F register complete");
@@ -107,14 +117,14 @@ async fn run_register() -> Result<()> {
 
 /// Tell System A to commit the currently staged units into the active set.
 async fn run_commit() -> Result<()> {
-    info!("System F (Finder) committing staging");
+    info!("System F (System Finder Worker) committing staging");
 
     let socket_path = libsysa::paths::instance().ipc_socket_path;
     info!("Connecting to System A at {}", socket_path);
 
     let stream = tokio::net::UnixStream::connect(socket_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {}", e))?;
+        .map_err(|e| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("Failed to connect to System A: {e}."), &[("e", &e.to_string())])))?;
     let mut framed = frame_stream(stream);
 
     let commit_msg = CommitUnits {};
@@ -124,17 +134,17 @@ async fn run_commit() -> Result<()> {
 
     let ack_env = recv_envelope(&mut framed)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("System A disconnected before sending ack"))?;
+        .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::t_("System A disconnected before sending ack.")))?;
 
     if ack_env.method != "finder.ack" {
-        anyhow::bail!("Expected 'finder.ack', got '{}'", ack_env.method);
+        anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Expected 'finder.ack', got '{method}'."), &[("method", &ack_env.method)]));
     }
 
     let ack = UnitRegistrationAck::decode(ack_env.payload.as_slice())?;
     if ack.success {
         info!("Commit successful: {} units committed", ack.unit_count);
     } else {
-        anyhow::bail!("Commit failed: {}", ack.message);
+        anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Commit failed: {message}."), &[("message", &ack.message)]));
     }
 
     info!("System F commit complete");

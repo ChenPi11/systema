@@ -12,6 +12,7 @@ pub struct Paths {
     pub systemd_machine_id_file: &'static str,
     pub systemd_lib_unit_dir: &'static str,
     pub systemd_first_boot_file: &'static str,
+    pub locale_dir: &'static str,
     pub unit_search_paths: Vec<String>,
     pub generator_search_paths: Vec<String>,
 }
@@ -48,6 +49,7 @@ fn compute_paths() -> Paths {
             "SYSTEMD_FIRST_BOOT_FILE",
             builtin::SYSTEMD_FIRST_BOOT_FILE,
         ),
+        locale_dir: resolve("SYSTEMA_LOCALE_DIR", builtin::LOCALE_DIR),
         unit_search_paths: resolve_list("SYSTEMA_UNIT_PATH", &builtin::UNIT_SEARCH_PATHS),
         generator_search_paths: resolve_list(
             "SYSTEMA_GENERATOR_PATH",
@@ -135,6 +137,7 @@ mod tests {
         assert_eq!(paths.systemd_machine_id_file, "/etc/machine-id");
         assert_eq!(paths.systemd_lib_unit_dir, "/usr/lib/systemd/system");
         assert_eq!(paths.systemd_first_boot_file, "/run/systemd/first-boot");
+        assert_eq!(paths.locale_dir, "/usr/share/locale");
         assert_eq!(
             paths.unit_search_paths,
             vec![

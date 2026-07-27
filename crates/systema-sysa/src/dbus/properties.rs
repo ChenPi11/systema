@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use async_trait::async_trait;
+use libsysa::l10n;
 use zbus::object_server::{DispatchResult, Interface, SignalContext};
 use zbus::names::InterfaceName;
 use zbus::{Connection, ObjectServer, fdo};
@@ -161,7 +162,7 @@ impl Properties {
         let (iface_name,): (String,) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}"));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -180,8 +181,9 @@ impl Properties {
                     connection.reply_dbus_error(&msg.header(), e).await?;
                 }
                 None => {
-                    let err = fdo::Error::UnknownInterface(format!(
-                        "Unknown interface '{iface_name}'"
+                    let err = fdo::Error::UnknownInterface(l10n::fmt(
+                        l10n::t_("Unknown interface '{iface_name}'."),
+                        &[("iface_name", &iface_name)],
                     ));
                     connection.reply_dbus_error(&msg.header(), err).await?;
                 }
@@ -199,7 +201,7 @@ impl Properties {
         let (iface_name, prop_name): (String, String) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}"));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -242,7 +244,10 @@ impl Properties {
                 connection.reply_dbus_error(&msg.header(), e).await?;
             }
             None => {
-                let err = fdo::Error::UnknownProperty(format!("Unknown property '{prop_name}'"));
+                let err = fdo::Error::UnknownProperty(l10n::fmt(
+                    l10n::t_("Unknown property '{prop_name}'."),
+                    &[("prop_name", &prop_name)],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
             }
         }
@@ -388,7 +393,7 @@ impl ManagerProperties {
         let (iface_name,): (String,) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}"));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -415,8 +420,9 @@ impl ManagerProperties {
                 connection.reply(msg, &empty).await?;
             }
             _ => {
-                let err = fdo::Error::UnknownInterface(format!(
-                    "Unknown interface '{iface_name}'"
+                let err = fdo::Error::UnknownInterface(l10n::fmt(
+                    l10n::t_("Unknown interface '{iface_name}'."),
+                    &[("iface_name", &iface_name)],
                 ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
             }
@@ -433,15 +439,16 @@ impl ManagerProperties {
         let (iface_name, prop_name): (String, String) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}"));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
         };
 
         if iface_name != "org.freedesktop.systemd1.Manager" {
-            let err = fdo::Error::UnknownInterface(format!(
-                "Unknown interface '{iface_name}'"
+            let err = fdo::Error::UnknownInterface(l10n::fmt(
+                l10n::t_("Unknown interface '{iface_name}'."),
+                &[("iface_name", &iface_name)],
             ));
             connection.reply_dbus_error(&msg.header(), err).await?;
             return Ok(());
@@ -460,8 +467,10 @@ impl ManagerProperties {
                 connection.reply_dbus_error(&msg.header(), e).await?;
             }
             None => {
-                let err =
-                    fdo::Error::UnknownProperty(format!("Unknown property '{prop_name}'"));
+                let err = fdo::Error::UnknownProperty(l10n::fmt(
+                    l10n::t_("Unknown property '{prop_name}'."),
+                    &[("prop_name", &prop_name)],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
             }
         }

@@ -42,7 +42,7 @@ const WORKER_UNIT_TYPES: &[&str] = &["service"];
 /// the [`FramedWrite`] will prepend the length header).
 fn encode_envelope(env: Envelope) -> Result<bytes::Bytes> {
     let mut buf = BytesMut::new();
-    env.encode(&mut buf).context("Failed to encode Envelope")?;
+    env.encode(&mut buf).context(libsysa::l10n::t_("Failed to encode Envelope."))?;
     Ok(buf.freeze())
 }
 
@@ -61,7 +61,7 @@ fn queue_event(
     let env = make_envelope(0, WORKER_ID, "system-a", "event.publish", event)?;
     out_tx
         .send(encode_envelope(env)?)
-        .map_err(|_| anyhow::anyhow!("Outgoing channel closed"))
+        .map_err(|_| anyhow::anyhow!(libsysa::l10n::t_("Outgoing channel closed.")))
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
 
     let stream = tokio::net::UnixStream::connect(libsysa::paths::instance().ipc_socket_path)
         .await
-        .with_context(|| format!("Cannot connect to {}", libsysa::paths::instance().ipc_socket_path))?;
+        .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Cannot connect to {path}."), &[("path", &libsysa::paths::instance().ipc_socket_path)]))?;
 
     info!("Connected to System A");
 
@@ -116,10 +116,10 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
     // Wait for ack.
     let ack_env = recv_envelope(&mut framed)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("System A closed connection before ack"))?;
+        .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::t_("System A closed connection before ack.")))?;
     let ack = RegisterAck::decode(ack_env.payload.as_slice())?;
     if !ack.accepted {
-        anyhow::bail!("Registration rejected: {}", ack.message);
+        anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Registration rejected: {message}."), &[("message", &ack.message)]));
     }
     info!("Registration accepted: {}", ack.message);
 
@@ -148,7 +148,7 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
         async move {
             use futures::SinkExt;
             while let Some(msg) = out_rx.recv().await {
-                writer.send(msg).await.context("Write to System A socket")?;
+                writer.send(msg).await.context(libsysa::l10n::t_("Write to System A socket."))?;
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -324,7 +324,7 @@ async fn execute_task(
     match kind {
         TaskKind::Start => {
             let config = unit_config
-                .ok_or_else(|| anyhow::anyhow!("No UnitConfig in task for {}", task.unit_name))?;
+                .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("No UnitConfig in task for {unit_name}."), &[("unit_name", &task.unit_name)])))?;
 
             let (pid, child) = start_service(registry.clone(), config).await?;
 
@@ -392,16 +392,13 @@ async fn execute_task(
                     use nix::sys::signal;
                     use nix::unistd::Pid;
                     signal::kill(Pid::from_raw(pid as i32), signal::Signal::SIGHUP)
-                        .context("Failed to send SIGHUP")?;
+                        .context(libsysa::l10n::t_("Failed to send SIGHUP."))?;
                     info!("Sent SIGHUP to PID {} ({})", pid, task.unit_name);
                 }
             } else {
                 // systemctl reload behaviour: if the service is not running, return an
                 // error instead of silently succeeding.
-                anyhow::bail!(
-                    "Reload of {} failed: service is not running",
-                    task.unit_name
-                );
+                anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Reload of {unit_name} failed: service is not running."), &[("unit_name", &task.unit_name)]));
             }
         }
     }

@@ -20,7 +20,7 @@ pub fn discover_all() -> Result<Vec<UnitFile>> {
         let path = Path::new(dir);
         if path.exists() {
             load_units_from_dir_recursive(path, &mut units)
-                .with_context(|| format!("Scanning {}", dir))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Scanning {dir} ..."), &[("dir", &dir.to_string())]))?;
         }
     }
     info!("Systemd finder discovered {} unit(s)", units.len());

@@ -6,6 +6,7 @@
 //! - Shared error types
 
 pub mod event_bus;
+pub mod l10n;
 pub mod ipc;
 pub mod paths;
 pub mod proto {

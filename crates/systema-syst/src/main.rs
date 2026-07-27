@@ -1,4 +1,4 @@
-//! system-t — System Target
+//! system-t — System Target Worker
 //!
 //! The target-activation worker for System Alphabet. Responsibilities:
 //! - Connect to System A's IPC socket and register as the "target" worker.
@@ -15,7 +15,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "systema-syst", about = "System T — System Target")]
+#[command(name = "systema-syst", about = "System T — System Target Worker")]
 struct Args {
     #[arg(long, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
@@ -26,15 +26,24 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    libsysa::paths::init();
+    libsysa::l10n::init();
+
+    let args = {
+        use clap::{CommandFactory, FromArgMatches};
+        let cmd = Args::command()
+            .about(libsysa::l10n::t_("System T — System Target Worker"))
+            .mut_arg("debug", |a| a.help(libsysa::l10n::t_("Enable debug-level logging.")))
+            .mut_arg("log_level", |a| a.help(libsysa::l10n::t_("Log level (trace, debug, info, warn, error).")));
+        Args::from_arg_matches(&cmd.get_matches())
+            .unwrap_or_else(|e| e.exit())
+    };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
         .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
 
-    libsysa::paths::init();
-
-    info!("System T (System Target) starting up");
+    info!("System T (System Target Worker) starting up");
 
     ipc::run().await?;
 

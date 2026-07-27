@@ -32,13 +32,22 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    libsysa::paths::init();
+    libsysa::l10n::init();
+
+    let args = {
+        use clap::{CommandFactory, FromArgMatches};
+        let cmd = Args::command()
+            .about(libsysa::l10n::t_("System A — System Allocator"))
+            .mut_arg("debug", |a| a.help(libsysa::l10n::t_("Enable debug-level logging.")))
+            .mut_arg("log_level", |a| a.help(libsysa::l10n::t_("Log level (trace, debug, info, warn, error).")));
+        Args::from_arg_matches(&cmd.get_matches())
+            .unwrap_or_else(|e| e.exit())
+    };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
         .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
-
-    libsysa::paths::init();
 
     info!("System A (System Allocator) starting up");
 

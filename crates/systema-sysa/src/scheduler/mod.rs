@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+use libsysa::l10n;
 use prost::Message;
 use tracing::{debug, info, warn, error};
 
@@ -62,11 +63,11 @@ pub async fn enqueue_job(
             .unwrap_or_else(|| "service".to_string());
         let has_worker = state.workers.values().any(|w| w.unit_types.contains(&unit_type));
         if !has_worker {
-            bail!(
-                "No worker available for unit type '{}' (unit: {}). \
-                 Cannot execute {:?} operation. Is the corresponding System Worker running?",
-                unit_type, unit_name, kind
-            );
+            bail!("{}", l10n::fmt(l10n::t_("No worker available for unit type '{unit_type}' (unit: {unit_name}). Cannot execute {kind:?} operation. Is the corresponding System Worker running?"), &[
+                ("unit_type", &unit_type),
+                ("unit_name", unit_name),
+                ("kind", &format!("{:?}", kind)),
+            ]));
         }
     }
 
@@ -264,12 +265,11 @@ pub async fn enqueue_job(
         if let Some((existing_id, _)) = existing {
             match mode {
                 JobMode::Fail => {
-                    bail!(
-                        "Job already exists for unit {} (kind={:?}, id={})",
-                        unit_name,
-                        kind,
-                        existing_id
-                    );
+                    bail!("{}", l10n::fmt(l10n::t_("Job already exists for unit {unit_name} (kind={kind:?}, id={existing_id})."), &[
+                        ("unit_name", unit_name),
+                        ("kind", &format!("{:?}", kind)),
+                        ("existing_id", &existing_id.to_string()),
+                    ]));
                 }
                 JobMode::Queue => {
                     return Ok(existing_id);
@@ -423,11 +423,11 @@ pub async fn enqueue_job(
         let (worker_task_tx, task_id) = match (worker_chan, task_id) {
             (Some(tx), tid) => (tx, tid),
             (None, _) => {
-                let err = format!(
-                    "No worker registered for unit type '{}' (unit: {}). \
-                     Cannot process dependency chain for '{}'.",
-                    unit_type, name, unit_name
-                );
+                let err = l10n::fmt(l10n::t_("No worker registered for unit type '{unit_type}' (unit: {unit_name}). Cannot process dependency chain for '{name}'."), &[
+                    ("unit_type", &unit_type),
+                    ("unit_name", unit_name),
+                    ("name", name),
+                ]);
                 warn!("{}", err);
                 {
                     let mut state = allocator.write();

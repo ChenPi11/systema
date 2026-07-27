@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
+use libsysa::l10n;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -227,20 +228,20 @@ impl DependencyGraph {
                             );
                             graph.remove_edge(eid);
                         } else {
-                            bail!(
-                                "Dependency cycle detected involving unit: {} (unable to break)",
-                                graph[cycle_node]
-                            );
+                            bail!("{}", l10n::fmt(
+                                l10n::t_("Dependency cycle detected involving unit: {unit} (unable to break)."),
+                                &[("unit", &graph[cycle_node].to_string())],
+                            ));
                         }
                     }
                 }
             }
         }
 
-        bail!(
-            "Unable to resolve dependency cycles after removing {} edges",
-            max_attempts
-        )
+        bail!("{}", l10n::fmt(
+            l10n::t_("Unable to resolve dependency cycles after removing {count} edges."),
+            &[("count", &max_attempts.to_string())],
+        ))
     }
 
     /// Compute the start order for a single unit and all of its transitive

@@ -36,7 +36,7 @@ pub fn parse_unit_from_path(path: &Path) -> Result<UnitFile> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Reading unit file {}", path.display()))?;
+        .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Reading unit file {path} ..."), &[("path", &path.display().to_string())]))?;
     let mut unit = parse_unit_content(name, &content)?;
 
     // Apply drop-in files from `<dir>/<name>.d/*.conf`.
@@ -52,7 +52,7 @@ pub fn parse_unit_from_path(path: &Path) -> Result<UnitFile> {
 /// order (higher sort = higher priority, overriding earlier entries).
 fn apply_dropin_dir(dir: &Path, unit: &mut UnitFile) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .with_context(|| format!("Reading drop-in dir {}", dir.display()))?
+        .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Reading drop-in dir {dir} ..."), &[("dir", &dir.display().to_string())]))?
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path()
@@ -90,7 +90,7 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
     let mut config = Ini::new();
     config
         .read(processed.clone())
-        .map_err(|e| anyhow::anyhow!("INI parse error in drop-in: {}", e))?;
+        .map_err(|e| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("INI parse error in drop-in: {e}."), &[("e", &e.to_string())])))?;
 
     // Re-apply each section that is present in the drop-in.
     // NOTE: We probe for a subset of common [Unit] keys rather than scanning all
@@ -239,24 +239,24 @@ fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
     let mut config = Ini::new(); // case-insensitive (normalizes to lowercase)
     config
         .read(processed)
-        .map_err(|e| anyhow::anyhow!("INI parse error in {}: {}", name, e))?;
+        .map_err(|e| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("INI parse error in {name}: {e}."), &[("name", name), ("e", &e.to_string())])))?;
 
     let mut unit = UnitFile::new(name);
 
     // --- [Unit] section ---
     parse_unit_section(&config, &mut unit.unit, name)
-        .with_context(|| format!("Parsing [Unit] section of {name}"))?;
+        .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Unit] section of {name} ..."), &[("name", name)]))?;
 
     // --- [Install] section ---
     parse_install_section(&config, &mut unit.install)
-        .with_context(|| format!("Parsing [Install] section of {name}"))?;
+        .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Install] section of {name} ..."), &[("name", name)]))?;
 
     // --- type-specific sections ---
     match &unit.kind {
         UnitKind::Service => {
             let mut svc = ServiceSection::default();
             parse_service_section(&config, &mut svc, name)
-                .with_context(|| format!("Parsing [Service] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Service] section of {name} ..."), &[("name", name)]))?;
             unit.service = Some(svc);
         }
         UnitKind::Target => {
@@ -265,49 +265,49 @@ fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
         UnitKind::Mount => {
             let mut mnt = MountSection::default();
             parse_mount_section(&config, &mut mnt, name)
-                .with_context(|| format!("Parsing [Mount] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Mount] section of {name} ..."), &[("name", name)]))?;
             unit.mount = Some(mnt);
         }
         UnitKind::Timer => {
             let mut tmr = TimerSection::default();
             parse_timer_section(&config, &mut tmr, name)
-                .with_context(|| format!("Parsing [Timer] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Timer] section of {name} ..."), &[("name", name)]))?;
             unit.timer = Some(tmr);
         }
         UnitKind::Socket => {
             let mut sock = SocketSection::default();
             parse_socket_section(&config, &mut sock, name)
-                .with_context(|| format!("Parsing [Socket] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Socket] section of {name} ..."), &[("name", name)]))?;
             unit.socket = Some(sock);
         }
         UnitKind::Swap => {
             let mut swap = SwapSection::default();
             parse_swap_section(&config, &mut swap, name)
-                .with_context(|| format!("Parsing [Swap] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Swap] section of {name} ..."), &[("name", name)]))?;
             unit.swap = Some(swap);
         }
         UnitKind::Path => {
             let mut path_sec = PathSection::default();
             parse_path_section(&config, &mut path_sec, name)
-                .with_context(|| format!("Parsing [Path] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Path] section of {name} ..."), &[("name", name)]))?;
             unit.path = Some(path_sec);
         }
         UnitKind::Slice => {
             let mut slice = SliceSection::default();
             parse_slice_section(&config, &mut slice, name)
-                .with_context(|| format!("Parsing [Slice] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Slice] section of {name} ..."), &[("name", name)]))?;
             unit.slice = Some(slice);
         }
         UnitKind::Scope => {
             let mut scope = ScopeSection::default();
             parse_scope_section(&config, &mut scope, name)
-                .with_context(|| format!("Parsing [Scope] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Scope] section of {name} ..."), &[("name", name)]))?;
             unit.scope = Some(scope);
         }
         UnitKind::Device => {
             let mut device = DeviceSection::default();
             parse_device_section(&config, &mut device, name)
-                .with_context(|| format!("Parsing [Device] section of {name}"))?;
+                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Parsing [Device] section of {name} ..."), &[("name", name)]))?;
             unit.device = Some(device);
         }
         other => {

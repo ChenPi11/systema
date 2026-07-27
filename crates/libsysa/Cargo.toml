@@ -16,6 +16,11 @@ tracing.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 libc = "0.2"
+gettext-rs.workspace = true
+
+[features]
+default = []
+l10n_debug = []
 
 [build-dependencies]
 prost-build = "0.13"
