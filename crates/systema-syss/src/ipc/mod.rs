@@ -207,8 +207,14 @@ async fn try_run(registry: ServiceRegistry) -> Result<()> {
                             None
                         };
 
+                        let invocation_id = if task.invocation_id.is_empty() {
+                            None
+                        } else {
+                            Some(task.invocation_id.clone())
+                        };
+
                         let result =
-                            execute_task(&registry, &task, unit_config.as_ref(), &out_tx).await;
+                            execute_task(&registry, &task, unit_config.as_ref(), &out_tx, invocation_id).await;
 
                         let (success, message, result_kind) = match result {
                             Ok(()) => (true, String::new(), TaskResultKind::TaskResultDone),
@@ -318,6 +324,7 @@ async fn execute_task(
     task: &TaskDispatch,
     unit_config: Option<&UnitConfig>,
     out_tx: &mpsc::UnboundedSender<bytes::Bytes>,
+    invocation_id: Option<String>,
 ) -> Result<()> {
     let kind = TaskKind::try_from(task.kind).unwrap_or(TaskKind::Start);
 
@@ -326,7 +333,7 @@ async fn execute_task(
             let config = unit_config
                 .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("No UnitConfig in task for {unit_name}."), &[("unit_name", &task.unit_name)])))?;
 
-            let (pid, child) = start_service(registry.clone(), config).await?;
+            let (pid, child) = start_service(registry.clone(), config, invocation_id).await?;
 
             // Notify System A that the service is running.
             queue_event(
@@ -365,7 +372,9 @@ async fn execute_task(
             stop_service(registry.clone(), &task.unit_name, timeout).await?;
 
             if let Some(config) = unit_config {
-                let (pid, child) = start_service(registry.clone(), config).await?;
+                // Restart gets a fresh invocation ID for the new activation.
+                let restart_invocation_id = invocation_id.clone();
+                let (pid, child) = start_service(registry.clone(), config, restart_invocation_id).await?;
                 queue_event(
                     out_tx,
                     "service.started",

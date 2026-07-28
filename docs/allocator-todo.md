@@ -116,13 +116,13 @@
 | `JobKind` 枚举（Start/Stop/Restart/Reload） | ✅ 完全实现 | |
 | `JobStatus` 枚举（Waiting/Running/Done/Failed/Cancelled） | ✅ 完全实现 | |
 | `JobResultKind` 枚举（Done/Failed/Cancelled/Timeout/Dependency/Skipped） | ✅ 完全实现 | |
-| Job 完成通知（one-shot channel `completion_tx`） | ⚠️ 部分实现 | 字段已定义，但 D-Bus 层不使用（调用者不等待 job 完成） |
+| Job 完成通知（one-shot channel `completion_tx`） | ✅ 完全实现 | 字段已定义，`handle_task_result` 通过 `completion_tx` 发送完成通知；D-Bus 层通过 `JobRemoved` 信号向调用者报告 |
 | Worker 注册表（`workers: HashMap`） | ✅ 完全实现 | |
 | `task_kinds: HashMap<u64, JobKind>` task 与 job 映射 | ✅ 完全实现 | |
-| 系统崩溃后恢复：与 Worker 重新同步状态 | ❌ 未实现 | System A 重启后 runtime 状态清空，Worker 状态不同步 |
-| 单元引用计数（`RefUnit`/`UnrefUnit`） | ❌ 未实现 | |
-| 期望状态与实际状态对账（reconciliation loop） | ❌ 未实现 | 无持续对账机制 |
-| `InvocationID`（每次启动的唯一 UUID） | ❌ 未实现 | |
+| 系统崩溃后恢复：与 Worker 重新同步状态 | 🚫 不计划实现 | System A 重启后 runtime 状态清空，Worker 状态不同步 |
+| 单元引用计数（`RefUnit`/`UnrefUnit`） | ✅ 完全实现 | `state.ref_counts` 记录单元间依赖引用；`ref_unit()`/`unref_unit()` 管理引用；`commit_staging()` 后自动重建；通过 D-Bus `refs` 属性暴露 |
+| 期望状态与实际状态对账（reconciliation loop） | ✅ 完全实现 | `scheduler::start_reconciliation_loop()` 每 5 秒对比 `desired` vs `runtime`，自动启停不匹配的单元 |
+| `InvocationID`（每次启动的唯一 UUID） | ✅ 完全实现 | 每次 Start/Restart 生成 UUIDv4；存入 `UnitRuntimeInfo.invocation_id`；通过 IPC 传递给 Worker 设为 `INVOCATION_ID=` 环境变量；通过 D-Bus `InvocationID` 属性暴露 |
 
 ---
 

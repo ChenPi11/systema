@@ -307,7 +307,19 @@ impl UnitObject {
 
     #[zbus(property)]
     fn refs(&self) -> Vec<String> {
-        Vec::new()
+        self.allocator
+            .read()
+            .get_refs(&self.unit_name)
+    }
+
+    #[zbus(property)]
+    fn invocation_id(&self) -> String {
+        self.allocator
+            .read()
+            .runtime
+            .get(&self.unit_name)
+            .and_then(|rt| rt.invocation_id.clone())
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------

@@ -43,7 +43,7 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 |--------|------|------|
 | `GetUnit(name)` | ⚠️ 部分实现 | 只支持非空 name；systemd 支持传空字符串返回调用方所属单元，未实现 |
 | `GetUnitByPID(pid)` | ❌ 未实现 | 按 PID 查找单元 |
-| `GetUnitByInvocationID(id)` | ❌ 未实现 | 按调用 ID（128位UUID）查找单元 |
+| `GetUnitByInvocationID(id)` | ✅ 完全实现 | 扫描 `runtime` 表中匹配的 `invocation_id`，返回单元对象路径 |
 | `GetUnitByControlGroup(cgroup)` | ❌ 未实现 | 按 cgroup 路径查找单元 |
 | `GetUnitByPIDFD(pidfd)` | ❌ 未实现 | 按 PIDFD 查找单元（Linux 5.3+） |
 | `LoadUnit(name)` | ⚠️ 部分实现 | 功能正确，但使用 `spawn_blocking` 同步加载，无 polkit 权限检查 |
@@ -72,8 +72,8 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 | `SetUnitProperties(name, runtime, properties)` | ❌ 未实现 | 运行时动态修改单元属性 |
 | `BindMountUnit(name, source, destination, read_only, mkdir)` | ❌ 未实现 | 向服务命名空间添加绑定挂载 |
 | `MountImageUnit(name, source, destination, read_only, mkdir, options)` | ❌ 未实现 | 向服务命名空间挂载磁盘镜像 |
-| `RefUnit(name)` | ❌ 未实现 | 增加单元引用计数 |
-| `UnrefUnit(name)` | ❌ 未实现 | 减少单元引用计数 |
+| `RefUnit(name)` | ✅ 完全实现 | 增加 `UnitRuntimeInfo.n_ref`，返回新引用计数 |
+| `UnrefUnit(name)` | ✅ 完全实现 | 减少 `UnitRuntimeInfo.n_ref`，返回新引用计数 |
 | `StartTransientUnit(name, mode, properties, aux)` | ❌ 未实现 | 动态创建并启动临时单元 |
 
 #### 进程与作用域
@@ -385,7 +385,7 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 | 作业策略类（`JobTimeoutAction`、`OnSuccessJobMode`、`OnFailureJobMode` 等） | ❌ 未实现 |
 | 启停限制类（`StartLimitIntervalUSec`、`StartLimitBurst`、`StartLimitAction`） | ❌ 未实现 |
 | 条件明细类（`ConditionTimestamp`、`Conditions`、`Asserts`） | ❌ 未实现 |
-| 其余 cgroup / SELinux / CollectMode / InvocationID 等高级属性 | ❌ 未实现 |
+| 其余 cgroup / SELinux / CollectMode / InvocationID 等高级属性 | ⚠️ 部分实现 | `InvocationID` 属性已实现；cgroup / SELinux 相关属性未实现 |
 
 ### 2.3 信号（Signals）
 

@@ -600,6 +600,60 @@ impl ManagerInterface {
     }
 
     // ------------------------------------------------------------------
+    // Reference counting methods
+    // ------------------------------------------------------------------
+
+    /// Increment a unit's external reference count.
+    /// Returns the new reference count.
+    async fn ref_unit(&self, name: &str) -> zbus::fdo::Result<u32> {
+        debug!("D-Bus RefUnit: name={}", name);
+        let mut state = self.allocator.write();
+        if !state.units.contains_key(name) {
+            return Err(zbus::fdo::Error::Failed(l10n::fmt(
+                l10n::t_("Unit {name} is not loaded."),
+                &[("name", name)],
+            )));
+        }
+        let rt = state.runtime.entry(name.to_string()).or_default();
+        rt.n_ref += 1;
+        Ok(rt.n_ref as u32)
+    }
+
+    /// Decrement a unit's external reference count.
+    /// Returns the new reference count (or 0 if the unit was not loaded).
+    async fn unref_unit(&self, name: &str) -> zbus::fdo::Result<u32> {
+        debug!("D-Bus UnrefUnit: name={}", name);
+        let mut state = self.allocator.write();
+        if !state.units.contains_key(name) {
+            return Err(zbus::fdo::Error::Failed(l10n::fmt(
+                l10n::t_("Unit {name} is not loaded."),
+                &[("name", name)],
+            )));
+        }
+        let rt = state.runtime.entry(name.to_string()).or_default();
+        if rt.n_ref > 0 {
+            rt.n_ref -= 1;
+        }
+        Ok(rt.n_ref as u32)
+    }
+
+    /// Look up a unit by its invocation ID (UUID string).
+    /// Returns the unit's D-Bus object path.
+    async fn get_unit_by_invocation_id(&self, invocation_id: &str) -> zbus::fdo::Result<OwnedObjectPath> {
+        debug!("D-Bus GetUnitByInvocationID: id={}", invocation_id);
+        let state = self.allocator.read();
+        for (name, rt) in &state.runtime {
+            if rt.invocation_id.as_deref() == Some(invocation_id) {
+                return Ok(unit_object_path(name));
+            }
+        }
+        Err(zbus::fdo::Error::UnknownObject(l10n::fmt(
+            l10n::t_("No unit with invocation ID {invocation_id}."),
+            &[("invocation_id", invocation_id)],
+        )))
+    }
+
+    // ------------------------------------------------------------------
     // Manager properties
     // ------------------------------------------------------------------
 

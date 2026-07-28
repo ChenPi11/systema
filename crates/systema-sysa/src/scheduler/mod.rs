@@ -14,9 +14,9 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    next_job_id, next_task_id, ActiveState, AllocatorHandle, AllocatorState, Job, JobCompletion,
-    JobKind, JobMode, JobNewInfo, JobResult, JobResultKind, JobStatus, StartLimitState,
-    UnitRuntimeInfo, WorkerTask,
+    generate_invocation_id, next_job_id, next_task_id, ActiveState, AllocatorHandle,
+    AllocatorState, DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo, JobResult,
+    JobResultKind, JobStatus, StartLimitState, UnitRuntimeInfo, WorkerTask,
 };
 use crate::unit::types::{ExitKind, RestartPolicy, StartLimitAction, UnitFile, UnitSection};
 use libsysa::proto::{ServiceConfig, SocketAddress, SocketConfig, TaskDispatch, TaskKind, UnitConfig};
@@ -480,6 +480,12 @@ pub async fn enqueue_job(
             state.units.get(name.as_str()).cloned()
         };
 
+        // Generate invocation ID for Start/Restart tasks.
+        let invocation_id = match kind {
+            JobKind::Start | JobKind::Restart => Some(generate_invocation_id()),
+            _ => None,
+        };
+
         // Create a serial chain entry for this task.
         let (next_serial_tx, next_serial_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -492,6 +498,7 @@ pub async fn enqueue_job(
                 JobKind::Start | JobKind::Restart => {
                     rt.active_state = ActiveState::Activating;
                     rt.sub_state = "start".to_string();
+                    rt.invocation_id = invocation_id.clone();
                 }
                 JobKind::Stop => {
                     rt.active_state = ActiveState::Deactivating;
@@ -506,6 +513,8 @@ pub async fn enqueue_job(
                     unit_name: name.clone(),
                     kind,
                     status: JobStatus::Running,
+                    // Root job gets a oneshot channel for callers that want
+                    // to wait synchronously (e.g. D-Bus --wait support).
                     completion_tx: None,
                     timeout_abort: None,
                 },
@@ -534,6 +543,7 @@ pub async fn enqueue_job(
             unit_type,
             kind,
             unit_file,
+            invocation_id: invocation_id.clone(),
         };
 
         // In serial mode, wait for the previous task to complete before
@@ -798,6 +808,10 @@ pub fn handle_task_result(
             } else {
                 "running".to_string()
             };
+            // Clear invocation ID when the unit transitions to inactive.
+            if kind == JobKind::Stop {
+                rt.invocation_id = None;
+            }
             // Reset rate-limit state on successful start.
             if matches!(kind, JobKind::Start | JobKind::Restart) {
                 state.start_limit_state.remove(unit_name);
@@ -805,6 +819,8 @@ pub fn handle_task_result(
         } else {
             rt.active_state = ActiveState::Failed;
             rt.sub_state = "failed".to_string();
+            // Clear invocation ID on failure.
+            rt.invocation_id = None;
         }
 
         // Find and update the associated job.
@@ -1063,6 +1079,7 @@ pub fn build_task_dispatch(task: &WorkerTask) -> TaskDispatch {
         unit_type: task.unit_type.clone(),
         kind: task_kind_to_proto(task.kind) as i32,
         unit_config: unit_config_bytes,
+        invocation_id: task.invocation_id.clone().unwrap_or_default(),
     }
 }
 
@@ -1569,6 +1586,94 @@ fn is_first_boot() -> bool {
     std::path::Path::new(libsysa::paths::instance().systemd_first_boot_file).exists()
 }
 
+// ---------------------------------------------------------------------------
+// Reconciliation loop
+// ---------------------------------------------------------------------------
+
+/// Run the reconciliation loop as a background task.
+///
+/// Periodically compares desired state against actual runtime state for every
+/// unit and enqueues jobs to resolve any discrepancies:
+///
+/// - Units with `DesiredState::Active` but not currently active → enqueue Start
+/// - Units with `DesiredState::Inactive` but currently active → enqueue Stop
+///
+/// The loop skips units that already have an in-flight job of the relevant kind
+/// to avoid fighting with the scheduler.
+///
+/// The `interval` controls how often the reconciliation runs (default: 5s).
+pub fn start_reconciliation_loop(allocator: AllocatorHandle, interval: Duration) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let units_to_check: Vec<(String, DesiredState)> = {
+                let state = allocator.read();
+                state.desired.iter().map(|(k, v)| (k.clone(), *v)).collect()
+            };
+
+            for (unit_name, desired) in units_to_check {
+                let (current_state, has_matching_job) = {
+                    let state = allocator.read();
+                    let current = state
+                        .runtime
+                        .get(&unit_name)
+                        .map(|rt| rt.active_state.clone())
+                        .unwrap_or(ActiveState::Inactive);
+                    let has_job = state.jobs.values().any(|j| {
+                        j.unit_name == unit_name
+                            && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+                    });
+                    (current, has_job)
+                };
+
+                match desired {
+                    DesiredState::Active => {
+                        if !matches!(
+                            current_state,
+                            ActiveState::Active | ActiveState::Activating
+                        ) && !has_matching_job
+                        {
+                            debug!(
+                                "Reconciliation: starting {} (desired=Active, current={:?})",
+                                unit_name, current_state
+                            );
+                            if let Err(e) =
+                                enqueue_job(allocator.clone(), &unit_name, JobKind::Start, JobMode::Replace).await
+                            {
+                                warn!(
+                                    "Reconciliation: failed to start {}: {}",
+                                    unit_name, e
+                                );
+                            }
+                        }
+                    }
+                    DesiredState::Inactive => {
+                        if matches!(
+                            current_state,
+                            ActiveState::Active | ActiveState::Activating
+                        ) && !has_matching_job
+                        {
+                            debug!(
+                                "Reconciliation: stopping {} (desired=Inactive, current={:?})",
+                                unit_name, current_state
+                            );
+                            if let Err(e) =
+                                enqueue_job(allocator.clone(), &unit_name, JobKind::Stop, JobMode::Replace).await
+                            {
+                                warn!(
+                                    "Reconciliation: failed to stop {}: {}",
+                                    unit_name, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1958,6 +2063,7 @@ mod tests {
             unit_type: "service".to_string(),
             kind: JobKind::Start,
             unit_file: Some(uf),
+            invocation_id: Some("test-invocation-id".to_string()),
         };
         let dispatch = build_task_dispatch(&task);
         assert_eq!(dispatch.task_id, 42);

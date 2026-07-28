@@ -34,9 +34,13 @@ use crate::state::{ServiceInstance, ServiceRegistry, ServiceState};
 /// Launch the service described by `config`.
 /// Returns the PID and the Child handle of the spawned main process.
 /// The caller must keep the Child handle to later collect the exit status.
+///
+/// If `invocation_id` is `Some`, the `INVOCATION_ID` environment variable is
+/// set in the spawned process's environment (systemd-compatible behaviour).
 pub async fn start_service(
     registry: ServiceRegistry,
     config: &UnitConfig,
+    invocation_id: Option<String>,
 ) -> Result<(u32, Child)> {
     let unit_name = config.unit_name.clone();
     let svc = config
@@ -94,6 +98,11 @@ pub async fn start_service(
         if let Some((key, val)) = env_str.split_once('=') {
             cmd.env(key, val);
         }
+    }
+
+    // Set INVOCATION_ID if provided (systemd compatibility).
+    if let Some(ref inv_id) = invocation_id {
+        cmd.env("INVOCATION_ID", inv_id);
     }
 
     // Spawn the child process. We deliberately do NOT wait here — the child

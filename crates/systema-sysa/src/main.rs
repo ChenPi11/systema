@@ -15,6 +15,8 @@ mod scheduler;
 mod state;
 mod unit;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
@@ -76,6 +78,11 @@ async fn main() -> Result<()> {
     // If the system D-Bus bus is not yet available (early boot, containers,
     // or after a transient outage), it retries with exponential backoff.
     tokio::spawn(dbus::run(allocator.clone()));
+
+    // Start the reconciliation loop (background task).
+    // Periodically checks desired vs actual state and enqueues jobs to
+    // resolve discrepancies.  Uses a 5-second interval.
+    scheduler::start_reconciliation_loop(allocator.clone(), Duration::from_secs(5));
 
     // Wait for the IPC server (runs until killed).
     ipc_handle.await??;

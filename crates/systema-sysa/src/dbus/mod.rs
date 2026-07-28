@@ -334,7 +334,7 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
             let iface_name = "org.freedesktop.systemd1.Unit";
             let changed: HashMap<String, OwnedValue> = HashMap::new();
             let invalidated: Vec<String> =
-                vec!["ActiveState".to_string(), "SubState".to_string()];
+                vec!["ActiveState".to_string(), "SubState".to_string(), "InvocationID".to_string()];
             match conn_for_props
                 .emit_signal(
                     None::<&str>,
