@@ -15,8 +15,8 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use libsysa::proto::{
+use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
+use sysa::proto::{
     Envelope, EventPublish, RegisterAck, RegisterUnits, StateSyncReport, TaskResult,
     UnitRegistrationAck, WorkerRegistration,
 };
@@ -26,7 +26,7 @@ use crate::state::{
     next_request_id, ActiveState, AllocatorHandle, JobCompletion, JobKind, JobResultKind,
     JobStatus, WorkerEntry, WorkerTask,
 };
-use libsysa::event_bus::{Event, EventTopic};
+use sysa::event_bus::{Event, EventTopic};
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
 pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
@@ -34,33 +34,33 @@ pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
 /// Run the IPC server — accepts System Worker & Finder connections indefinitely.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     // Ensure the socket directory exists.
-    if let Some(parent) = std::path::Path::new(libsysa::paths::instance().ipc_socket_path).parent() {
+    if let Some(parent) = std::path::Path::new(sysa::paths::instance().ipc_socket_path).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    if let Some(parent) = std::path::Path::new(libsysa::paths::instance().systema_fdpass_sock).parent() {
+    if let Some(parent) = std::path::Path::new(sysa::paths::instance().systema_fdpass_sock).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
     // Check if another allocator is already listening on the socket.
     // We try connecting first — if it succeeds, a live allocator is already
     // running and we should exit gracefully to avoid stealing its socket.
-    if let Ok(_) = tokio::net::UnixStream::connect(libsysa::paths::instance().ipc_socket_path).await {
+    if let Ok(_) = tokio::net::UnixStream::connect(sysa::paths::instance().ipc_socket_path).await {
         warn!(
             "Another allocator is already listening on {}. Exiting.",
-            libsysa::paths::instance().ipc_socket_path
+            sysa::paths::instance().ipc_socket_path
         );
         return Ok(());
     }
 
     // Remove stale socket files.
-    let _ = tokio::fs::remove_file(libsysa::paths::instance().ipc_socket_path).await;
-    let _ = tokio::fs::remove_file(libsysa::paths::instance().systema_fdpass_sock).await;
+    let _ = tokio::fs::remove_file(sysa::paths::instance().ipc_socket_path).await;
+    let _ = tokio::fs::remove_file(sysa::paths::instance().systema_fdpass_sock).await;
 
-    let listener = UnixListener::bind(libsysa::paths::instance().ipc_socket_path)?;
-    info!("IPC server listening on {}", libsysa::paths::instance().ipc_socket_path);
+    let listener = UnixListener::bind(sysa::paths::instance().ipc_socket_path)?;
+    info!("IPC server listening on {}", sysa::paths::instance().ipc_socket_path);
 
-    let fdpass_listener = UnixListener::bind(libsysa::paths::instance().systema_fdpass_sock)?;
-    info!("FD-Pass server listening on {}", libsysa::paths::instance().systema_fdpass_sock);
+    let fdpass_listener = UnixListener::bind(sysa::paths::instance().systema_fdpass_sock)?;
+    info!("FD-Pass server listening on {}", sysa::paths::instance().systema_fdpass_sock);
 
     let fdpass_map: FdPassMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -136,15 +136,15 @@ async fn handle_worker(
     // Read the first envelope to determine the connection type.
     let env = recv_envelope(&mut framed)
         .await?
-        .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::t_("Client disconnected before registration")))?;
+        .ok_or_else(|| anyhow::anyhow!(sysa::l10n::t_("Client disconnected before registration")))?;
 
     match env.method.as_str() {
         "worker.register" => handle_worker_session(framed, env, allocator).await,
         "finder.register_units" => handle_finder_register(framed, env, allocator).await,
         "finder.commit_units" => handle_finder_commit(framed, env, allocator).await,
         other => {
-            anyhow::bail!(libsysa::l10n::fmt(
-                libsysa::l10n::t_("Expected 'worker.register', 'finder.register_units', or 'finder.commit_units', got '{method}'"),
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', or 'finder.commit_units', got '{method}'"),
                 &[("method", other)],
             ))
         }
@@ -153,7 +153,7 @@ async fn handle_worker(
 
 /// Handle a System Worker connection (existing flow).
 async fn handle_worker_session(
-    mut framed: libsysa::ipc::EnvelopeFramed,
+    mut framed: sysa::ipc::EnvelopeFramed,
     env: Envelope,
     allocator: AllocatorHandle,
 ) -> Result<()> {
@@ -176,7 +176,7 @@ async fn handle_worker_session(
 
     // --- Step 3: send state.sync_request so the worker reports its snapshot ---
     {
-        use libsysa::proto::StateSyncRequest;
+        use sysa::proto::StateSyncRequest;
         let sync = StateSyncRequest {};
         let sync_env = make_envelope(
             next_request_id(),
@@ -344,7 +344,7 @@ async fn handle_worker_session(
 /// area.  The caller must issue a separate `CommitUnits` request to make
 /// them live.
 async fn handle_finder_register(
-    mut framed: libsysa::ipc::EnvelopeFramed,
+    mut framed: sysa::ipc::EnvelopeFramed,
     env: Envelope,
     allocator: AllocatorHandle,
 ) -> Result<()> {
@@ -355,8 +355,8 @@ async fn handle_finder_register(
 
     let units: std::collections::HashMap<String, systema_sysf::ir::UnitIR> =
         serde_json::from_slice(&json_bytes)
-            .map_err(|e| anyhow::anyhow!(libsysa::l10n::fmt(
-                libsysa::l10n::t_("Failed to deserialize UnitIR JSON: {error}"),
+            .map_err(|e| anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("Failed to deserialize UnitIR JSON: {error}"),
                 &[("error", &e.to_string())],
             )))?;
 
@@ -369,7 +369,7 @@ async fn handle_finder_register(
 
     let ack = UnitRegistrationAck {
         success: true,
-        message: libsysa::l10n::fmt(libsysa::l10n::t_("{count} units staged."), &[("count", &unit_count.to_string())]),
+        message: sysa::l10n::fmt(sysa::l10n::t_("{count} units staged."), &[("count", &unit_count.to_string())]),
         unit_count: unit_count as u32,
     };
     let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;
@@ -383,7 +383,7 @@ async fn handle_finder_register(
 ///
 /// Commits the currently staged units into the active unit set.
 async fn handle_finder_commit(
-    mut framed: libsysa::ipc::EnvelopeFramed,
+    mut framed: sysa::ipc::EnvelopeFramed,
     _env: Envelope,
     allocator: AllocatorHandle,
 ) -> Result<()> {
@@ -399,7 +399,7 @@ async fn handle_finder_commit(
 
     let ack = UnitRegistrationAck {
         success: true,
-        message: libsysa::l10n::fmt(libsysa::l10n::t_("{count} units committed."), &[("count", &unit_count.to_string())]),
+        message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed."), &[("count", &unit_count.to_string())]),
         unit_count: unit_count as u32,
     };
     let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;

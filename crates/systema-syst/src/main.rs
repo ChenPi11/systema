@@ -26,15 +26,15 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    libsysa::paths::init();
-    libsysa::l10n::init();
+    sysa::paths::init();
+    sysa::l10n::init();
 
     let args = {
         use clap::{CommandFactory, FromArgMatches};
         let cmd = Args::command()
-            .about(libsysa::l10n::t_("System T — System Target Worker"))
-            .mut_arg("debug", |a| a.help(libsysa::l10n::t_("Enable debug-level logging.")))
-            .mut_arg("log_level", |a| a.help(libsysa::l10n::t_("Log level (trace, debug, info, warn, error).")));
+            .about(sysa::l10n::t_("System T — System Target Worker"))
+            .mut_arg("debug", |a| a.help(sysa::l10n::t_("Enable debug-level logging.")))
+            .mut_arg("log_level", |a| a.help(sysa::l10n::t_("Log level (trace, debug, info, warn, error).")));
         Args::from_arg_matches(&cmd.get_matches())
             .unwrap_or_else(|e| e.exit())
     };

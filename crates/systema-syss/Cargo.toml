@@ -9,7 +9,7 @@ name = "systema-syss"
 path = "src/main.rs"
 
 [dependencies]
-libsysa = { path = "../libsysa" }
+sysa = { path = "../libsysa" }
 
 tokio.workspace = true
 tokio-util.workspace = true

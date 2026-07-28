@@ -19,7 +19,7 @@ use crate::state::AllocatorHandle;
 
 /// Load all unit files from the default search paths into the allocator.
 pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {
-    let paths: Vec<PathBuf> = libsysa::paths::instance().unit_search_paths
+    let paths: Vec<PathBuf> = sysa::paths::instance().unit_search_paths
         .iter()
         .map(PathBuf::from)
         .filter(|p| p.exists())
@@ -45,7 +45,7 @@ pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {
     }
 
     // Also load from generator directories
-    for dir in libsysa::paths::instance().generator_search_paths.iter() {
+    for dir in sysa::paths::instance().generator_search_paths.iter() {
         let path = PathBuf::from(dir);
         if path.exists() {
             match load_units_from_dir_recursive(&path, allocator.clone()).await {
@@ -81,7 +81,7 @@ pub async fn load_named_unit(allocator: AllocatorHandle, name: &str) -> Result<O
     }
 
     // Search in order.
-    let paths: Vec<PathBuf> = libsysa::paths::instance().unit_search_paths
+    let paths: Vec<PathBuf> = sysa::paths::instance().unit_search_paths
         .iter()
         .map(|d| Path::new(d).join(name))
         .collect();
@@ -115,7 +115,7 @@ pub async fn load_units_matching<F>(allocator: AllocatorHandle, predicate: F) ->
 where
     F: Fn(&str) -> bool,
 {
-    let paths: Vec<PathBuf> = libsysa::paths::instance().unit_search_paths
+    let paths: Vec<PathBuf> = sysa::paths::instance().unit_search_paths
         .iter()
         .map(PathBuf::from)
         .filter(|p| p.exists())
@@ -175,7 +175,7 @@ pub fn resolve_alias(allocator: &AllocatorHandle, name: &str) -> String {
 
 /// Check if a unit is masked (symlink to /dev/null).
 pub fn is_unit_masked(name: &str) -> bool {
-    for dir in libsysa::paths::instance().unit_search_paths.iter() {
+    for dir in sysa::paths::instance().unit_search_paths.iter() {
         let path = Path::new(dir).join(name);
         if path.exists() {
             // Check if it's a symlink to /dev/null

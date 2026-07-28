@@ -10,8 +10,8 @@ use super::types::{
     UnitFile, UnitKind,
 };
 use crate::ir::{
-    self, Condition, DependencySet, ExecCommand, MountConfig, ServiceConfig, SocketConfig,
-    TimerConfig, UnitIR, UnitType,
+    self, AutomountConfig, Condition, DependencySet, ExecCommand, MountConfig, ServiceConfig,
+    SocketConfig, TimerConfig, UnitIR, UnitType,
 };
 use crate::Finder;
 
@@ -54,6 +54,7 @@ fn convert_unit_file(uf: &UnitFile) -> UnitIR {
         dependencies: convert_dependencies(uf),
         service: uf.service.as_ref().map(convert_service),
         mount: uf.mount.as_ref().map(convert_mount),
+        automount: uf.automount.as_ref().map(convert_automount),
         timer: uf.timer.as_ref().map(convert_timer),
         socket: uf.socket.as_ref().map(convert_socket),
         conditions: convert_conditions(uf),
@@ -68,6 +69,7 @@ fn convert_unit_kind(kind: &UnitKind) -> UnitType {
         UnitKind::Service => UnitType::Service,
         UnitKind::Target => UnitType::Target,
         UnitKind::Mount => UnitType::Mount,
+        UnitKind::Automount => UnitType::Automount,
         UnitKind::Timer => UnitType::Timer,
         UnitKind::Socket => UnitType::Socket,
         UnitKind::Slice => UnitType::Slice,
@@ -140,6 +142,15 @@ fn convert_service(svc: &ServiceSection) -> ServiceConfig {
         watchdog_sec: svc.watchdog_sec,
         kill_signal: svc.kill_signal.clone(),
         kill_mode: svc.kill_mode.clone(),
+    }
+}
+
+fn convert_automount(amt: &super::types::AutomountSection) -> AutomountConfig {
+    AutomountConfig {
+        where_: amt.where_.clone(),
+        extra_options: amt.extra_options.clone(),
+        timeout_idle_sec: amt.timeout_idle_sec,
+        directory_mode: amt.directory_mode.clone(),
     }
 }
 

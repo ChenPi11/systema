@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::AbortHandle;
 
-use libsysa::event_bus::EventBus;
+use sysa::event_bus::EventBus;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock as TokioRwLock;

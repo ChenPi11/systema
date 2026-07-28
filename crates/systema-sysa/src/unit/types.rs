@@ -11,6 +11,7 @@ pub enum UnitKind {
     Service,
     Target,
     Mount,
+    Automount,
     Timer,
     Socket,
     Slice,
@@ -28,6 +29,7 @@ impl UnitKind {
             "service" => UnitKind::Service,
             "target" => UnitKind::Target,
             "mount" => UnitKind::Mount,
+            "automount" => UnitKind::Automount,
             "timer" => UnitKind::Timer,
             "socket" => UnitKind::Socket,
             "slice" => UnitKind::Slice,
@@ -45,6 +47,7 @@ impl UnitKind {
             UnitKind::Service => "service",
             UnitKind::Target => "target",
             UnitKind::Mount => "mount",
+            UnitKind::Automount => "automount",
             UnitKind::Timer => "timer",
             UnitKind::Socket => "socket",
             UnitKind::Slice => "slice",
@@ -493,6 +496,8 @@ pub struct UnitFile {
     pub service: Option<ServiceSection>,
     /// Present only for mount units.
     pub mount: Option<MountSection>,
+    /// Present only for automount units.
+    pub automount: Option<AutomountSection>,
     /// Present only for timer units.
     pub timer: Option<TimerSection>,
     /// Present only for socket units.
@@ -520,6 +525,7 @@ impl UnitFile {
             install: InstallSection::default(),
             service: None,
             mount: None,
+            automount: None,
             timer: None,
             socket: None,
             swap: None,
@@ -556,6 +562,23 @@ pub struct MountSection {
     pub directory_mode: String,
     /// Ignore unknown mount options (`SloppyOptions=`).
     pub sloppy_options: bool,
+}
+
+// ---------------------------------------------------------------------------
+// [Automount] section
+// ---------------------------------------------------------------------------
+
+/// `[Automount]` section for `.automount` units.
+#[derive(Debug, Clone, Default)]
+pub struct AutomountSection {
+    /// Mount point path (`Where=`).
+    pub where_: String,
+    /// Extra mount options passed to the autofs mount (`ExtraOptions=`).
+    pub extra_options: String,
+    /// Idle timeout in seconds after which the mount is unmounted (`TimeoutIdleSec=`).
+    pub timeout_idle_sec: u32,
+    /// Permission mode for the mount point directory (`DirectoryMode=`).
+    pub directory_mode: String,
 }
 
 // ---------------------------------------------------------------------------

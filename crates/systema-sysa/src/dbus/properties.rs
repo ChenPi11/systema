@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use async_trait::async_trait;
-use libsysa::l10n;
+use sysa::l10n;
 use zbus::object_server::{DispatchResult, Interface, SignalContext};
 use zbus::names::InterfaceName;
 use zbus::{Connection, ObjectServer, fdo};

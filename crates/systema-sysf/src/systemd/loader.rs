@@ -16,11 +16,11 @@ pub fn is_known_extension(name: &str) -> bool {
 /// Discover and parse all systemd unit files from standard search paths.
 pub fn discover_all() -> Result<Vec<UnitFile>> {
     let mut units = Vec::new();
-    for dir in libsysa::paths::instance().unit_search_paths.iter() {
+    for dir in sysa::paths::instance().unit_search_paths.iter() {
         let path = Path::new(dir);
         if path.exists() {
             load_units_from_dir_recursive(path, &mut units)
-                .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Scanning {dir} ..."), &[("dir", &dir.to_string())]))?;
+                .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Scanning {dir} ..."), &[("dir", &dir.to_string())]))?;
         }
     }
     info!("Systemd finder discovered {} unit(s)", units.len());
@@ -29,7 +29,7 @@ pub fn discover_all() -> Result<Vec<UnitFile>> {
 
 /// Find and parse a single named unit file from standard search paths.
 pub fn discover_one(name: &str) -> Result<Option<UnitFile>> {
-    for dir in libsysa::paths::instance().unit_search_paths.iter() {
+    for dir in sysa::paths::instance().unit_search_paths.iter() {
         let path = Path::new(dir).join(name);
         if path.exists() {
             match parse_unit_from_path(&path) {

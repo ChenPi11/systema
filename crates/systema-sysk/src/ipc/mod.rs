@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
-use libsysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use libsysa::proto::{
+use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
+use sysa::proto::{
     Envelope, RegisterAck, StateSyncReport, SyncUnitState, TaskDispatch, TaskKind,
     TaskResult, TaskResultKind, UnitConfig, WorkerRegistration,
 };
@@ -19,7 +19,7 @@ const WORKER_UNIT_TYPES: &[&str] = &["socket"];
 /// Encode an [`Envelope`] into a length-delimited frame.
 fn encode_envelope(env: Envelope) -> Result<bytes::Bytes> {
     let mut buf = BytesMut::new();
-    env.encode(&mut buf).context(libsysa::l10n::t_("Failed to encode Envelope."))?;
+    env.encode(&mut buf).context(sysa::l10n::t_("Failed to encode Envelope."))?;
     Ok(buf.freeze())
 }
 
@@ -44,16 +44,16 @@ pub async fn run() -> Result<()> {
 }
 
 async fn try_run(socket_manager: SocketManager) -> Result<()> {
-    info!("Connecting to System A at {}", libsysa::paths::instance().ipc_socket_path);
+    info!("Connecting to System A at {}", sysa::paths::instance().ipc_socket_path);
 
-    let stream = tokio::net::UnixStream::connect(libsysa::paths::instance().ipc_socket_path)
+    let stream = tokio::net::UnixStream::connect(sysa::paths::instance().ipc_socket_path)
         .await
-        .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Cannot connect to {path}."), &[("path", &libsysa::paths::instance().ipc_socket_path.to_string())]))?;
+        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Cannot connect to {path}."), &[("path", &sysa::paths::instance().ipc_socket_path.to_string())]))?;
 
     info!("Connected to System A");
 
     // --- Connect to fd-pass channel ---
-    let fdpass_stream = match tokio::net::UnixStream::connect(libsysa::paths::instance().systema_fdpass_sock).await {
+    let fdpass_stream = match tokio::net::UnixStream::connect(sysa::paths::instance().systema_fdpass_sock).await {
         Ok(s) => {
             // Identify ourselves by sending worker_id via raw write.
             use tokio::io::AsyncWriteExt;
@@ -65,7 +65,7 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
             Some(s_ref)
         }
         Err(e) => {
-            warn!("Cannot connect to fdpass socket ({}): {}", libsysa::paths::instance().systema_fdpass_sock, e);
+            warn!("Cannot connect to fdpass socket ({}): {}", sysa::paths::instance().systema_fdpass_sock, e);
             None
         }
     };
@@ -83,10 +83,10 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
     // Wait for ack.
     let ack_env = recv_envelope(&mut framed)
         .await?
-        .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::t_("System A closed connection before ack.")))?;
+        .ok_or_else(|| anyhow::anyhow!(sysa::l10n::t_("System A closed connection before ack.")))?;
     let ack = RegisterAck::decode(ack_env.payload.as_slice())?;
     if !ack.accepted {
-        anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Registration rejected: {message}."), &[("message", &ack.message.to_string())]));
+        anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("Registration rejected: {message}."), &[("message", &ack.message.to_string())]));
     }
     info!("Registration accepted: {}", ack.message);
 
@@ -111,7 +111,7 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
         async move {
             use futures::SinkExt;
             while let Some(msg) = out_rx.recv().await {
-                writer.send(msg).await.context(libsysa::l10n::t_("Write to System A socket."))?;
+                writer.send(msg).await.context(sysa::l10n::t_("Write to System A socket."))?;
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -238,7 +238,7 @@ async fn try_run(socket_manager: SocketManager) -> Result<()> {
                             ) {
                                 info!("Sending fd for '{}' via SCM_RIGHTS", unit_name);
                                 if let Err(e) =
-                                    libsysa::ipc::send_fd(fdpass, fd).await
+                                    sysa::ipc::send_fd(fdpass, fd).await
                                 {
                                     warn!("Failed to send fd: {}", e);
                                 }
@@ -284,10 +284,10 @@ async fn execute_task(
             let config = if !task.unit_config.is_empty() {
                 let uc = UnitConfig::decode(task.unit_config.as_slice())?;
                 uc.socket.ok_or_else(|| {
-                    anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("No SocketConfig in unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]))
+                    anyhow::anyhow!(sysa::l10n::fmt(sysa::l10n::t_("No SocketConfig in unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]))
                 })?
             } else {
-                anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Empty unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]));
+                anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("Empty unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]));
             };
 
             socket::start_socket(socket_manager, &task.unit_name, &config)?;
@@ -310,10 +310,10 @@ async fn execute_task(
             let config = if !task.unit_config.is_empty() {
                 let uc = UnitConfig::decode(task.unit_config.as_slice())?;
                 uc.socket.ok_or_else(|| {
-                    anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("No SocketConfig in unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]))
+                    anyhow::anyhow!(sysa::l10n::fmt(sysa::l10n::t_("No SocketConfig in unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]))
                 })?
             } else {
-                anyhow::bail!(libsysa::l10n::fmt(libsysa::l10n::t_("Empty unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]));
+                anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("Empty unit config for '{unit_name}'."), &[("unit_name", &task.unit_name.to_string())]));
             };
             socket::start_socket(socket_manager, &task.unit_name, &config)?;
             if config.accept {

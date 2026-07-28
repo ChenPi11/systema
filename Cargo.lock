@@ -686,25 +686,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "libsysa"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "futures",
- "gettext-rs",
- "libc",
- "prost",
- "prost-build",
- "prost-types",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1285,6 +1266,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "gettext-rs",
+ "libc",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "systema-sysa"
 version = "0.1.0"
 dependencies = [
@@ -1294,13 +1294,13 @@ dependencies = [
  "clap",
  "configparser",
  "futures",
- "libsysa",
  "once_cell",
  "parking_lot",
  "petgraph 0.6.5",
  "prost",
  "serde",
  "serde_json",
+ "sysa",
  "systema-sysf",
  "thiserror",
  "tokio",
@@ -1320,10 +1320,10 @@ dependencies = [
  "async-trait",
  "clap",
  "configparser",
- "libsysa",
  "prost",
  "serde",
  "serde_json",
+ "sysa",
  "thiserror",
  "tokio",
  "tracing",
@@ -1339,9 +1339,52 @@ dependencies = [
  "clap",
  "futures",
  "libc",
- "libsysa",
  "parking_lot",
  "prost",
+ "sysa",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "systema-sysm-linux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "futures",
+ "libc",
+ "parking_lot",
+ "prost",
+ "serde",
+ "serde_json",
+ "sysa",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "systema-sysm-unix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "futures",
+ "parking_lot",
+ "prost",
+ "serde",
+ "serde_json",
+ "sysa",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1357,12 +1400,12 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "libsysa",
  "nix",
  "parking_lot",
  "prost",
  "serde",
  "serde_json",
+ "sysa",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1378,9 +1421,9 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "libsysa",
  "parking_lot",
  "prost",
+ "sysa",
  "tokio",
  "tokio-util",
  "tracing",

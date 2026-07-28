@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use libsysa::event_bus::{Event, EventSubscriber, EventTopic};
+use sysa::event_bus::{Event, EventSubscriber, EventTopic};
 use tracing::info;
 
 use crate::scheduler::{schedule_automatic_restart, should_restart_service};

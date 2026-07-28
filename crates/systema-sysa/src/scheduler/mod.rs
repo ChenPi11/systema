@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use libsysa::l10n;
+use sysa::l10n;
 use prost::Message;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
@@ -19,7 +19,10 @@ use crate::state::{
     JobResultKind, JobStatus, StartLimitState, UnitRuntimeInfo, WorkerTask,
 };
 use crate::unit::types::{ExitKind, RestartPolicy, StartLimitAction, UnitFile, UnitSection};
-use libsysa::proto::{ServiceConfig, SocketAddress, SocketConfig, TaskDispatch, TaskKind, UnitConfig};
+use sysa::proto::{
+    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, TaskDispatch,
+    TaskKind, UnitConfig,
+};
 
 /// Enqueue a start job for the named unit, expanding dependencies.
 /// Returns the primary job ID.
@@ -1152,11 +1155,32 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
         }
     });
 
+    let mount = uf.mount.as_ref().map(|m| MountConfig {
+        what: m.what.clone(),
+        r#where: m.where_.clone(),
+        r#type: m.type_.clone(),
+        options: m.options.clone(),
+        timeout_sec: m.timeout_sec,
+        lazy_unmount: m.lazy_unmount,
+        force_unmount: m.force_unmount,
+        directory_mode: m.directory_mode.clone(),
+        sloppy_options: m.sloppy_options,
+    });
+
+    let automount = uf.automount.as_ref().map(|a| AutomountConfig {
+        r#where: a.where_.clone(),
+        extra_options: a.extra_options.clone(),
+        timeout_idle_sec: a.timeout_idle_sec,
+        directory_mode: a.directory_mode.clone(),
+    });
+
     UnitConfig {
         unit_name: uf.name.clone(),
         description: uf.unit.description.clone(),
         service,
         socket,
+        mount,
+        automount,
     }
 }
 
@@ -1583,7 +1607,7 @@ fn is_on_ac_power() -> bool {
 /// Returns `true` if this appears to be the first boot of the system.
 /// Heuristic: `/run/systemd/first-boot` or `/run/machine-id` does not exist.
 fn is_first_boot() -> bool {
-    std::path::Path::new(libsysa::paths::instance().systemd_first_boot_file).exists()
+    std::path::Path::new(sysa::paths::instance().systemd_first_boot_file).exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -2073,7 +2097,7 @@ mod tests {
 
     #[test]
     fn test_task_kind_to_proto() {
-        use libsysa::proto::TaskKind;
+        use sysa::proto::TaskKind;
         assert_eq!(task_kind_to_proto(JobKind::Start), TaskKind::Start);
         assert_eq!(task_kind_to_proto(JobKind::Stop), TaskKind::Stop);
         assert_eq!(task_kind_to_proto(JobKind::Restart), TaskKind::Restart);

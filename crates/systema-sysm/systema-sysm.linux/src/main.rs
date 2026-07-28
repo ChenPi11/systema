@@ -1,13 +1,7 @@
-//! system-s — System Service Worker
-//!
-//! The service execution worker for System Alphabet. Responsibilities:
-//! - Connect to System A's IPC socket and register as the "service" worker.
-//! - Receive `TaskDispatch` messages from System A.
-//! - Execute service processes (fork/exec), track their lifecycle.
-//! - Report `TaskResult` and publish `EventPublish` messages back to System A.
-
+mod automount;
 mod ipc;
-mod process;
+mod mount;
+mod mountinfo;
 mod state;
 
 use anyhow::Result;
@@ -16,7 +10,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "systema-syss", about = "System S — System Service Worker")]
+#[command(name = "systema-sysm", about = "System M — System Mount Worker (Linux)")]
 struct Args {
     #[arg(long, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
@@ -33,7 +27,7 @@ async fn main() -> Result<()> {
     let args = {
         use clap::{CommandFactory, FromArgMatches};
         let cmd = Args::command()
-            .about(sysa::l10n::t_("System S — System Service Worker"))
+            .about(sysa::l10n::t_("System M — System Mount Worker (Linux)"))
             .mut_arg("debug", |a| a.help(sysa::l10n::t_("Enable debug-level logging.")))
             .mut_arg("log_level", |a| a.help(sysa::l10n::t_("Log level (trace, debug, info, warn, error).")));
         Args::from_arg_matches(&cmd.get_matches())
@@ -44,7 +38,7 @@ async fn main() -> Result<()> {
         .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
 
-    info!("System S (System Service Worker) starting up");
+    info!("System M (System Mount Worker for Linux) starting up");
 
     ipc::run().await?;
 

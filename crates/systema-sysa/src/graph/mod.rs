@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use libsysa::l10n;
+use sysa::l10n;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;

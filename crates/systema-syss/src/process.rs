@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-use libsysa::proto::UnitConfig;
+use sysa::proto::UnitConfig;
 
 use crate::state::{ServiceInstance, ServiceRegistry, ServiceState};
 
@@ -46,10 +46,10 @@ pub async fn start_service(
     let svc = config
         .service
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("No [Service] config for {unit_name}."), &[("unit_name", &unit_name)])))?;
+        .ok_or_else(|| anyhow::anyhow!(sysa::l10n::fmt(sysa::l10n::t_("No [Service] config for {unit_name}."), &[("unit_name", &unit_name)])))?;
 
     if svc.exec_start.is_empty() {
-        bail!(libsysa::l10n::fmt(libsysa::l10n::t_("ExecStart is empty for {unit_name}."), &[("unit_name", &unit_name)]));
+        bail!(sysa::l10n::fmt(sysa::l10n::t_("ExecStart is empty for {unit_name}."), &[("unit_name", &unit_name)]));
     }
 
     // Parse the ExecStart command line (prefixes, word splitting, % specifiers).
@@ -79,7 +79,7 @@ pub async fn start_service(
     let mut cmd = if parsed.flags.via_shell {
         // | prefix: route through sh -c
         let joined = build_shell_command_line(&parsed.program, &final_args);
-        let mut c = Command::new(libsysa::paths::instance().systema_shell_path);
+        let mut c = Command::new(sysa::paths::instance().systema_shell_path);
         c.arg("-c");
         c.arg(&joined);
         c
@@ -109,11 +109,11 @@ pub async fn start_service(
     // is monitored asynchronously via `monitor_child`.
     let child = cmd
         .spawn()
-        .with_context(|| libsysa::l10n::fmt(libsysa::l10n::t_("Failed to spawn {program}."), &[("program", &parsed.program)]))?;
+        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to spawn {program}."), &[("program", &parsed.program)]))?;
 
     let pid = child
         .id()
-        .ok_or_else(|| anyhow::anyhow!(libsysa::l10n::fmt(libsysa::l10n::t_("Failed to get PID for {unit_name}."), &[("unit_name", &unit_name)])))?;
+        .ok_or_else(|| anyhow::anyhow!(sysa::l10n::fmt(sysa::l10n::t_("Failed to get PID for {unit_name}."), &[("unit_name", &unit_name)])))?;
 
     info!("Service {} started, PID={}", unit_name, pid);
 
@@ -262,7 +262,7 @@ struct ParsedExec {
 fn parse_exec_start(raw: &str, unit_name: &str) -> Result<ParsedExec> {
     let raw = raw.trim();
     if raw.is_empty() {
-        bail!(libsysa::l10n::t_("Empty ExecStart command."));
+        bail!(sysa::l10n::t_("Empty ExecStart command."));
     }
 
     let (flags, rest) = strip_prefixes(raw);
@@ -270,7 +270,7 @@ fn parse_exec_start(raw: &str, unit_name: &str) -> Result<ParsedExec> {
     // Split the remainder into words (respects quotes, C-escapes).
     let words = split_words(rest);
     if words.is_empty() {
-        bail!(libsysa::l10n::t_("Empty ExecStart command after prefix stripping."));
+        bail!(sysa::l10n::t_("Empty ExecStart command after prefix stripping."));
     }
 
     // Expand % specifiers in each word.
@@ -282,7 +282,7 @@ fn parse_exec_start(raw: &str, unit_name: &str) -> Result<ParsedExec> {
     if flags.custom_argv0 {
         // @ prefix: first word is argv[0], second word is the program.
         if words.len() < 2 {
-            bail!(libsysa::l10n::t_("@ prefix requires at least two tokens (argv0 program)."));
+            bail!(sysa::l10n::t_("@ prefix requires at least two tokens (argv0 program)."));
         }
         // We don't have a way to set argv[0] natively in tokio::process::Command,
         // so we just use the program as-is and note the custom argv0 in the log.
@@ -540,7 +540,7 @@ fn expand_specifiers(s: &str, name: &str) -> String {
             .unwrap_or_default()
     };
     let machine_id = || {
-        std::fs::read_to_string(libsysa::paths::instance().systemd_machine_id_file)
+        std::fs::read_to_string(sysa::paths::instance().systemd_machine_id_file)
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     };

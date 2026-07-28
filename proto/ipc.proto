@@ -157,6 +157,40 @@ message SocketAddress {
     string fifo = 4;
 }
 
+// Configuration for a .mount unit, sent inside UnitConfig.
+message MountConfig {
+    // Device or remote filesystem to mount (What=).
+    string what = 1;
+    // Mount point path (Where=).
+    string where = 2;
+    // Filesystem type, e.g. "ext4", "nfs" (Type=).
+    string type = 3;
+    // Mount options passed to mount(8) (Options=).
+    string options = 4;
+    // Time to wait for the mount operation in seconds (TimeoutSec=).
+    uint32 timeout_sec = 5;
+    // Unmount lazily (LazyUnmount=).
+    bool lazy_unmount = 6;
+    // Force unmount even if busy (ForceUnmount=).
+    bool force_unmount = 7;
+    // Permission mode for the mount point directory (DirectoryMode=).
+    string directory_mode = 8;
+    // Ignore unknown mount options (SloppyOptions=).
+    bool sloppy_options = 9;
+}
+
+// Configuration for a .automount unit, sent inside UnitConfig.
+message AutomountConfig {
+    // Mount point path (Where=).
+    string where = 1;
+    // Extra mount options passed to the autofs mount (ExtraOptions=).
+    string extra_options = 2;
+    // Idle timeout in seconds after which the mount is unmounted (TimeoutIdleSec=).
+    uint32 timeout_idle_sec = 3;
+    // Permission mode for the mount point directory (DirectoryMode=).
+    string directory_mode = 4;
+}
+
 // Minimal unit configuration sent from System A to System Workers.
 message UnitConfig {
     string unit_name = 1;
@@ -165,6 +199,10 @@ message UnitConfig {
     ServiceConfig service = 3;
     // For socket units.
     SocketConfig socket = 4;
+    // For mount units.
+    MountConfig mount = 5;
+    // For automount units.
+    AutomountConfig automount = 6;
 }
 
 message ServiceConfig {

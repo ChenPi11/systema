@@ -6,6 +6,8 @@ members = [
     "crates/systema-syss",
     "crates/systema-syst",
     "crates/systema-sysk",
+    "crates/systema-sysm/systema-sysm.unix",
+    "crates/systema-sysm/systema-sysm.linux",
 ]
 resolver = "2"
 

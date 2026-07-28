@@ -4,7 +4,7 @@
 //! `systemd` so that tools like `systemctl` can talk to us.
 
 use anyhow::Result;
-use libsysa::l10n;
+use sysa::l10n;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -504,7 +504,7 @@ impl ManagerInterface {
             Ok(file_state.to_string())
         } else {
             // Unit not loaded — try to find it on disk without loading it fully.
-            for dir in libsysa::paths::instance().unit_search_paths.iter() {
+            for dir in sysa::paths::instance().unit_search_paths.iter() {
                 let path = std::path::Path::new(dir).join(name);
                 if path.exists() {
                     // File exists but isn't loaded; report as "static".
@@ -813,7 +813,7 @@ impl ManagerInterface {
 
     #[zbus(property)]
     fn unit_path(&self) -> Vec<String> {
-        libsysa::paths::instance().unit_search_paths
+        sysa::paths::instance().unit_search_paths
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -944,7 +944,7 @@ pub(super) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<
     use crate::unit::parser::parse_unit;
 
     // Check all search paths.
-    for dir in libsysa::paths::instance().unit_search_paths.iter() {
+    for dir in sysa::paths::instance().unit_search_paths.iter() {
         let path = std::path::Path::new(dir).join(name);
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
@@ -958,8 +958,8 @@ pub(super) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<
             return Ok(());
         }
     }
-    anyhow::bail!(libsysa::l10n::fmt(
-        libsysa::l10n::t_("Unit not found: {name}"),
+    anyhow::bail!(sysa::l10n::fmt(
+        sysa::l10n::t_("Unit not found: {name}"),
         &[("name", name)],
     ))
 }
@@ -1048,7 +1048,7 @@ where
             let file_state = unit_file_state(&unit.install);
             if predicate(name, file_state) {
                 Some((
-                    format!("{}/{}", libsysa::paths::instance().systemd_lib_unit_dir, name),
+                    format!("{}/{}", sysa::paths::instance().systemd_lib_unit_dir, name),
                     file_state.to_string(),
                 ))
             } else {

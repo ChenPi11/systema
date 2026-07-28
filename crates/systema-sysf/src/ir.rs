@@ -8,6 +8,7 @@ pub enum UnitType {
     Service,
     Target,
     Mount,
+    Automount,
     Timer,
     Socket,
     Slice,
@@ -25,6 +26,7 @@ impl UnitType {
             UnitType::Service => "service",
             UnitType::Target => "target",
             UnitType::Mount => "mount",
+            UnitType::Automount => "automount",
             UnitType::Timer => "timer",
             UnitType::Socket => "socket",
             UnitType::Slice => "slice",
@@ -142,6 +144,15 @@ pub struct MountConfig {
     pub timeout_sec: u32,
 }
 
+/// Automount-specific configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutomountConfig {
+    pub where_: String,
+    pub extra_options: String,
+    pub timeout_idle_sec: u32,
+    pub directory_mode: String,
+}
+
 /// Timer-specific configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TimerConfig {
@@ -193,6 +204,7 @@ pub struct UnitIR {
     // Optional section-specific configs.
     pub service: Option<ServiceConfig>,
     pub mount: Option<MountConfig>,
+    pub automount: Option<AutomountConfig>,
     pub timer: Option<TimerConfig>,
     pub socket: Option<SocketConfig>,
 
