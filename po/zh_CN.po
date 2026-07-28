@@ -1,0 +1,341 @@
+# Chinese translations for systema package
+# systema 软件包的简体中文翻译.
+# Copyright (C) 2026 System Alphabet
+# This file is distributed under the same license as the systema package.
+# ChenPi11 <wushengwuxi-msctinoulk@outlook.com>, 2026.
+#
+msgid   ""
+msgstr  "Project-Id-Version: systema 0.0.1\n"
+        "Report-Msgid-Bugs-To: https://github.com/system-alphabet/systema/issues\n"
+        "POT-Creation-Date: 2026-07-27 13:48+0800\n"
+        "PO-Revision-Date: 2026-07-27 12:25+0800\n"
+        "Last-Translator: ChenPi11 <wushengwuxi-msctinoulk@outlook.com>\n"
+        "Language-Team: none\n"
+        "Language: zh_CN\n"
+        "MIME-Version: 1.0\n"
+        "Content-Type: text/plain; charset=UTF-8\n"
+        "Content-Transfer-Encoding: 8bit\n"
+#
+# File: ../crates/libsysa/src/ipc.rs, line: 28
+# File: ../crates/systema-syss/src/ipc/mod.rs, line: 45
+# File: ../crates/systema-syst/src/ipc/mod.rs, line: 35
+# File: ../crates/systema-sysk/src/ipc/mod.rs, line: 22
+msgid   "Failed to encode Envelope."
+msgstr  "Envelope 编码失败。"
+#
+# File: ../crates/libsysa/src/ipc.rs, line: 32
+msgid   "Failed to send Envelope frame."
+msgstr  "发送 Envelope 帧失败。"
+#
+# File: ../crates/libsysa/src/ipc.rs, line: 42
+msgid   "Frame receive error."
+msgstr  "帧接收错误。"
+#
+# File: ../crates/libsysa/src/ipc.rs, line: 43
+msgid   "Failed to decode Envelope."
+msgstr  "Envelope 解码失败。"
+#
+# File: ../crates/libsysa/src/ipc.rs, line: 60
+msgid   "Failed to encode payload."
+msgstr  "载荷编码失败。"
+#
+# File: ../crates/libsysa/src/ipc.rs, line: 82
+msgid   "SCM_RIGHTS send task panicked."
+msgstr  "SCM_RIGHTS 发送任务发生 panic。"
+#
+# File: ../crates/libsysa/src/ipc.rs, line: 93
+msgid   "SCM_RIGHTS recv task panicked."
+msgstr  "SCM_RIGHTS 接收任务发生 panic。"
+#
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 165
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 204
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 396
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 442
+#, rust-format
+msgid   "Bad arguments: {e}."
+msgstr  "参数错误：{e}。"
+#
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 185
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 424
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 450
+#, rust-format
+msgid   "Unknown interface '{iface_name}'."
+msgstr  "未知接口 '{iface_name}'。"
+#
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 248
+# File: ../crates/systema-sysa/src/dbus/properties.rs, line: 471
+#, rust-format
+msgid   "Unknown property '{prop_name}'."
+msgstr  "未知属性 '{prop_name}'。"
+#
+# File: ../crates/systema-sysa/src/dbus/manager.rs, line: 146
+#, rust-format
+msgid   "Unit {name} is not loaded."
+msgstr  "Unit {name} 未加载。"
+#
+# File: ../crates/systema-sysa/src/dbus/manager.rs, line: 510
+#, rust-format
+msgid   "Unit file {name} not found."
+msgstr  "未找到 unit 文件 {name}。"
+#
+# File: ../crates/systema-sysa/src/graph/mod.rs, line: 232
+#, rust-format
+msgid   "Dependency cycle detected involving unit: {unit} (unable to break)."
+msgstr  "检测到涉及 unit {unit} 的依赖循环（无法打破）。"
+#
+# File: ../crates/systema-sysa/src/graph/mod.rs, line: 242
+#, rust-format
+msgid   "Unable to resolve dependency cycles after removing {count} edges."
+msgstr  "移除 {count} 条边后仍无法解决依赖循环。"
+#
+# File: ../crates/systema-sysa/src/ipc/server.rs, line: 376
+#, rust-format
+msgid   "{count} units staged."
+msgstr  "已暂存 {count} 个 unit。"
+#
+# File: ../crates/systema-sysa/src/ipc/server.rs, line: 406
+#, rust-format
+msgid   "{count} units committed."
+msgstr  "已提交 {count} 个 unit。"
+#
+# File: ../crates/systema-sysa/src/scheduler/mod.rs, line: 66
+#, rust-format
+msgid   "No worker available for unit type '{unit_type}' (unit: {unit_name}). Cannot execute {kind:?} operation. Is the corresponding System Worker running?"
+msgstr  "没有可用于 unit 类型 '{unit_type}' 的工作进程（unit：{unit_name}）。无法执行 {kind:?} 操作。相应的 System Worker 是否正在运行？"
+#
+# File: ../crates/systema-sysa/src/scheduler/mod.rs, line: 268
+#, rust-format
+msgid   "Job already exists for unit {unit_name} (kind={kind:?}, id={existing_id})."
+msgstr  "unit {unit_name} 的作业已存在（kind={kind:?}，id={existing_id}）。"
+#
+# File: ../crates/systema-sysa/src/scheduler/mod.rs, line: 426
+#, rust-format
+msgid   "No worker registered for unit type '{unit_type}' (unit: {unit_name}). Cannot process dependency chain for '{name}'."
+msgstr  "没有为 unit 类型 '{unit_type}' 注册的工作进程（unit：{unit_name}）。无法处理 '{name}' 的依赖链。"
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 40
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 39
+#, rust-format
+msgid   "Reading unit file {path} ..."
+msgstr  "正在读取 unit 文件 {path} ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 59
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 55
+#, rust-format
+msgid   "Reading drop-in dir {dir} ..."
+msgstr  "正在读取 drop-in 目录 {dir} ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 261
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 248
+#, rust-format
+msgid   "Parsing [Unit] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Unit] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 268
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 252
+#, rust-format
+msgid   "Parsing [Install] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Install] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 278
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 259
+#, rust-format
+msgid   "Parsing [Service] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Service] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 290
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 268
+#, rust-format
+msgid   "Parsing [Mount] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Mount] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 299
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 274
+#, rust-format
+msgid   "Parsing [Timer] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Timer] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 308
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 280
+#, rust-format
+msgid   "Parsing [Socket] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Socket] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 317
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 286
+#, rust-format
+msgid   "Parsing [Swap] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Swap] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 326
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 292
+#, rust-format
+msgid   "Parsing [Path] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Path] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 335
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 298
+#, rust-format
+msgid   "Parsing [Slice] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Slice] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 344
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 304
+#, rust-format
+msgid   "Parsing [Scope] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Scope] 节 ..."
+#
+# File: ../crates/systema-sysa/src/unit/parser.rs, line: 353
+# File: ../crates/systema-sysf/src/systemd/parser.rs, line: 310
+#, rust-format
+msgid   "Parsing [Device] section of {name} ..."
+msgstr  "正在解析 {name} 的 [Device] 节 ..."
+#
+# File: ../crates/systema-sysa/src/main.rs, line: 38
+msgid   "System A — System Allocator"
+msgstr  "System A — 系统分配器"
+#
+# File: ../crates/systema-sysa/src/main.rs, line: 39
+# File: ../crates/systema-syss/src/main.rs, line: 34
+# File: ../crates/systema-syst/src/main.rs, line: 33
+# File: ../crates/systema-sysk/src/main.rs, line: 25
+# File: ../crates/systema-sysf/src/main.rs, line: 47
+msgid   "Enable debug-level logging."
+msgstr  "启用调试级别日志记录。"
+#
+# File: ../crates/systema-sysa/src/main.rs, line: 40
+# File: ../crates/systema-syss/src/main.rs, line: 35
+# File: ../crates/systema-syst/src/main.rs, line: 34
+# File: ../crates/systema-sysk/src/main.rs, line: 26
+# File: ../crates/systema-sysf/src/main.rs, line: 48
+msgid   "Log level (trace, debug, info, warn, error)."
+msgstr  "日志级别（trace、debug、info、warn、error）。"
+#
+# File: ../crates/systema-syss/src/ipc/mod.rs, line: 101
+# File: ../crates/systema-syst/src/ipc/mod.rs, line: 72
+# File: ../crates/systema-sysk/src/ipc/mod.rs, line: 51
+#, rust-format
+msgid   "Cannot connect to {path}."
+msgstr  "无法连接到 {path}。"
+#
+# File: ../crates/systema-syss/src/ipc/mod.rs, line: 151
+# File: ../crates/systema-syst/src/ipc/mod.rs, line: 117
+# File: ../crates/systema-sysk/src/ipc/mod.rs, line: 114
+msgid   "Write to System A socket."
+msgstr  "写入 System A 套接字。"
+#
+# File: ../crates/systema-syss/src/ipc/mod.rs, line: 395
+msgid   "Failed to send SIGHUP."
+msgstr  "发送 SIGHUP 失败。"
+#
+# File: ../crates/systema-syss/src/process.rs, line: 48
+#, rust-format
+msgid   "ExecStart is empty for {unit_name}."
+msgstr  "{unit_name} 的 ExecStart 为空。"
+#
+# File: ../crates/systema-syss/src/process.rs, line: 103
+#, rust-format
+msgid   "Failed to spawn {program}."
+msgstr  "启动 {program} 失败。"
+#
+# File: ../crates/systema-syss/src/process.rs, line: 256
+msgid   "Empty ExecStart command."
+msgstr  "ExecStart 命令为空。"
+#
+# File: ../crates/systema-syss/src/process.rs, line: 264
+msgid   "Empty ExecStart command after prefix stripping."
+msgstr  "去除前缀后 ExecStart 命令为空。"
+#
+# File: ../crates/systema-syss/src/process.rs, line: 276
+msgid   "@ prefix requires at least two tokens (argv0 program)."
+msgstr  "@ 前缀需要至少两个标记（argv0 程序）。"
+#
+# File: ../crates/systema-syss/src/main.rs, line: 33
+msgid   "System S — System Service Worker"
+msgstr  "System S — 系统服务工作进程"
+#
+# File: ../crates/systema-syst/src/main.rs, line: 32
+msgid   "System T — System Target Worker"
+msgstr  "System T — 系统目标工作进程"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 55
+#, rust-format
+msgid   "Failed to bind ListenStream '{addr_stream}'."
+msgstr  "绑定 ListenStream '{addr_stream}' 失败。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 60
+#, rust-format
+msgid   "Failed to bind ListenDatagram '{addr_datagram}'."
+msgstr  "绑定 ListenDatagram '{addr_datagram}' 失败。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 65
+#, rust-format
+msgid   "Failed to bind ListenSequentialPacket '{addr_sequential_packet}'."
+msgstr  "绑定 ListenSequentialPacket '{addr_sequential_packet}' 失败。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 70
+#, rust-format
+msgid   "Failed to create FIFO '{addr_fifo}'."
+msgstr  "创建 FIFO '{addr_fifo}' 失败。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 176
+#, rust-format
+msgid   "Cannot parse TCP address '{address}'."
+msgstr  "无法解析 TCP 地址 '{address}'。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 186
+#, rust-format
+msgid   "Cannot bind Unix stream at '{address}'."
+msgstr  "无法在 '{address}' 绑定 Unix 流。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 193
+#, rust-format
+msgid   "Cannot convert Unix listener '{address}'."
+msgstr  "无法转换 Unix 监听器 '{address}'。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 199
+#, rust-format
+msgid   "Cannot bind TCP at '{address}'."
+msgstr  "无法在 '{address}' 绑定 TCP。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 207
+#, rust-format
+msgid   "Cannot convert TCP listener '{address}'."
+msgstr  "无法转换 TCP 监听器 '{address}'。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 270
+#, rust-format
+msgid   "Cannot convert abstract Unix listener '{address}'."
+msgstr  "无法转换抽象 Unix 监听器 '{address}'。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 336
+#, rust-format
+msgid   "Invalid FIFO path '{path}'."
+msgstr  "无效的 FIFO 路径 '{path}'。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 438
+#, rust-format
+msgid   "Failed to spawn child for '{unit_name}'."
+msgstr  "为 '{unit_name}' 启动子进程失败。"
+#
+# File: ../crates/systema-sysk/src/socket.rs, line: 441
+#, rust-format
+msgid   "Failed to wait for child for '{unit_name}'."
+msgstr  "等待 '{unit_name}' 的子进程失败。"
+#
+# File: ../crates/systema-sysk/src/main.rs, line: 24
+msgid   "System K — System Socket Worker"
+msgstr  "System K — 系统套接字工作进程"
+#
+# File: ../crates/systema-sysf/src/systemd/loader.rs, line: 23
+#, rust-format
+msgid   "Scanning {dir} ..."
+msgstr  "正在扫描 {dir} ..."
+#
+# File: ../crates/systema-sysf/src/main.rs, line: 46
+msgid   "System F — System Finder Worker"
+msgstr  "System F — 系统查找工作进程"
+#
+# File: ../crates/systema-sysf/src/main.rs, line: 49
+msgid   "Commit previously staged units into the active set."
+msgstr  "将先前暂存的 unit 提交到活动集合中。"

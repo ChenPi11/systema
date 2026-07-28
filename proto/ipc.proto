@@ -106,6 +106,24 @@ message StateSyncReport {
     repeated SyncUnitState units = 1;
 }
 
+// Sent by System F (Finder) to register discovered units as JSON-serialized
+// UnitIR values.  System A stores them in staging until CommitUnits is sent.
+message RegisterUnits {
+    // JSON-serialized map of unit_id → UnitIR.
+    bytes units_json = 1;
+}
+
+// Sent by System F to commit staged units into the active dependency graph.
+message CommitUnits {
+}
+
+// Sent by System A to acknowledge a unit registration or commit.
+message UnitRegistrationAck {
+    bool success = 1;
+    string message = 2;
+    uint32 unit_count = 3;
+}
+
 // Configuration for a .socket unit, sent inside UnitConfig.
 message SocketConfig {
     // Addresses to listen on — see SocketAddress below.
