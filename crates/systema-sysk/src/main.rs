@@ -1,3 +1,4 @@
+mod controller;
 mod ipc;
 mod socket;
 

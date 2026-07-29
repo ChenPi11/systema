@@ -1335,6 +1335,7 @@ name = "systema-sysk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "clap",
  "futures",
@@ -1418,6 +1419,7 @@ name = "systema-syst"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "clap",
  "futures",

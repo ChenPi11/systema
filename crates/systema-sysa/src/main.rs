@@ -62,9 +62,6 @@ async fn main() -> Result<()> {
         let bus = allocator.read().event_bus.clone();
         let mut bus_w = bus.write().await;
         bus_w.subscribe(Arc::new(
-            event::StateUpdater::new(allocator.clone()),
-        ));
-        bus_w.subscribe(Arc::new(
             event::RestartHandler::new(allocator.clone()),
         ));
     }

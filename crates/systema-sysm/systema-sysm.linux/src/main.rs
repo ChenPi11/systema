@@ -1,4 +1,5 @@
 mod automount;
+mod controller;
 mod ipc;
 mod mount;
 mod mountinfo;

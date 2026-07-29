@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountState {
     Dead,
+    #[allow(dead_code)]
     Mounting,
     Mounted,
     Unmounting,

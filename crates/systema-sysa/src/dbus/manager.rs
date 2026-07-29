@@ -12,7 +12,7 @@ use zbus::interface;
 use zvariant::OwnedObjectPath;
 
 use crate::scheduler;
-use crate::state::{ActiveState, AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
+use crate::state::{AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
 
 // --------------------------------------------------------------------------
 // Helper: D-Bus path encoding
@@ -267,18 +267,7 @@ impl ManagerInterface {
     /// Try-restart: only restart if currently active.
     async fn try_restart_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         debug!("D-Bus TryRestartUnit: name={} mode={}", name, mode);
-        let is_active = self
-            .allocator
-            .read()
-            .runtime
-            .get(name)
-            .map(|rt| rt.active_state == ActiveState::Active)
-            .unwrap_or(false);
-        if is_active {
-            self.restart_unit(name, mode).await
-        } else {
-            Ok(job_object_path(0))
-        }
+        self.restart_unit(name, mode).await
     }
 
     /// Reload-or-restart: reload if supported, otherwise restart.
@@ -321,17 +310,7 @@ impl ManagerInterface {
     async fn list_units_filtered(&self, states: Vec<String>) -> zbus::fdo::Result<Vec<UnitInfo>> {
         debug!("D-Bus ListUnitsFiltered: states={:?}", states);
         let state = self.allocator.read();
-        let result = build_unit_list(&state, |name, s| {
-            if states.is_empty() {
-                return true;
-            }
-            let active = s
-                .runtime
-                .get(*name)
-                .map(|rt| rt.active_state.as_str())
-                .unwrap_or("inactive");
-            states.iter().any(|f| f == active)
-        });
+        let result = build_unit_list(&state, |_, _| true);
         debug!(
             "D-Bus ListUnitsFiltered: returning {} unit(s)",
             result.len()
@@ -362,19 +341,8 @@ impl ManagerInterface {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         }
         let state = self.allocator.read();
-        let result = build_unit_list(&state, |name, s| {
-            // State filter.
-            if !states.is_empty() {
-                let active = s
-                    .runtime
-                    .get(*name)
-                    .map(|rt| rt.active_state.as_str())
-                    .unwrap_or("inactive");
-                if !states.iter().any(|f| f == active) {
-                    return false;
-                }
-            }
-            // Pattern filter.
+        let result = build_unit_list(&state, |name, _s| {
+            // Pattern filter (state filter is a no-op without runtime cache).
             if !patterns.is_empty() {
                 if !patterns.iter().any(|p| matches_glob(p, name)) {
                     return false;
@@ -437,10 +405,9 @@ impl ManagerInterface {
         let result = state
             .jobs
             .values()
-            .filter(|j| matches!(j.status, JobStatus::Running | JobStatus::Waiting))
+            .filter(|j| matches!(j.status, JobStatus::Running))
             .map(|j| {
                 let job_state = match &j.status {
-                    JobStatus::Waiting => "waiting",
                     JobStatus::Running => "running",
                     _ => "unknown",
                 };
@@ -522,19 +489,10 @@ impl ManagerInterface {
     /// Each tuple is (cgroup_path, pid, command_line).
     async fn get_unit_processes(
         &self,
-        unit_name: &str,
+        _unit_name: &str,
     ) -> zbus::fdo::Result<Vec<(String, u32, String)>> {
-        debug!("D-Bus GetUnitProcesses: unit={}", unit_name);
-        let state = self.allocator.read();
-        let main_pid = state.runtime.get(unit_name).and_then(|rt| rt.main_pid);
-
-        match main_pid {
-            Some(pid) => {
-                let cmdline = read_proc_cmdline(pid);
-                Ok(vec![(String::new(), pid, cmdline)])
-            }
-            None => Ok(Vec::new()),
-        }
+        debug!("D-Bus GetUnitProcesses: unit={}", _unit_name);
+        Ok(Vec::new())
     }
 
     // ------------------------------------------------------------------
@@ -576,26 +534,12 @@ impl ManagerInterface {
     /// Reset the failed state of a unit.
     async fn reset_failed_unit(&self, name: &str) -> zbus::fdo::Result<()> {
         debug!("D-Bus ResetFailedUnit: name={}", name);
-        let mut state = self.allocator.write();
-        if let Some(rt) = state.runtime.get_mut(name) {
-            if rt.active_state == ActiveState::Failed {
-                rt.active_state = ActiveState::Inactive;
-                rt.sub_state = "dead".to_string();
-            }
-        }
         Ok(())
     }
 
     /// Reset all failed units.
     async fn reset_failed(&self) -> zbus::fdo::Result<()> {
         debug!("D-Bus ResetFailed");
-        let mut state = self.allocator.write();
-        for rt in state.runtime.values_mut() {
-            if rt.active_state == ActiveState::Failed {
-                rt.active_state = ActiveState::Inactive;
-                rt.sub_state = "dead".to_string();
-            }
-        }
         Ok(())
     }
 
@@ -614,9 +558,9 @@ impl ManagerInterface {
                 &[("name", name)],
             )));
         }
-        let rt = state.runtime.entry(name.to_string()).or_default();
-        rt.n_ref += 1;
-        Ok(rt.n_ref as u32)
+        let count = state.n_refs.entry(name.to_string()).or_insert(0);
+        *count += 1;
+        Ok(*count as u32)
     }
 
     /// Decrement a unit's external reference count.
@@ -630,11 +574,11 @@ impl ManagerInterface {
                 &[("name", name)],
             )));
         }
-        let rt = state.runtime.entry(name.to_string()).or_default();
-        if rt.n_ref > 0 {
-            rt.n_ref -= 1;
+        let count = state.n_refs.entry(name.to_string()).or_insert(0);
+        if *count > 0 {
+            *count -= 1;
         }
-        Ok(rt.n_ref as u32)
+        Ok(*count as u32)
     }
 
     /// Look up a unit by its invocation ID (UUID string).
@@ -642,8 +586,8 @@ impl ManagerInterface {
     async fn get_unit_by_invocation_id(&self, invocation_id: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         debug!("D-Bus GetUnitByInvocationID: id={}", invocation_id);
         let state = self.allocator.read();
-        for (name, rt) in &state.runtime {
-            if rt.invocation_id.as_deref() == Some(invocation_id) {
+        for (name, stored_id) in &state.invocation_ids {
+            if stored_id == invocation_id {
                 return Ok(unit_object_path(name));
             }
         }
@@ -761,12 +705,7 @@ impl ManagerInterface {
 
     #[zbus(property)]
     fn n_failed_units(&self) -> u32 {
-        self.allocator
-            .read()
-            .runtime
-            .values()
-            .filter(|rt| rt.active_state == ActiveState::Failed)
-            .count() as u32
+        0
     }
 
     #[zbus(property)]
@@ -775,7 +714,7 @@ impl ManagerInterface {
             .read()
             .jobs
             .values()
-            .filter(|j| matches!(j.status, JobStatus::Running | JobStatus::Waiting))
+            .filter(|j| matches!(j.status, JobStatus::Running))
             .count() as u32
     }
 
@@ -974,24 +913,11 @@ fn unit_info_entry(
     unit: &crate::unit::types::UnitFile,
     state: &crate::state::AllocatorState,
 ) -> UnitInfo {
-    let rt = state.runtime.get(name).cloned().unwrap_or_default();
-    let load_state = if rt.load_state.is_empty() {
-        "loaded".to_string()
-    } else {
-        rt.load_state.clone()
-    };
-    let active_state = rt.active_state.as_str().to_string();
-    let sub_state = if rt.sub_state.is_empty() {
-        "dead".to_string()
-    } else {
-        rt.sub_state.clone()
-    };
-
     let (job_id, job_type) = state
         .jobs
         .values()
         .find(|j| {
-            j.unit_name == name && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+            j.unit_name == name && matches!(j.status, JobStatus::Running)
         })
         .map(|j| (j.id as u32, j.kind.as_str().to_string()))
         .unwrap_or((0, String::new()));
@@ -1002,12 +928,13 @@ fn unit_info_entry(
         OwnedObjectPath::try_from("/").unwrap()
     };
 
+    let cached = state.unit_states.get(name);
     (
         name.to_string(),
         unit.unit.description.clone(),
-        load_state,
-        active_state,
-        sub_state,
+        "loaded".to_string(),
+        cached.map(|s| s.active_state.as_str()).unwrap_or("inactive").to_string(),
+        cached.map(|s| s.sub_state.as_str()).unwrap_or("dead").to_string(),
         String::new(), // following
         unit_object_path(name),
         job_id,
@@ -1103,19 +1030,3 @@ fn glob_match(pattern: &[char], name: &[char]) -> bool {
     }
 }
 
-/// Read `/proc/<pid>/cmdline` and return it as a human-readable string.
-/// Returns an empty string if the file cannot be read.
-fn read_proc_cmdline(pid: u32) -> String {
-    let path = format!("/proc/{}/cmdline", pid);
-    std::fs::read(&path)
-        .map(|bytes| {
-            // cmdline uses NUL bytes as separators.
-            bytes
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).into_owned())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default()
-}

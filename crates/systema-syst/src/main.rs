@@ -6,6 +6,7 @@
 //! - Activate/deactivate targets (no external processes, just state tracking).
 //! - Report `TaskResult` messages back to System A.
 
+mod controller;
 mod ipc;
 mod state;
 

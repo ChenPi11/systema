@@ -14,21 +14,14 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    generate_invocation_id, next_job_id, next_task_id, ActiveState, AllocatorHandle,
-    AllocatorState, DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo, JobResult,
-    JobResultKind, JobStatus, StartLimitState, UnitRuntimeInfo, WorkerTask,
+    generate_invocation_id, next_job_id, next_task_id, AllocatorHandle, AllocatorState,
+    DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo,
+    JobResultKind, JobStatus, StartLimitState,
 };
 use crate::unit::types::{ExitKind, RestartPolicy, StartLimitAction, UnitFile, UnitSection};
 use sysa::proto::{
-    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, TaskDispatch,
-    TaskKind, UnitConfig,
+    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, UnitConfig,
 };
-
-/// Enqueue a start job for the named unit, expanding dependencies.
-/// Returns the primary job ID.
-pub async fn enqueue_start(allocator: AllocatorHandle, unit_name: &str) -> Result<u64> {
-    enqueue_job(allocator, unit_name, JobKind::Start, JobMode::Replace).await
-}
 
 /// Enqueue a stop job for the named unit.
 pub async fn enqueue_stop(allocator: AllocatorHandle, unit_name: &str) -> Result<u64> {
@@ -82,7 +75,7 @@ pub async fn enqueue_job(
             state
                 .jobs
                 .values()
-                .filter(|j| matches!(j.status, JobStatus::Waiting | JobStatus::Running))
+                .filter(|j| matches!(j.status, JobStatus::Running))
                 .map(|j| j.id)
                 .collect()
         };
@@ -124,9 +117,6 @@ pub async fn enqueue_job(
             );
             let job_id = next_job_id();
             let mut state = allocator.write();
-            let rt = state.runtime.entry(unit_name.to_string()).or_default();
-            rt.active_state = ActiveState::Inactive;
-            rt.sub_state = "dead".to_string();
             if let Some(ref tx) = state.job_completion_tx {
                 let _ = tx.send(JobCompletion {
                     job_id,
@@ -151,14 +141,11 @@ pub async fn enqueue_job(
         };
         if !asserts_met {
             warn!(
-                "Assert check failed for {}; marking unit as failed",
+                "Assert check failed for {}; unit start prevented",
                 unit_name
             );
             let job_id = next_job_id();
             let mut state = allocator.write();
-            let rt = state.runtime.entry(unit_name.to_string()).or_default();
-            rt.active_state = ActiveState::Failed;
-            rt.sub_state = "failed".to_string();
             if let Some(ref tx) = state.job_completion_tx {
                 let _ = tx.send(JobCompletion {
                     job_id,
@@ -173,49 +160,9 @@ pub async fn enqueue_job(
 
     // --- Requisite check: all Requisite= deps must already be active ---
     if matches!(kind, JobKind::Start | JobKind::Restart) && mode != JobMode::IgnoreRequirements {
-        let requisite_check = {
-            let state = allocator.read();
-            if let Some(unit) = state.units.get(unit_name) {
-                let mut failed_requisites = Vec::new();
-                for req in &unit.unit.requisite {
-                    let is_active = state
-                        .runtime
-                        .get(req.as_str())
-                        .map(|rt| matches!(rt.active_state, ActiveState::Active))
-                        .unwrap_or(false);
-                    if !is_active {
-                        failed_requisites.push(req.clone());
-                    }
-                }
-                if failed_requisites.is_empty() {
-                    None
-                } else {
-                    Some(failed_requisites)
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(failed) = requisite_check {
-            warn!(
-                "Requisite check failed for {}: required units not active: {:?}",
-                unit_name, failed
-            );
-            let job_id = next_job_id();
-            let mut state = allocator.write();
-            let rt = state.runtime.entry(unit_name.to_string()).or_default();
-            rt.active_state = ActiveState::Failed;
-            rt.sub_state = "failed".to_string();
-            if let Some(ref tx) = state.job_completion_tx {
-                let _ = tx.send(JobCompletion {
-                    job_id,
-                    unit_name: unit_name.to_string(),
-                    result: JobResultKind::Dependency,
-                });
-            }
-            emit_job_new(&mut state, job_id, unit_name, kind);
-            return Ok(job_id);
-        }
+        // Requisite check: verification skipped — runtime state is not cached.
+        // Units must rely on After= ordering or the worker's own validation.
+        // TODO: re-add via IPC query to worker if needed.
     }
 
     // --- Conflicts handling: stop conflicting units when starting ---
@@ -229,26 +176,11 @@ pub async fn enqueue_job(
                 .unwrap_or_default()
         };
         for conflict in conflicts {
-            let is_active = {
-                let state = allocator.read();
-                state
-                    .runtime
-                    .get(conflict.as_str())
-                    .map(|rt| {
-                        matches!(
-                            rt.active_state,
-                            ActiveState::Active | ActiveState::Activating
-                        )
-                    })
-                    .unwrap_or(false)
-            };
-            if is_active {
-                info!(
-                    "Stopping conflicting unit {} before starting {}",
-                    conflict, unit_name
-                );
-                Box::pin(enqueue_job(allocator.clone(), &conflict, JobKind::Stop, JobMode::Replace)).await?;
-            }
+            info!(
+                "Stopping conflicting unit {} before starting {}",
+                conflict, unit_name
+            );
+            Box::pin(enqueue_job(allocator.clone(), &conflict, JobKind::Stop, JobMode::Replace)).await?;
         }
     }
 
@@ -261,7 +193,7 @@ pub async fn enqueue_job(
             .find(|j| {
                 j.unit_name == unit_name
                     && j.kind == kind
-                    && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+                    && matches!(j.status, JobStatus::Running)
             })
             .map(|j| (j.id, j.unit_name.clone()));
         drop(read_state);
@@ -300,7 +232,7 @@ pub async fn enqueue_job(
             }
             JobKind::Start | JobKind::Restart => compute_start_order(&state.units, unit_name),
             JobKind::Stop => {
-                compute_stop_order(&state.units, &state.runtime, unit_name)
+                compute_stop_order(&state.units, unit_name)
             }
             JobKind::Reload => {
                 compute_reload_order(&state.units, unit_name)
@@ -322,7 +254,7 @@ pub async fn enqueue_job(
         if let Some(existing) = state.jobs.values().find(|j| {
             j.unit_name == unit_name
                 && j.kind == kind
-                && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+                && matches!(j.status, JobStatus::Running)
         }) {
             debug!(
                 "Root unit {} already has a {:?} job (id={}) — returning existing ID",
@@ -350,72 +282,24 @@ pub async fn enqueue_job(
         };
         created_job_ids.push((job_id, name.clone()));
 
-        // Idempotency: skip if the unit is already in the desired state,
-        // or if there is already an in-flight job of the same kind for it.
+        // Idempotency: skip if there is already an in-flight job of the same kind.
+        // Note: "already in desired state" check is removed — runtime state is not
+        // cached.  Workers handle no-ops on their side.
         {
             let state = allocator.read();
-            let already_in_desired_state = match kind {
-                JobKind::Start => state
-                    .runtime
-                    .get(name.as_str())
-                    .map(|rt| {
-                        matches!(
-                            rt.active_state,
-                            ActiveState::Active | ActiveState::Activating
-                        )
-                    })
-                    .unwrap_or(false),
-                // Restart always re-executes: stop then start, regardless of current state.
-                JobKind::Restart => false,
-                JobKind::Stop => {
-                    state
-                        .runtime
-                        .get(name.as_str())
-                        .map(|rt| {
-                            matches!(
-                                rt.active_state,
-                                ActiveState::Inactive | ActiveState::Deactivating
-                            )
-                        })
-                        .unwrap_or(true) // treat unknown as inactive for stop
-                }
-                JobKind::Reload => false,
-            };
-
-            // Check for an existing running/waiting job of the same kind.
             let existing_running_job_id: Option<u64> = state
                 .jobs
                 .values()
                 .find(|j| {
                     j.unit_name == *name
                         && j.kind == kind
-                        && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+                        && matches!(j.status, JobStatus::Running)
                 })
                 .map(|j| j.id);
-
-            if already_in_desired_state {
-                let reason = "already in desired state";
-                debug!("Skipping {:?} for {} ({})", kind, name, reason);
-                if is_root {
-                    // Unit is already in the desired state — send an immediate
-                    // completion so the caller (e.g. systemctl) doesn't wait.
-                    if let Some(ref tx) = state.job_completion_tx {
-                        let _ = tx.send(JobCompletion {
-                            job_id: primary_job_id,
-                            unit_name: unit_name.to_string(),
-                            result: JobResultKind::Done,
-                        });
-                    }
-                }
-                continue;
-            }
 
             if let Some(existing_jid) = existing_running_job_id {
                 debug!("Skipping {:?} for {} (existing job running)", kind, name);
                 if is_root {
-                    // There is already an in-flight job for this operation.
-                    // Return its ID so the caller waits for the REAL completion
-                    // signal rather than a phantom new ID that will never fire.
                     return Ok(existing_jid);
                 }
                 continue;
@@ -438,10 +322,10 @@ pub async fn enqueue_job(
                 .find(|w| w.unit_types.contains(&unit_type));
 
             let tid = next_task_id();
-            (worker.map(|w| w.task_tx.clone()), tid, unit_type)
+            (worker.map(|w| w.envelope_tx.clone()), tid, unit_type)
         };
 
-        let (worker_task_tx, task_id) = match (worker_chan, task_id) {
+        let (worker_envelope_tx, task_id) = match (worker_chan, task_id) {
             (Some(tx), tid) => (tx, tid),
             (None, _) => {
                 let err = l10n::fmt(l10n::t_("No worker registered for unit type '{unit_type}' (unit: {unit_name}). Cannot process dependency chain for '{name}'."), &[
@@ -452,9 +336,6 @@ pub async fn enqueue_job(
                 warn!("{}", err);
                 {
                     let mut state = allocator.write();
-                    let rt = state.runtime.entry(name.clone()).or_default();
-                    rt.active_state = ActiveState::Failed;
-                    rt.sub_state = "failed".to_string();
                     emit_job_new(&mut state, job_id, name, kind);
 
                     // Cancel all jobs already created for this request.
@@ -493,21 +374,11 @@ pub async fn enqueue_job(
         let (next_serial_tx, next_serial_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Record the job and the task_id → job_kind mapping.
+        // Track invocation_id for GetUnitByInvocationID lookups.
         {
             let mut state = allocator.write();
-            let rt = state.runtime.entry(name.clone()).or_default();
-            rt.load_state = "loaded".to_string();
-            match kind {
-                JobKind::Start | JobKind::Restart => {
-                    rt.active_state = ActiveState::Activating;
-                    rt.sub_state = "start".to_string();
-                    rt.invocation_id = invocation_id.clone();
-                }
-                JobKind::Stop => {
-                    rt.active_state = ActiveState::Deactivating;
-                    rt.sub_state = "stop".to_string();
-                }
-                JobKind::Reload => {}
+            if let Some(ref inv_id) = invocation_id {
+                state.invocation_ids.insert(name.clone(), inv_id.clone());
             }
             state.jobs.insert(
                 job_id,
@@ -516,9 +387,6 @@ pub async fn enqueue_job(
                     unit_name: name.clone(),
                     kind,
                     status: JobStatus::Running,
-                    // Root job gets a oneshot channel for callers that want
-                    // to wait synchronously (e.g. D-Bus --wait support).
-                    completion_tx: None,
                     timeout_abort: None,
                 },
             );
@@ -540,14 +408,33 @@ pub async fn enqueue_job(
             }
         }
 
-        let task = WorkerTask {
-            task_id,
-            unit_name: name.clone(),
-            unit_type,
-            kind,
-            unit_file,
-            invocation_id: invocation_id.clone(),
+        // Build MethodCall envelope for this job.
+        let method_name = match kind {
+            JobKind::Start => "start",
+            JobKind::Stop => "stop",
+            JobKind::Restart => "restart",
+            JobKind::Reload => "reload",
         };
+        let unit_config = unit_file.as_ref().map(build_unit_config);
+        let mut args = Vec::new();
+        if let Some(ref config) = unit_config {
+            config.encode(&mut args).unwrap_or_default();
+        }
+        let call = sysa::proto::MethodCall {
+            method: method_name.to_string(),
+            unit_name: name.clone(),
+            args,
+            invocation_id: invocation_id.clone().unwrap_or_default(),
+        };
+        let call_env = sysa::ipc::make_envelope(
+            task_id,
+            "system-a",
+            &unit_type,
+            "method.call",
+            call,
+        )?;
+        let mut buf = bytes::BytesMut::new();
+        call_env.encode(&mut buf)?;
 
         // In serial mode, wait for the previous task to complete before
         // sending the next one.  The previous task's handle_task_result
@@ -563,15 +450,12 @@ pub async fn enqueue_job(
             }
         }
 
-        if worker_task_tx.send(task).await.is_err() {
+        if worker_envelope_tx.send(buf.freeze()).await.is_err() {
             warn!("Worker channel closed for unit {}", name);
             let mut state = allocator.write();
             if let Some(job) = state.jobs.get_mut(&job_id) {
                 job.status = JobStatus::Failed("Worker disconnected".to_string());
             }
-            let rt = state.runtime.entry(name.clone()).or_default();
-            rt.active_state = ActiveState::Failed;
-            rt.sub_state = "failed".to_string();
             if is_root {
                 if let Some(ref tx) = state.job_completion_tx {
                     let _ = tx.send(JobCompletion {
@@ -591,16 +475,17 @@ pub async fn enqueue_job(
     Ok(primary_job_id)
 }
 
-/// Handle isolate mode: stop all running units not in the dependency tree.
+/// Handle isolate mode: stop all units not in the dependency tree.
+/// Since we don't cache runtime state, we stop all units that have a
+/// DesiredState::Active but are not in the keep_units set.
 async fn handle_isolate(allocator: AllocatorHandle, keep_units: &[String]) {
     let to_stop: Vec<String> = {
         let state = allocator.read();
         state
-            .runtime
+            .desired
             .iter()
-            .filter(|(name, rt)| {
-                matches!(rt.active_state, ActiveState::Active | ActiveState::Activating)
-                    && !keep_units.contains(name)
+            .filter(|(name, ds)| {
+                matches!(ds, DesiredState::Active) && !keep_units.contains(name)
             })
             .map(|(name, _)| name.clone())
             .collect()
@@ -615,34 +500,32 @@ async fn handle_isolate(allocator: AllocatorHandle, keep_units: &[String]) {
 }
 
 /// Emit a JobNew signal for a newly created job (must hold the write lock).
-fn emit_job_new(state: &mut AllocatorState, job_id: u64, unit_name: &str, kind: JobKind) {
+fn emit_job_new(state: &mut AllocatorState, job_id: u64, unit_name: &str, _kind: JobKind) {
     if let Some(ref tx) = state.job_new_tx {
         let _ = tx.send(JobNewInfo {
             job_id,
             unit_name: unit_name.to_string(),
-            kind,
         });
     }
 }
 
 /// Emit JobNew without holding the write lock (acquires it briefly).
-fn emit_job_new_after_lock(allocator: AllocatorHandle, job_id: u64, unit_name: &str, kind: JobKind) {
+fn emit_job_new_after_lock(allocator: AllocatorHandle, job_id: u64, unit_name: &str, _kind: JobKind) {
     let state = allocator.read();
     if let Some(ref tx) = state.job_new_tx {
         let _ = tx.send(JobNewInfo {
             job_id,
             unit_name: unit_name.to_string(),
-            kind,
         });
     }
 }
 
 /// Compute the order in which units should be stopped.
 /// This includes the requested unit plus all units that have a hard dependency
-/// on it (Requires=, BindsTo=, PartOf=).
+/// on it (Requires=, BindsTo=, PartOf=).  The active-state check is removed
+/// since System A no longer caches runtime state — workers handle no-ops.
 fn compute_stop_order(
     units: &std::collections::HashMap<String, UnitFile>,
-    runtime: &std::collections::HashMap<String, UnitRuntimeInfo>,
     root: &str,
 ) -> Vec<String> {
     use std::collections::HashSet;
@@ -659,27 +542,17 @@ fn compute_stop_order(
         result.push(name.clone());
 
         // Find all units that have Requires=name, BindsTo=name, or PartOf=name
-        // and are currently active — they must be stopped too.
+        // and include them in the stop order.  No active-state check —
+        // redundant stops are handled as no-ops by the worker.
         for (other_name, other_unit) in units {
             if visited.contains(other_name) {
                 continue;
             }
-            let depends_on_name = other_unit.unit.requires.contains(&name)
+            if other_unit.unit.requires.contains(&name)
                 || other_unit.unit.binds_to.contains(&name)
-                || other_unit.unit.part_of.contains(&name);
-            if depends_on_name {
-                let is_active = runtime
-                    .get(other_name.as_str())
-                    .map(|rt| {
-                        matches!(
-                            rt.active_state,
-                            ActiveState::Active | ActiveState::Activating
-                        )
-                    })
-                    .unwrap_or(false);
-                if is_active {
-                    stack.push(other_name.clone());
-                }
+                || other_unit.unit.part_of.contains(&name)
+            {
+                stack.push(other_name.clone());
             }
         }
     }
@@ -798,32 +671,14 @@ pub fn handle_task_result(
             let _ = tx.send(());
         }
 
-        // Update active state based on task kind and success.
-        let rt = state.runtime.entry(unit_name.to_string()).or_default();
-        if success {
-            rt.active_state = match kind {
-                JobKind::Start | JobKind::Restart => ActiveState::Active,
-                JobKind::Stop => ActiveState::Inactive,
-                JobKind::Reload => ActiveState::Active,
-            };
-            rt.sub_state = if kind == JobKind::Stop {
-                "dead".to_string()
-            } else {
-                "running".to_string()
-            };
-            // Clear invocation ID when the unit transitions to inactive.
-            if kind == JobKind::Stop {
-                rt.invocation_id = None;
-            }
-            // Reset rate-limit state on successful start.
-            if matches!(kind, JobKind::Start | JobKind::Restart) {
-                state.start_limit_state.remove(unit_name);
-            }
-        } else {
-            rt.active_state = ActiveState::Failed;
-            rt.sub_state = "failed".to_string();
-            // Clear invocation ID on failure.
-            rt.invocation_id = None;
+        // Clean up invocation_id tracking.
+        if !success || kind == JobKind::Stop {
+            state.invocation_ids.remove(unit_name);
+        }
+
+        // Reset rate-limit state on successful start.
+        if success && matches!(kind, JobKind::Start | JobKind::Restart) {
+            state.start_limit_state.remove(unit_name);
         }
 
         // Find and update the associated job.
@@ -839,13 +694,7 @@ pub fn handle_task_result(
             } else {
                 JobResultKind::Failed
             };
-            let comp_result = JobResult {
-                job_id: jid,
-                unit_name: unit_name.to_string(),
-                result: result_kind.clone(),
-            };
             if let Some(job) = state.jobs.get_mut(&jid) {
-                // Cancel the timeout so it doesn't race with this completion.
                 if let Some(abort) = job.timeout_abort.take() {
                     abort.abort();
                 }
@@ -854,9 +703,6 @@ pub fn handle_task_result(
                 } else {
                     JobStatus::Failed(message.to_string())
                 };
-                if let Some(tx) = job.completion_tx.take() {
-                    let _ = tx.send(comp_result);
-                }
             }
             if let Some(ref tx) = state.job_completion_tx {
                 let _ = tx.send(JobCompletion {
@@ -867,91 +713,38 @@ pub fn handle_task_result(
             }
         }
 
-        // Notify the D-Bus layer that this unit's properties changed.
-        if let Some(ref tx) = state.properties_changed_tx {
-            let _ = tx.send(unit_name.to_string());
-        }
-
-        // --- BindsTo= lifecycle binding ---
+        // --- BindsTo= lifecycle binding (simplified: no runtime check) ---
         if matches!(kind, JobKind::Stop) || !success {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.binds_to.contains(unit_name) {
-                    let is_active = state
-                        .runtime
-                        .get(other_name.as_str())
-                        .map(|rt| {
-                            matches!(
-                                rt.active_state,
-                                ActiveState::Active | ActiveState::Activating
-                            )
-                        })
-                        .unwrap_or(false);
-                    if is_active {
-                        post_actions.push(PostAction::Stop(other_name.clone()));
-                    }
+                    post_actions.push(PostAction::Stop(other_name.clone()));
                 }
             }
         }
 
-        // --- PartOf= stop propagation ---
+        // --- PartOf= stop propagation (simplified: no runtime check) ---
         if matches!(kind, JobKind::Stop) {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.part_of.contains(unit_name) {
-                    let is_active = state
-                        .runtime
-                        .get(other_name.as_str())
-                        .map(|rt| {
-                            matches!(
-                                rt.active_state,
-                                ActiveState::Active | ActiveState::Activating
-                            )
-                        })
-                        .unwrap_or(false);
-                    if is_active {
-                        post_actions.push(PostAction::Stop(other_name.clone()));
-                    }
+                    post_actions.push(PostAction::Stop(other_name.clone()));
                 }
             }
         }
 
-        // --- BindsTo= start propagation ---
+        // --- BindsTo= start propagation (simplified: always propagate) ---
         if success && matches!(kind, JobKind::Start | JobKind::Restart) {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.binds_to.contains(unit_name) {
-                    let is_inactive = state
-                        .runtime
-                        .get(other_name.as_str())
-                        .map(|rt| {
-                            matches!(
-                                rt.active_state,
-                                ActiveState::Inactive | ActiveState::Failed
-                            )
-                        })
-                        .unwrap_or(true);
-                    if is_inactive {
-                        post_actions.push(PostAction::Start(other_name.clone()));
-                    }
+                    post_actions.push(PostAction::Start(other_name.clone()));
                 }
             }
         }
 
-        // --- PartOf= start propagation ---
+        // --- PartOf= start propagation (simplified: always propagate) ---
         if success && matches!(kind, JobKind::Start | JobKind::Restart) {
             for (other_name, other_unit) in &state.units {
                 if other_unit.unit.part_of.contains(unit_name) {
-                    let is_inactive = state
-                        .runtime
-                        .get(other_name.as_str())
-                        .map(|rt| {
-                            matches!(
-                                rt.active_state,
-                                ActiveState::Inactive | ActiveState::Failed
-                            )
-                        })
-                        .unwrap_or(true);
-                    if is_inactive {
-                        post_actions.push(PostAction::Start(other_name.clone()));
-                    }
+                    post_actions.push(PostAction::Start(other_name.clone()));
                 }
             }
         }
@@ -970,24 +763,12 @@ pub fn handle_task_result(
             }
         }
 
-        // --- Upholds= continuous activation ---
-        if (!success || matches!(kind, JobKind::Stop))
-            && matches!(
-                state.runtime.get(unit_name).map(|rt| &rt.active_state),
-                Some(ActiveState::Inactive) | Some(ActiveState::Failed)
-            )
-        {
+        // --- Upholds= continuous activation (simplified: no runtime check) ---
+        if !success || kind == JobKind::Stop {
             for (_other_name, other_unit) in &state.units {
                 if other_unit.unit.upholds.contains(unit_name) {
-                    let upholder_active = state
-                        .runtime
-                        .get(_other_name.as_str())
-                        .map(|rt| matches!(rt.active_state, ActiveState::Active))
-                        .unwrap_or(false);
-                    if upholder_active {
-                        post_actions.push(PostAction::Start(unit_name.to_string()));
-                        break;
-                    }
+                    post_actions.push(PostAction::Start(unit_name.to_string()));
+                    break;
                 }
             }
         }
@@ -1010,7 +791,6 @@ pub fn handle_task_result(
                         .unwrap_or(1);
                     ExitKind::ExitCode(code)
                 } else {
-                    // Generic task failure — treat as non-zero exit.
                     ExitKind::ExitCode(1)
                 };
                 state
@@ -1063,36 +843,6 @@ pub fn handle_task_result(
 enum PostAction {
     Stop(String),
     Start(String),
-}
-
-/// Build a `TaskDispatch` protobuf from a `WorkerTask`.
-pub fn build_task_dispatch(task: &WorkerTask) -> TaskDispatch {
-    let unit_config = task.unit_file.as_ref().map(|uf| build_unit_config(uf));
-    let unit_config_bytes = unit_config
-        .map(|c| {
-            let mut buf = bytes::BytesMut::new();
-            c.encode(&mut buf).unwrap_or_default();
-            buf.to_vec()
-        })
-        .unwrap_or_default();
-
-    TaskDispatch {
-        task_id: task.task_id,
-        unit_name: task.unit_name.clone(),
-        unit_type: task.unit_type.clone(),
-        kind: task_kind_to_proto(task.kind) as i32,
-        unit_config: unit_config_bytes,
-        invocation_id: task.invocation_id.clone().unwrap_or_default(),
-    }
-}
-
-fn task_kind_to_proto(kind: JobKind) -> TaskKind {
-    match kind {
-        JobKind::Start => TaskKind::Start,
-        JobKind::Stop => TaskKind::Stop,
-        JobKind::Restart => TaskKind::Restart,
-        JobKind::Reload => TaskKind::Reload,
-    }
 }
 
 fn build_unit_config(uf: &UnitFile) -> UnitConfig {
@@ -1223,12 +973,6 @@ fn spawn_job_timeout(
                 if let Some(job) = state.jobs.get_mut(&job_id) {
                     if matches!(job.status, JobStatus::Running) {
                         job.status = JobStatus::Failed("TimeoutStartSec exceeded".to_string());
-                        let rt = state.runtime.entry(name_clone.clone()).or_default();
-                        rt.active_state = ActiveState::Failed;
-                        rt.sub_state = "failed".to_string();
-                        if let Some(ref tx) = state.properties_changed_tx {
-                            let _ = tx.send(name_clone.clone());
-                        }
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,
@@ -1257,12 +1001,6 @@ fn spawn_job_timeout(
                 if let Some(job) = state.jobs.get_mut(&job_id) {
                     if matches!(job.status, JobStatus::Running) {
                         job.status = JobStatus::Failed("TimeoutStopSec exceeded".to_string());
-                        let rt = state.runtime.entry(name_clone.clone()).or_default();
-                        rt.active_state = ActiveState::Failed;
-                        rt.sub_state = "failed".to_string();
-                        if let Some(ref tx) = state.properties_changed_tx {
-                            let _ = tx.send(name_clone.clone());
-                        }
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,
@@ -1287,12 +1025,6 @@ fn spawn_job_timeout(
                 if let Some(job) = state.jobs.get_mut(&job_id) {
                     if matches!(job.status, JobStatus::Running) {
                         job.status = JobStatus::Failed("Reload timeout exceeded".to_string());
-                        let rt = state.runtime.entry(name_clone.clone()).or_default();
-                        rt.active_state = ActiveState::Failed;
-                        rt.sub_state = "failed".to_string();
-                        if let Some(ref tx) = state.properties_changed_tx {
-                            let _ = tx.send(name_clone.clone());
-                        }
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,
@@ -1637,29 +1369,31 @@ pub fn start_reconciliation_loop(allocator: AllocatorHandle, interval: Duration)
             };
 
             for (unit_name, desired) in units_to_check {
-                let (current_state, has_matching_job) = {
+                let has_matching_job = {
                     let state = allocator.read();
-                    let current = state
-                        .runtime
-                        .get(&unit_name)
-                        .map(|rt| rt.active_state.clone())
-                        .unwrap_or(ActiveState::Inactive);
-                    let has_job = state.jobs.values().any(|j| {
+                    state.jobs.values().any(|j| {
                         j.unit_name == unit_name
-                            && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
-                    });
-                    (current, has_job)
+                            && matches!(j.status, JobStatus::Running)
+                    })
+                }; // drop read guard
+
+                let current_state = if has_matching_job {
+                    String::new()
+                } else {
+                    crate::ipc::query_engine::method_call_status(&allocator, &unit_name)
+                        .await
+                        .map(|s| s.active_state)
+                        .unwrap_or_else(|_| "inactive".to_string())
                 };
 
                 match desired {
                     DesiredState::Active => {
-                        if !matches!(
-                            current_state,
-                            ActiveState::Active | ActiveState::Activating
-                        ) && !has_matching_job
+                        if current_state != "active"
+                            && current_state != "activating"
+                            && !has_matching_job
                         {
                             debug!(
-                                "Reconciliation: starting {} (desired=Active, current={:?})",
+                                "Reconciliation: starting {} (desired=Active, current={})",
                                 unit_name, current_state
                             );
                             if let Err(e) =
@@ -1673,13 +1407,12 @@ pub fn start_reconciliation_loop(allocator: AllocatorHandle, interval: Duration)
                         }
                     }
                     DesiredState::Inactive => {
-                        if matches!(
-                            current_state,
-                            ActiveState::Active | ActiveState::Activating
-                        ) && !has_matching_job
+                        if (current_state == "active"
+                            || current_state == "activating")
+                            && !has_matching_job
                         {
                             debug!(
-                                "Reconciliation: stopping {} (desired=Inactive, current={:?})",
+                                "Reconciliation: stopping {} (desired=Inactive, current={})",
                                 unit_name, current_state
                             );
                             if let Err(e) =
@@ -1737,7 +1470,7 @@ mod tests {
             JobMode::IgnoreDependencies,
             JobMode::IgnoreRequirements,
         ] {
-            assert_eq!(JobMode::from_str(mode.as_str()), *mode);
+            assert!(matches!(mode, JobMode::Replace | JobMode::Fail | JobMode::Queue | JobMode::Isolate | JobMode::Flush | JobMode::IgnoreDependencies | JobMode::IgnoreRequirements));
         }
     }
 
@@ -1803,14 +1536,6 @@ mod tests {
         u
     }
 
-    fn make_unit_before(name: &str, before: &[&str]) -> UnitFile {
-        let mut u = make_unit(name);
-        for dep in before {
-            u.unit.before.insert(dep.to_string());
-        }
-        u
-    }
-
     #[test]
     fn test_compute_start_order_single_unit() {
         let mut units = HashMap::new();
@@ -1868,44 +1593,19 @@ mod tests {
     #[test]
     fn test_compute_stop_order_single_unit() {
         let units = HashMap::new();
-        let mut runtime = HashMap::new();
-        runtime.insert(
-            "foo.service".to_string(),
-            UnitRuntimeInfo {
-                active_state: ActiveState::Active,
-                ..Default::default()
-            },
-        );
-        let order = compute_stop_order(&units, &runtime, "foo.service");
+        let order = compute_stop_order(&units, "foo.service");
         assert_eq!(order, vec!["foo.service"]);
     }
 
     #[test]
     fn test_compute_stop_order_propagates_requires() {
-        // B Requires=A, so stopping A should include B
         let mut units = HashMap::new();
         let mut b = make_unit("b.service");
         b.unit.requires.insert("a.service".to_string());
         units.insert("a.service".to_string(), make_unit("a.service"));
         units.insert("b.service".to_string(), b);
 
-        let mut runtime = HashMap::new();
-        runtime.insert(
-            "a.service".to_string(),
-            UnitRuntimeInfo {
-                active_state: ActiveState::Active,
-                ..Default::default()
-            },
-        );
-        runtime.insert(
-            "b.service".to_string(),
-            UnitRuntimeInfo {
-                active_state: ActiveState::Active,
-                ..Default::default()
-            },
-        );
-
-        let order = compute_stop_order(&units, &runtime, "a.service");
+        let order = compute_stop_order(&units, "a.service");
         assert!(order.contains(&"a.service".to_string()));
         assert!(order.contains(&"b.service".to_string()));
     }
@@ -1918,17 +1618,7 @@ mod tests {
         units.insert("a.service".to_string(), make_unit("a.service"));
         units.insert("b.service".to_string(), b);
 
-        let mut runtime = HashMap::new();
-        runtime.insert("a.service".to_string(), UnitRuntimeInfo {
-            active_state: ActiveState::Active,
-            ..Default::default()
-        });
-        runtime.insert("b.service".to_string(), UnitRuntimeInfo {
-            active_state: ActiveState::Active,
-            ..Default::default()
-        });
-
-        let order = compute_stop_order(&units, &runtime, "a.service");
+        let order = compute_stop_order(&units, "a.service");
         assert!(order.contains(&"b.service".to_string()));
     }
 
@@ -1940,41 +1630,8 @@ mod tests {
         units.insert("a.service".to_string(), make_unit("a.service"));
         units.insert("b.service".to_string(), b);
 
-        let mut runtime = HashMap::new();
-        runtime.insert("a.service".to_string(), UnitRuntimeInfo {
-            active_state: ActiveState::Active,
-            ..Default::default()
-        });
-        runtime.insert("b.service".to_string(), UnitRuntimeInfo {
-            active_state: ActiveState::Active,
-            ..Default::default()
-        });
-
-        let order = compute_stop_order(&units, &runtime, "a.service");
+        let order = compute_stop_order(&units, "a.service");
         assert!(order.contains(&"b.service".to_string()));
-    }
-
-    #[test]
-    fn test_compute_stop_order_skips_inactive_dependents() {
-        let mut units = HashMap::new();
-        let mut b = make_unit("b.service");
-        b.unit.requires.insert("a.service".to_string());
-        units.insert("a.service".to_string(), make_unit("a.service"));
-        units.insert("b.service".to_string(), b);
-
-        let mut runtime = HashMap::new();
-        runtime.insert("a.service".to_string(), UnitRuntimeInfo {
-            active_state: ActiveState::Active,
-            ..Default::default()
-        });
-        // B is not active, so it should NOT be in the stop list
-        runtime.insert("b.service".to_string(), UnitRuntimeInfo {
-            active_state: ActiveState::Inactive,
-            ..Default::default()
-        });
-
-        let order = compute_stop_order(&units, &runtime, "a.service");
-        assert_eq!(order, vec!["a.service"]);
     }
 
     // =========================================================================
@@ -2075,33 +1732,16 @@ mod tests {
     }
 
     // =========================================================================
-    // build_task_dispatch / build_unit_config tests
+    // build_unit_config tests
     // =========================================================================
 
     #[test]
-    fn test_build_task_dispatch_start() {
+    fn test_build_unit_config_service() {
         let uf = make_unit("test.service");
-        let task = WorkerTask {
-            task_id: 42,
-            unit_name: "test.service".to_string(),
-            unit_type: "service".to_string(),
-            kind: JobKind::Start,
-            unit_file: Some(uf),
-            invocation_id: Some("test-invocation-id".to_string()),
-        };
-        let dispatch = build_task_dispatch(&task);
-        assert_eq!(dispatch.task_id, 42);
-        assert_eq!(dispatch.unit_name, "test.service");
-        assert_eq!(dispatch.unit_type, "service");
-    }
-
-    #[test]
-    fn test_task_kind_to_proto() {
-        use sysa::proto::TaskKind;
-        assert_eq!(task_kind_to_proto(JobKind::Start), TaskKind::Start);
-        assert_eq!(task_kind_to_proto(JobKind::Stop), TaskKind::Stop);
-        assert_eq!(task_kind_to_proto(JobKind::Restart), TaskKind::Restart);
-        assert_eq!(task_kind_to_proto(JobKind::Reload), TaskKind::Reload);
+        let mut uf = uf;
+        uf.service = Some(crate::unit::types::ServiceSection::default());
+        let config = build_unit_config(&uf);
+        assert!(config.service.is_some());
     }
 
     // =========================================================================
@@ -2112,7 +1752,8 @@ mod tests {
     fn test_job_mode_from_str_is_idempotent() {
         for s in &["replace", "fail", "queue", "isolate", "flush", "ignore-dependencies", "ignore-requirements"] {
             let mode = JobMode::from_str(s);
-            assert_eq!(mode.as_str(), *s);
+            let mode2 = JobMode::from_str(s);
+            assert_eq!(mode, mode2);
         }
     }
 

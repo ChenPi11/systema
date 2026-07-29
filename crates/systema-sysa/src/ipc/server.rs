@@ -1,8 +1,8 @@
 //! IPC server for System A.
 //!
 //! Listens on a Unix socket at `SOCKET_PATH`. Each System Worker connects,
-//! sends a `WorkerRegistration`, then receives dispatched `TaskDispatch`
-//! messages and sends back `TaskResult` / `EventPublish` messages.
+//! sends a `WorkerRegistration`, then receives dispatched `method.call`
+//! envelopes and sends back `method.result` / `event.publish` envelopes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,16 +16,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use sysa::proto::{
-    Envelope, EventPublish, RegisterAck, RegisterUnits, StateSyncReport, TaskResult,
-    UnitRegistrationAck, WorkerRegistration,
-};
+use sysa::proto::{Envelope, EventPublish, MethodResult, RegisterAck, RegisterUnits, UnitRegistrationAck, WorkerRegistration};
 
-use crate::scheduler::{self, build_task_dispatch};
-use crate::state::{
-    next_request_id, ActiveState, AllocatorHandle, JobCompletion, JobKind, JobResultKind,
-    JobStatus, WorkerEntry, WorkerTask,
-};
+use crate::state::{next_request_id, AllocatorHandle, WorkerEntry};
 use sysa::event_bus::{Event, EventTopic};
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
@@ -33,7 +26,6 @@ pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
 
 /// Run the IPC server — accepts System Worker & Finder connections indefinitely.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
-    // Ensure the socket directory exists.
     if let Some(parent) = std::path::Path::new(sysa::paths::instance().ipc_socket_path).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -41,9 +33,6 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Check if another allocator is already listening on the socket.
-    // We try connecting first — if it succeeds, a live allocator is already
-    // running and we should exit gracefully to avoid stealing its socket.
     if let Ok(_) = tokio::net::UnixStream::connect(sysa::paths::instance().ipc_socket_path).await {
         warn!(
             "Another allocator is already listening on {}. Exiting.",
@@ -52,7 +41,6 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         return Ok(());
     }
 
-    // Remove stale socket files.
     let _ = tokio::fs::remove_file(sysa::paths::instance().ipc_socket_path).await;
     let _ = tokio::fs::remove_file(sysa::paths::instance().systema_fdpass_sock).await;
 
@@ -64,7 +52,6 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
 
     let fdpass_map: FdPassMap = Arc::new(Mutex::new(HashMap::new()));
 
-    // Spawn fdpass acceptor.
     let fpm = fdpass_map.clone();
     tokio::spawn(async move {
         if let Err(e) = run_fdpass_acceptor(fdpass_listener, fpm).await {
@@ -72,7 +59,6 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         }
     });
 
-    // Main accept loop.
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -91,7 +77,6 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     }
 }
 
-/// Accept connections on the fdpass socket, read worker_id, store stream.
 async fn run_fdpass_acceptor(
     listener: UnixListener,
     fdpass_map: FdPassMap,
@@ -102,7 +87,6 @@ async fn run_fdpass_acceptor(
         let (mut stream, _) = listener.accept().await?;
         let fpm = fdpass_map.clone();
         tokio::spawn(async move {
-            // Read worker_id (null-terminated or newline-terminated).
             let mut buf = [0u8; 128];
             let n = match stream.read(&mut buf).await {
                 Ok(0) => return,
@@ -125,7 +109,6 @@ async fn run_fdpass_acceptor(
     }
 }
 
-/// Handle a single connection — either a System Worker or System F Finder.
 async fn handle_worker(
     stream: tokio::net::UnixStream,
     allocator: AllocatorHandle,
@@ -133,7 +116,6 @@ async fn handle_worker(
 ) -> Result<()> {
     let mut framed = frame_stream(stream);
 
-    // Read the first envelope to determine the connection type.
     let env = recv_envelope(&mut framed)
         .await?
         .ok_or_else(|| anyhow::anyhow!(sysa::l10n::t_("Client disconnected before registration")))?;
@@ -151,7 +133,6 @@ async fn handle_worker(
     }
 }
 
-/// Handle a System Worker connection (existing flow).
 async fn handle_worker_session(
     mut framed: sysa::ipc::EnvelopeFramed,
     env: Envelope,
@@ -166,7 +147,7 @@ async fn handle_worker_session(
         worker_id, unit_types
     );
 
-    // --- Step 2: send RegisterAck ---
+    // Send RegisterAck.
     let ack = RegisterAck {
         accepted: true,
         message: "Welcome".to_string(),
@@ -174,22 +155,12 @@ async fn handle_worker_session(
     let ack_env = make_envelope(next_request_id(), "system-a", &worker_id, "worker.ack", ack)?;
     send_envelope(&mut framed, &ack_env).await?;
 
-    // --- Step 3: send state.sync_request so the worker reports its snapshot ---
-    {
-        use sysa::proto::StateSyncRequest;
-        let sync = StateSyncRequest {};
-        let sync_env = make_envelope(
-            next_request_id(),
-            "system-a",
-            &worker_id,
-            "state.sync_request",
-            sync,
-        )?;
-        send_envelope(&mut framed, &sync_env).await?;
-    }
+    // Create channels: envelope channel + pending_calls.
+    let (envelope_tx, mut envelope_rx) = mpsc::channel::<bytes::Bytes>(64);
+    let pending_calls: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
-    // --- Step 4: create task channel and register worker ---
-    let (task_tx, mut task_rx) = mpsc::channel::<WorkerTask>(64);
+    // Register the worker.
     {
         let mut state = allocator.write();
         state.workers.insert(
@@ -197,13 +168,12 @@ async fn handle_worker_session(
             WorkerEntry {
                 worker_id: worker_id.clone(),
                 unit_types: unit_types.clone(),
-                task_tx,
+                envelope_tx,
+                pending_calls: pending_calls.clone(),
             },
         );
     }
 
-    // We need to both send tasks and receive results/events over the same
-    // connection. Split the framed into two halves.
     let inner = framed.into_inner();
     let (reader, writer) = tokio::io::split(inner);
     let writer_stream = {
@@ -221,31 +191,31 @@ async fn handle_worker_session(
         tokio_util::codec::FramedRead::new(reader, codec)
     };
 
+    let _alloc_for_send = allocator.clone();
     let alloc_for_recv = allocator.clone();
     let worker_id_recv = worker_id.clone();
     let worker_id_send = worker_id.clone();
+    let pending_for_recv = pending_calls.clone();
 
-    // Sender task: take tasks from channel and write to socket.
+    // Sender task: reads pre-encoded envelopes from envelope_rx.
     let sender = async move {
         use futures::SinkExt;
         let mut writer = writer_stream;
-        while let Some(task) = task_rx.recv().await {
-            let dispatch = build_task_dispatch(&task);
-            let env = make_envelope(
-                next_request_id(),
-                "system-a",
-                &worker_id_send,
-                "task.dispatch",
-                dispatch,
-            )?;
-            let mut buf = bytes::BytesMut::new();
-            env.encode(&mut buf)?;
-            writer.send(buf.freeze()).await?;
+        loop {
+            match envelope_rx.recv().await {
+                Some(bytes) => {
+                    if let Err(e) = writer.send(bytes).await {
+                        warn!("Sender error for worker '{}': {}", worker_id_send, e);
+                        break;
+                    }
+                }
+                None => break,
+            }
         }
         Ok::<_, anyhow::Error>(())
     };
 
-    // Receiver task: read results/events from socket and update state.
+    // Receiver task: reads method.result and event.publish from socket.
     let receiver = async move {
         use futures::StreamExt;
         let mut reader = reader_stream;
@@ -274,16 +244,78 @@ async fn handle_worker_session(
                         "IPC envelope received from worker '{}': method={} source={} target={} payload_len={}",
                         worker_id_recv, env.method, env.source, env.target, env.payload.len()
                     );
-                    if let Err(e) = dispatch_incoming(env, alloc_for_recv.clone()).await {
-                        warn!("Error handling worker message: {}", e);
+
+                    if env.method == "method.result" {
+                        let qid = env.request_id;
+                        // Check if this request_id corresponds to a job
+                        // (via task_kinds in the allocator state).
+                        let is_task = alloc_for_recv.read().task_kinds.contains_key(&qid);
+                        if is_task {
+                            if let Ok(result) = MethodResult::decode(env.payload.as_slice()) {
+                                use crate::scheduler::handle_task_result;
+                                use sysa::controller::UnitStatus;
+                                let kind = alloc_for_recv
+                                    .read()
+                                    .task_kinds
+                                    .get(&qid)
+                                    .copied()
+                                    .unwrap_or(crate::state::JobKind::Start);
+                                handle_task_result(
+                                    alloc_for_recv.clone(),
+                                    qid,
+                                    result.success,
+                                    &result.error,
+                                    &result.unit_name,
+                                    kind,
+                                );
+                                // Update cache from method result payload.
+                                if !result.result.is_empty() {
+                                    if let Some(unit_status) = UnitStatus::decode_from(&result.result) {
+                                        let mut state = alloc_for_recv.write();
+                                        state.unit_states.insert(
+                                            result.unit_name.clone(),
+                                            crate::state::CachedUnitState {
+                                                active_state: unit_status.active_state,
+                                                sub_state: unit_status.sub_state,
+                                                main_pid: unit_status.main_pid,
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    // Empty result — optimistically set based on kind.
+                                    update_cache_on_task_result(
+                                        &alloc_for_recv,
+                                        &result.unit_name,
+                                        kind,
+                                        result.success,
+                                    );
+                                }
+                            }
+                        } else if let Some(tx) = pending_for_recv.lock().remove(&qid) {
+                            let _ = tx.send(env.payload.to_vec());
+                        }
+                        continue;
                     }
+
+                    if env.method == "event.publish" {
+                        let event = match EventPublish::decode(env.payload.as_slice()) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                warn!("Failed to decode EventPublish: {}", e);
+                                continue;
+                            }
+                        };
+                        handle_event(alloc_for_recv.clone(), event).await;
+                        continue;
+                    }
+
+                    warn!("Unknown method from worker '{}': {}", worker_id_recv, env.method);
                 }
             }
         }
         Ok::<_, anyhow::Error>(())
     };
 
-    // Run sender and receiver concurrently.
     tokio::select! {
         res = sender => {
             if let Err(e) = res { warn!("Sender error for worker: {}", e); }
@@ -293,18 +325,16 @@ async fn handle_worker_session(
         }
     }
 
-    // Deregister the worker and cancel any jobs that were pending for it.
-    // Without this, Running/Waiting jobs would stay stuck forever if the worker
-    // crashes or disconnects before sending a task.result back.
+    // Deregister the worker and cancel any pending jobs.
     {
         let mut state = allocator.write();
         state.workers.remove(&worker_id);
 
-        // Collect all Running/Waiting jobs and mark them Cancelled.
+        use crate::state::{JobCompletion, JobResultKind, JobStatus};
         let stale: Vec<JobCompletion> = state
             .jobs
             .values_mut()
-            .filter(|j| matches!(j.status, JobStatus::Running | JobStatus::Waiting))
+            .filter(|j| matches!(j.status, JobStatus::Running))
             .map(|j| {
                 j.status = JobStatus::Cancelled;
                 JobCompletion {
@@ -315,18 +345,6 @@ async fn handle_worker_session(
             })
             .collect();
 
-        // Reset any units that were in a transitional state.
-        for rt in state.runtime.values_mut() {
-            if matches!(
-                rt.active_state,
-                ActiveState::Activating | ActiveState::Deactivating
-            ) {
-                rt.active_state = ActiveState::Failed;
-                rt.sub_state = "failed".to_string();
-            }
-        }
-
-        // Emit JobRemoved for each cancelled job so waiting clients unblock.
         if let Some(ref tx) = state.job_completion_tx {
             for completion in stale {
                 let _ = tx.send(completion);
@@ -338,11 +356,6 @@ async fn handle_worker_session(
     Ok(())
 }
 
-/// Handle a System F `RegisterUnits` request.
-///
-/// Deserialises the JSON payload and places the units into the staging
-/// area.  The caller must issue a separate `CommitUnits` request to make
-/// them live.
 async fn handle_finder_register(
     mut framed: sysa::ipc::EnvelopeFramed,
     env: Envelope,
@@ -379,9 +392,6 @@ async fn handle_finder_register(
     Ok(())
 }
 
-/// Handle a System F `CommitUnits` request.
-///
-/// Commits the currently staged units into the active unit set.
 async fn handle_finder_commit(
     mut framed: sysa::ipc::EnvelopeFramed,
     _env: Envelope,
@@ -409,163 +419,195 @@ async fn handle_finder_commit(
     Ok(())
 }
 
-/// Dispatch an incoming envelope from a worker (task result or event).
-async fn dispatch_incoming(env: Envelope, allocator: AllocatorHandle) -> Result<()> {
-    match env.method.as_str() {
-        "task.result" => {
-            let result = TaskResult::decode(env.payload.as_slice())?;
-            debug!(
-                "IPC task.result: task_id={} unit={} success={} message={:?}",
-                result.task_id, result.unit_name, result.success, result.message
-            );
-            let kind = parse_task_kind_from_context(&allocator, result.task_id, &result.unit_name);
-            scheduler::handle_task_result(
-                allocator,
-                result.task_id,
-                result.success,
-                &result.message,
-                &result.unit_name,
-                kind,
-            );
-        }
-        "event.publish" => {
-            let event = EventPublish::decode(env.payload.as_slice())?;
-            debug!(
-                "IPC event.publish: event_type={} unit={} data_len={}",
-                event.event_type,
-                event.unit_name,
-                event.event_data.len()
-            );
-            handle_event(allocator, event).await?;
-        }
-        "state.sync_report" => {
-            let report = StateSyncReport::decode(env.payload.as_slice())?;
-            info!(
-                "Received state.sync_report from '{}': {} units reported",
-                env.source,
-                report.units.len()
-            );
-            handle_state_sync_report(allocator, report).await?;
-        }
-        other => {
-            warn!("Unknown method from worker: {}", other);
-        }
-    }
-    Ok(())
-}
-
-/// Look up what kind of task a task_id corresponds to using the tracked mapping.
-///
-/// Falls back to scanning running jobs for the given unit, then to `JobKind::Start`
-/// only as a last resort (with a warning).
-fn parse_task_kind_from_context(
+/// Optimistically update the runtime cache when a task completes, based on
+/// what we know the new state should be.
+fn update_cache_on_task_result(
     allocator: &AllocatorHandle,
-    task_id: u64,
     unit_name: &str,
-) -> JobKind {
-    let state = allocator.read();
-    if let Some(kind) = state.task_kinds.get(&task_id).copied() {
-        return kind;
+    kind: crate::state::JobKind,
+    success: bool,
+) {
+    if !success {
+        return;
     }
-    // Recovery: find the running job for this unit.
-    if let Some(job) = state
-        .jobs
-        .values()
-        .find(|j| j.unit_name == unit_name && matches!(j.status, JobStatus::Running))
-    {
-        warn!(
-            "task_kind mapping missing for task_id={}, unit={}, recovered from job",
-            task_id, unit_name
-        );
-        return job.kind;
-    }
-    warn!(
-        "task_kind mapping missing for task_id={}, unit={}, no recovery possible",
-        task_id, unit_name
-    );
-    JobKind::Start
-}
-
-/// Process a `StateSyncReport` from a (re-)connecting worker and update
-/// `AllocatorState.runtime` with the worker's reported unit states.
-///
-/// This is the core of crash recovery: after System A restarts or a worker
-/// reconnects, the runtime table starts empty; this report populates it so
-/// that D-Bus queries (`ListUnits`, `GetUnit`) return correct live status.
-async fn handle_state_sync_report(
-    allocator: AllocatorHandle,
-    report: StateSyncReport,
-) -> Result<()> {
     let mut state = allocator.write();
-    for unit in &report.units {
-        // Don't overwrite runtime state for units that have in-flight jobs
-        // or are in transitional states — the scheduler is actively managing them.
-        let has_running_job = state.jobs.values().any(|j| {
-            j.unit_name == unit.unit_name
-                && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
-        });
-        let is_transitioning = state
-            .runtime
-            .get(&unit.unit_name)
-            .map(|rt| {
-                matches!(
-                    rt.active_state,
-                    ActiveState::Activating | ActiveState::Deactivating
-                )
-            })
-            .unwrap_or(false);
-        if has_running_job || is_transitioning {
-            debug!(
-                "Skipping sync_report for {} (in-flight job or transitional state)",
-                unit.unit_name
-            );
-            continue;
+    let entry = state.unit_states.entry(unit_name.to_string()).or_default();
+    match kind {
+        crate::state::JobKind::Start | crate::state::JobKind::Restart => {
+            entry.active_state = "active".to_string();
+            entry.sub_state = match kind {
+                crate::state::JobKind::Start => "start".to_string(),
+                _ => entry.sub_state.clone(),
+            };
         }
-
-        let rt = state.runtime.entry(unit.unit_name.clone()).or_default();
-        rt.main_pid = if unit.main_pid > 0 { Some(unit.main_pid) } else { None };
-        rt.load_state = "loaded".to_string();
-        // Map worker state strings → ActiveState
-        match unit.state.as_str() {
-            "running" => {
-                rt.active_state = ActiveState::Active;
-                rt.sub_state = "running".to_string();
-            }
-            "dead" => {
-                rt.active_state = ActiveState::Inactive;
-                rt.sub_state = "dead".to_string();
-            }
-            "failed" => {
-                rt.active_state = ActiveState::Failed;
-                rt.sub_state = "failed".to_string();
-            }
-            other => {
-                rt.active_state = ActiveState::Inactive;
-                rt.sub_state = other.to_string();
-            }
+        crate::state::JobKind::Stop => {
+            entry.active_state = "inactive".to_string();
+            entry.sub_state = "dead".to_string();
         }
+        crate::state::JobKind::Reload => {}
     }
-    Ok(())
 }
 
 /// Handle an event published by a worker by dispatching it through the
-/// in-process event bus.  Subscribers (StateUpdater, RestartHandler, etc.)
-/// react to the event and update `AllocatorState` or schedule tasks as needed.
-async fn handle_event(allocator: AllocatorHandle, event: EventPublish) -> Result<()> {
+/// in-process event bus.
+async fn handle_event(allocator: AllocatorHandle, event: EventPublish) {
     let topic = EventTopic::from_str(&event.event_type);
 
     let ev = Event {
         topic,
-        unit_name: event.unit_name,
+        unit_name: event.unit_name.clone(),
         worker_id: String::new(),
         timestamp: tokio::time::Instant::now(),
-        data: bytes::Bytes::from(event.event_data),
+        data: bytes::Bytes::from(event.event_data.clone()),
     };
 
-    // Clone the Arc under the parking_lot lock, then dispatch through the
-    // tokio RwLock so the Send requirement of tokio::spawn is satisfied.
     let bus = allocator.read().event_bus.clone();
     bus.read().await.dispatch(&ev).await;
 
+    match event.event_type.as_str() {
+        // Proactive status push from mount worker — update the cache directly.
+        "mount.status_update" => {
+            use sysa::controller::UnitStatus;
+            if let Some(status) = UnitStatus::decode_from(&event.event_data) {
+                let cs = crate::state::CachedUnitState {
+                    active_state: status.active_state.clone(),
+                    sub_state: status.sub_state.clone(),
+                    main_pid: status.main_pid,
+                };
+                let mut state = allocator.write();
+                state.unit_states.insert(status.unit_name.clone(), cs);
+                debug!(
+                    "mount.status_update: {} active={} sub={}",
+                    status.unit_name, status.active_state, status.sub_state,
+                );
+            }
+        }
+
+        // Mount table snapshot: correlate mount points with loaded mount units
+        // and populate the runtime state cache for any unit that is already mounted.
+        "mount.table_update" => {
+            use crate::state::CachedUnitState;
+            let text = String::from_utf8_lossy(&event.event_data);
+            debug!("mount.table_update: {}", text);
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(mounts) = parsed.get("mounts").and_then(|v| v.as_array()) {
+                    // Build a set of mount points present in the kernel.
+                    let mounted: std::collections::HashSet<String> = mounts
+                        .iter()
+                        .filter_map(|m| m.get("mount_point")?.as_str().map(String::from))
+                        .collect();
+
+                    // Collect matching unit names without holding the write lock.
+                    let (to_update, total_mount_units) = {
+                        let guard = allocator.read();
+                        let mount_units: Vec<_> = guard.units.iter()
+                            .filter(|(_, uf)| uf.mount.is_some())
+                            .collect();
+                        let count = mount_units.len();
+                        let matched: Vec<String> = mount_units.into_iter()
+                            .filter(|(_, uf)| {
+                                let m = uf.mount.as_ref().unwrap();
+                                mounted.contains(&m.where_)
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        (matched, count)
+                    };
+                    debug!(
+                        "mount.table_update: {} mount units loaded, {} matched mount points",
+                        total_mount_units, to_update.len()
+                    );
+                    if to_update.is_empty() {
+                        let guard = allocator.read();
+                        for (name, uf) in guard.units.iter() {
+                            if uf.mount.is_some() {
+                                let m = uf.mount.as_ref().unwrap();
+                                debug!(
+                                    "  loaded mount unit: {} where_={}",
+                                    name, m.where_
+                                );
+                            }
+                        }
+                    }
+
+                    // Now update the cache with a write lock.
+                    let mut guard = allocator.write();
+                    for name in &to_update {
+                        guard.unit_states.entry(name.clone()).or_insert(
+                            CachedUnitState {
+                                active_state: "active".to_string(),
+                                sub_state: "mounted".to_string(),
+                                main_pid: 0,
+                            },
+                        );
+                        debug!("mount.table_update: populated cache for {}", name);
+                    }
+                }
+            }
+        }
+
+        // Legacy mount.state_change — still runs reconciliation.
+        "mount.state_change" => {
+            if let Err(e) = mount_state_change_reconcile(allocator, &event.unit_name).await {
+                warn!("mount state change reconcile error: {}", e);
+            }
+        }
+
+        _ => {}
+    }
+}
+
+/// Called when a mount worker sends `mount.state_change`.  Checks desired
+/// state against the unit's actual runtime state and enqueues a start or
+/// stop job if a mismatch exists.
+async fn mount_state_change_reconcile(allocator: AllocatorHandle, unit_name: &str) -> Result<()> {
+    use crate::scheduler::enqueue_job;
+    use crate::state::{DesiredState, JobKind, JobMode};
+    use crate::ipc::query_engine::method_call_status;
+
+    let (desired, has_matching_job) = {
+        let state = allocator.read();
+        let desired = state.desired.get(unit_name).copied();
+        let has_job = state.jobs.values().any(|j| {
+            j.unit_name == *unit_name
+                && matches!(j.status, crate::state::JobStatus::Running)
+        });
+        (desired, has_job)
+    };
+
+    let desired = match desired {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    if has_matching_job {
+        return Ok(());
+    }
+
+    let current_state = method_call_status(&allocator, unit_name)
+        .await
+        .map(|s| s.active_state)
+        .unwrap_or_else(|_| "inactive".to_string());
+
+    match desired {
+        DesiredState::Active => {
+            if current_state != "active" && current_state != "activating" {
+                debug!(
+                    "Mount state change: starting {} (desired=Active, current={})",
+                    unit_name, current_state
+                );
+                enqueue_job(allocator, unit_name, JobKind::Start, JobMode::Replace).await?;
+            }
+        }
+        DesiredState::Inactive => {
+            if current_state == "active" || current_state == "activating" {
+                debug!(
+                    "Mount state change: stopping {} (desired=Inactive, current={})",
+                    unit_name, current_state
+                );
+                enqueue_job(allocator, unit_name, JobKind::Stop, JobMode::Replace).await?;
+            }
+        }
+    }
     Ok(())
 }

@@ -129,26 +129,6 @@ pub async fn start_service(
     Ok((pid, child))
 }
 
-/// Monitor a child process and return when it exits.
-/// Returns `(exit_code, success)`.
-pub async fn wait_for_child(mut child: Child, unit_name: &str) -> (Option<i32>, bool) {
-    match child.wait().await {
-        Ok(status) => {
-            let code = status.code();
-            let success = status.success();
-            info!(
-                "Service {} exited: code={:?}, success={}",
-                unit_name, code, success
-            );
-            (code, success)
-        }
-        Err(e) => {
-            warn!("Error waiting for child process of {}: {}", unit_name, e);
-            (None, false)
-        }
-    }
-}
-
 /// Stop a running service by sending SIGTERM (then SIGKILL after timeout).
 pub async fn stop_service(
     registry: ServiceRegistry,

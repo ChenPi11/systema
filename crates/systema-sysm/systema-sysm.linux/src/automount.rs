@@ -16,7 +16,6 @@ use crate::state::{
 // ---------------------------------------------------------------------------
 
 // Values from <asm-generic/ioctl.h> and <linux/auto_dev-ioctl.h>
-const IOC_NONE: u32 = 0;
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
 const IOC_DIR_SHIFT: u32 = 30;
@@ -33,10 +32,6 @@ const fn ioc(dir: u32, ty: u8, nr: u8, size: usize) -> libc::c_ulong {
 
 const fn iowr(ty: u8, nr: u8, size: usize) -> libc::c_ulong {
     ioc(IOC_READ | IOC_WRITE, ty, nr, size)
-}
-
-const fn iow(ty: u8, nr: u8, size: usize) -> libc::c_ulong {
-    ioc(IOC_WRITE, ty, nr, size)
 }
 
 #[repr(C)]
@@ -57,8 +52,6 @@ const AUTOFS_DEV_IOCTL_OPENMOUNT: libc::c_ulong = iowr(AUTOFS_TYPE, 0x04, AUTOFS
 const AUTOFS_DEV_IOCTL_PROTOVER: libc::c_ulong = iowr(AUTOFS_TYPE, 0x01, AUTOFS_DEV_IOCTL_SIZEOF);
 const AUTOFS_DEV_IOCTL_PROTOSUBVER: libc::c_ulong = iowr(AUTOFS_TYPE, 0x02, AUTOFS_DEV_IOCTL_SIZEOF);
 const AUTOFS_DEV_IOCTL_TIMEOUT: libc::c_ulong = iowr(AUTOFS_TYPE, 0x0b, AUTOFS_DEV_IOCTL_SIZEOF);
-const AUTOFS_DEV_IOCTL_READY: libc::c_ulong = iowr(AUTOFS_TYPE, 0x06, AUTOFS_DEV_IOCTL_SIZEOF);
-const AUTOFS_DEV_IOCTL_FAIL: libc::c_ulong = iowr(AUTOFS_TYPE, 0x07, AUTOFS_DEV_IOCTL_SIZEOF);
 const AUTOFS_DEV_IOCTL_EXPIRE: libc::c_ulong = iowr(AUTOFS_TYPE, 0x0c, AUTOFS_DEV_IOCTL_SIZEOF);
 
 const AUTOFS_DEV_IOCTL_OPENMOUNT_SIZEOF: usize =
@@ -109,13 +102,11 @@ fn ensure_dev_autofs() -> Result<i32> {
 
         // Verify version
         let mut params: AutofsDevIoctl = Default::default();
-        let rc = unsafe {
-            libc::ioctl(
-                fd,
-                AUTOFS_DEV_IOCTL_VERSION,
-                &mut params as *mut _ as *mut libc::c_void,
-            )
-        };
+        let rc = libc::ioctl(
+            fd,
+            AUTOFS_DEV_IOCTL_VERSION,
+            &mut params as *mut _ as *mut libc::c_void,
+        );
         if rc < 0 {
             libc::close(fd);
             anyhow::bail!("AUTOFS_DEV_IOCTL_VERSION failed");
@@ -136,7 +127,7 @@ fn ensure_dev_autofs() -> Result<i32> {
 // ---------------------------------------------------------------------------
 
 fn open_ioctl_fd(dev_autofs_fd: i32, where_: &str, dev_id: u64) -> Result<i32> {
-    let path_c = CString::new(where_).unwrap();
+    let _path_c = CString::new(where_).unwrap();
     let path_bytes = where_.as_bytes();
 
     // Allocate buffer: struct + path + null
@@ -226,56 +217,6 @@ fn set_autofs_timeout(
     Ok(())
 }
 
-fn automount_send_ready(
-    dev_autofs_fd: i32,
-    ioctl_fd: i32,
-    token: u32,
-    success: bool,
-) -> Result<()> {
-    unsafe {
-        let mut params: AutofsDevIoctl = Default::default();
-        params.ioctlfd = ioctl_fd;
-
-        if success {
-            params.arg1 = token as u64; // ready.token
-            let rc = libc::ioctl(
-                dev_autofs_fd,
-                AUTOFS_DEV_IOCTL_READY,
-                &mut params as *mut _ as *mut libc::c_void,
-            );
-            if rc < 0 {
-                anyhow::bail!("AUTOFS_DEV_IOCTL_READY failed for token {}", token);
-            }
-        } else {
-            params.arg1 = (!0i32) as u64 as u64; // fail.status = -ENODEV, but arg1 maps to status
-            params.arg2 = token as u64; // fail.token (actually in the union, different layout)
-            // Actually the struct layout has status then token.
-            // For the fail ioctl, the union is args_fail { s32 status; u32 token; }
-            // With our AutofsDevIoctl layout: arg1=status, arg2=token doesn't match.
-            // Let's use a raw buffer approach.
-            let buf_size = 256;
-            let mut buf = vec![0u8; buf_size];
-            let p = &mut *(buf.as_mut_ptr() as *mut AutofsDevIoctl);
-            p.ioctlfd = ioctl_fd;
-            // Write fail args at offset of union (offset 16)
-            // args_fail: s32 status at offset 0 of union; u32 token at offset 4 of union
-            let union_ptr = buf.as_mut_ptr().add(16) as *mut i32;
-            *union_ptr = -5; // -ENODEV as status
-            *union_ptr.add(1) = token as i32;
-
-            let rc = libc::ioctl(
-                dev_autofs_fd,
-                AUTOFS_DEV_IOCTL_FAIL,
-                buf.as_ptr() as *const libc::c_void,
-            );
-            if rc < 0 {
-                anyhow::bail!("AUTOFS_DEV_IOCTL_FAIL failed for token {}", token);
-            }
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Mount(2) helper for autofs
 // ---------------------------------------------------------------------------
@@ -342,7 +283,6 @@ pub async fn automount_enter_waiting(
     mount_event_tx: tokio::sync::mpsc::UnboundedSender<AutomountTrigger>,
 ) -> Result<()> {
     let where_ = config.r#where.clone();
-    let associated_mount = unit_name.replace(".automount", ".mount");
 
     // Create pipe for autofs communication.
     let mut pipe_fds = [-1i32; 2];
@@ -413,7 +353,6 @@ pub async fn automount_enter_waiting(
         let mut inst = AutomountInstance::new(
             unit_name.to_string(),
             where_.clone(),
-            associated_mount,
         );
         inst.state = AutomountState::Waiting;
         inst.timeout_idle_usec = (timeout_idle_sec as u64) * 1_000_000;

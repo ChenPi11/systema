@@ -5,7 +5,7 @@
 
 use zbus::interface;
 
-use crate::state::{ActiveState, AllocatorHandle};
+use crate::state::AllocatorHandle;
 
 /// Service-specific D-Bus object bound to a unit path.
 pub struct ServiceObject {
@@ -30,15 +30,15 @@ impl ServiceObject {
     fn main_pid(&self) -> u32 {
         self.allocator
             .read()
-            .runtime
+            .unit_states
             .get(&self.unit_name)
-            .and_then(|rt| rt.main_pid)
+            .map(|s| s.main_pid)
             .unwrap_or(0)
     }
 
     #[zbus(property)]
     fn control_pid(&self) -> u32 {
-        0
+        self.main_pid()
     }
 
     #[zbus(property)]
@@ -69,16 +69,7 @@ impl ServiceObject {
 
     #[zbus(property)]
     fn result(&self) -> String {
-        let active_state = self
-            .allocator
-            .read()
-            .runtime
-            .get(&self.unit_name)
-            .map(|rt| rt.active_state.clone());
-        match active_state {
-            Some(ActiveState::Failed) => "failed".to_string(),
-            _ => "success".to_string(),
-        }
+        "success".to_string()
     }
 
     #[zbus(property)]

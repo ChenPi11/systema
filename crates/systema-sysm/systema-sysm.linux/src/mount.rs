@@ -6,7 +6,8 @@ use sysa::proto::MountConfig;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::state::{MountInstance, MountRegistry, MountResult, MountState};
+use crate::mountinfo;
+use crate::state::{MountInstance, MountRegistry, MountState};
 
 pub async fn do_mount(
     registry: MountRegistry,
@@ -29,11 +30,9 @@ pub async fn do_mount(
             .context("chmod for mount point failed")?;
     }
 
-    // Mark as mounting.
     {
         let mut reg = registry.lock();
         if let Some(inst) = reg.get_mut(unit_name) {
-            inst.state = MountState::Mounting;
             inst.from_fragment = true;
         } else {
             let mut inst = MountInstance::new(
@@ -41,7 +40,6 @@ pub async fn do_mount(
                 mount_point.clone(),
                 config.r#what.clone(),
             );
-            inst.state = MountState::Mounting;
             inst.from_fragment = true;
             inst.fstype = config.r#type.clone();
             inst.options = config.options.clone();
@@ -81,42 +79,29 @@ pub async fn do_mount(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let err = anyhow::anyhow!("mount failed: {}", stderr.trim());
-        let mut reg = registry.lock();
-        if let Some(inst) = reg.get_mut(unit_name) {
-            inst.state = MountState::Failed;
-            inst.result = MountResult::ExitCode;
-        }
         return Err(err);
     }
 
-    // Mount command succeeded. Check if mountinfo confirms it.
-    let mounted = {
-        let reg = registry.lock();
-        reg.get(unit_name)
-            .map(|inst| matches!(inst.state, MountState::MountingDone))
-            .unwrap_or(false)
-    };
-
-    if mounted {
-        let mut reg = registry.lock();
-        if let Some(inst) = reg.get_mut(unit_name) {
+    // Verify against kernel: re-check /proc/self/mountinfo.
+    // Trust the kernel, not the exit code (systemd mount_enter_dead_or_mounted pattern).
+    let actually_mounted = mountinfo::mount_point_is_mounted(&mount_point);
+    let mut reg = registry.lock();
+    if let Some(inst) = reg.get_mut(unit_name) {
+        if actually_mounted {
             inst.state = MountState::Mounted;
-            inst.result = MountResult::Success;
+        } else {
+            warn!(
+                "mount command exited OK but {} is NOT in /proc/self/mountinfo; staying Dead",
+                mount_point
+            );
         }
-        info!("Mount succeeded (confirmed by mountinfo): {}", mount_point);
+    }
+    drop(reg);
+
+    if actually_mounted {
+        info!("Mount succeeded: {}", mount_point);
     } else {
-        // Mount exited successfully but mountinfo doesn't show it yet.
-        // mountinfo poll will eventually pick it up and transition to MountingDone → Mounted.
-        let mut reg = registry.lock();
-        if let Some(inst) = reg.get_mut(unit_name) {
-            if inst.state == MountState::Mounting {
-                // Protocol error: mount returned 0 but mount point didn't appear.
-                warn!("mount returned success but mount point {} not in mountinfo", mount_point);
-                inst.state = MountState::Failed;
-                inst.result = MountResult::Protocol;
-            }
-        }
-        info!("Mount command exited successfully: {}", mount_point);
+        warn!("Mount command reported success but kernel disagrees: {}", mount_point);
     }
 
     Ok(())
@@ -127,13 +112,13 @@ pub async fn do_umount(
     unit_name: &str,
     config: Option<&MountConfig>,
 ) -> Result<()> {
-    let (mount_point, from_mountinfo) = {
+    let mount_point = {
         let reg = registry.lock();
         reg.get(unit_name)
-            .map(|inst| (inst.mount_point.clone(), inst.from_mountinfo))
+            .map(|inst| inst.mount_point.clone())
             .unwrap_or_else(|| {
                 warn!("No mount point found for {}", unit_name);
-                (String::new(), false)
+                String::new()
             })
     };
 
@@ -184,29 +169,12 @@ pub async fn do_umount(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let err = anyhow::anyhow!("umount failed: {}", stderr.trim());
-        let mut reg = registry.lock();
-        if let Some(inst) = reg.get_mut(unit_name) {
-            // If the unit was already gone from mountinfo, treat as success
-            // even though the umount process returned non-zero.  This happens
-            // when someone else unmounted it before us.
-            if from_mountinfo {
-                inst.state = MountState::Failed;
-                inst.result = MountResult::ExitCode;
-            } else {
-                inst.state = MountState::Dead;
-                inst.result = MountResult::Success;
-            }
-        }
         return Err(err);
     }
 
-    // umount succeeded
-    let still_mounted = {
-        let reg = registry.lock();
-        reg.get(unit_name)
-            .map(|inst| inst.from_mountinfo)
-            .unwrap_or(false)
-    };
+    // Verify against kernel: re-check /proc/self/mountinfo.
+    // Trust the kernel, not the exit code.
+    let still_mounted = mountinfo::mount_point_is_mounted(&mount_point);
 
     let mut reg = registry.lock();
     if let Some(inst) = reg.get_mut(unit_name) {
@@ -218,15 +186,25 @@ pub async fn do_umount(
                 "Layered mount still present, retry {}/32 for {}",
                 inst.n_retry_umount, mount_point
             );
-        } else {
+        } else if !still_mounted {
             inst.state = MountState::Dead;
             inst.from_mountinfo = false;
-            inst.result = MountResult::Success;
+            info!("Unmount succeeded: {}", mount_point);
+        } else {
+            // still_mounted && retries exhausted
+            inst.state = MountState::Dead;
+            inst.from_mountinfo = false;
+            warn!(
+                "Giving up on {} after {} retries; still in mountinfo",
+                mount_point, inst.n_retry_umount
+            );
         }
+    } else {
+        // Registry entry vanished under us; nothing to update
+        info!("Unmount succeeded: {} (no registry entry)", mount_point);
     }
     drop(reg);
 
-    info!("Unmount succeeded: {}", mount_point);
     Ok(())
 }
 
@@ -267,6 +245,14 @@ pub async fn do_remount(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("remount failed: {}", stderr.trim());
+    }
+
+    // Verify the mount point still exists after remount.
+    if !mountinfo::mount_point_is_mounted(&mount_point) {
+        warn!(
+            "remount exited OK but {} is no longer in /proc/self/mountinfo",
+            mount_point
+        );
     }
 
     info!("Remount succeeded: {}", mount_point);

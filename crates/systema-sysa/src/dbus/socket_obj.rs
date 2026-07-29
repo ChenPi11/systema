@@ -5,11 +5,13 @@
 
 use zbus::interface;
 
-use crate::state::{ActiveState, AllocatorHandle};
+use crate::state::AllocatorHandle;
 
 /// Socket-specific D-Bus object bound to a unit path.
 pub struct SocketObject {
+    #[allow(dead_code)]
     pub allocator: AllocatorHandle,
+    #[allow(dead_code)]
     pub unit_name: String,
 }
 
@@ -17,16 +19,7 @@ pub struct SocketObject {
 impl SocketObject {
     #[zbus(property)]
     fn result(&self) -> String {
-        let active_state = self
-            .allocator
-            .read()
-            .runtime
-            .get(&self.unit_name)
-            .map(|rt| rt.active_state.clone());
-        match active_state {
-            Some(ActiveState::Failed) => "failed".to_string(),
-            _ => "success".to_string(),
-        }
+        "success".to_string()
     }
 
     #[zbus(property)]

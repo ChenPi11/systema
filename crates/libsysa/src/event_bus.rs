@@ -22,7 +22,14 @@ impl EventTopic {
             "process.exit" => EventTopic::ProcessExit,
             "service.started" => EventTopic::ServiceStarted,
             "service.failed" => EventTopic::ServiceFailed,
-            "unit.state_change" => EventTopic::UnitStateChange,
+            "unit.state_change"
+            | "mount.state_change"
+            | "mount.status_update"
+            | "mount.table_update"
+            | "mount.done"
+            | "automount.done"
+            | "automount.trigger"
+            | "automount.expire" => EventTopic::UnitStateChange,
             _ => {
                 tracing::warn!("Unknown event topic string: {}", s);
                 EventTopic::ProcessExit

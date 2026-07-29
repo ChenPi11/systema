@@ -21,3 +21,4 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
+async-trait.workspace = true

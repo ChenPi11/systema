@@ -10,28 +10,16 @@ use parking_lot::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountState {
     Dead,
-    Mounting,
-    MountingDone,
     Mounted,
-    Remounting,
     Unmounting,
-    UnmountingSigterm,
-    UnmountingSigkill,
-    Failed,
 }
 
 impl MountState {
     pub fn as_str(&self) -> &str {
         match self {
             MountState::Dead => "dead",
-            MountState::Mounting => "mounting",
-            MountState::MountingDone => "mounting-done",
             MountState::Mounted => "mounted",
-            MountState::Remounting => "remounting",
             MountState::Unmounting => "unmounting",
-            MountState::UnmountingSigterm => "unmounting-sigterm",
-            MountState::UnmountingSigkill => "unmounting-sigkill",
-            MountState::Failed => "failed",
         }
     }
 }
@@ -47,18 +35,6 @@ pub struct MountInstance {
     pub from_fragment: bool,
     pub control_pid: Option<u32>,
     pub n_retry_umount: u32,
-    pub result: MountResult,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MountResult {
-    Success,
-    Resources,
-    Timeout,
-    ExitCode,
-    Signal,
-    Protocol,
-    StartLimitHit,
 }
 
 impl MountInstance {
@@ -74,7 +50,6 @@ impl MountInstance {
             from_fragment: false,
             control_pid: None,
             n_retry_umount: 0,
-            result: MountResult::Success,
         }
     }
 }
@@ -94,6 +69,7 @@ pub enum AutomountState {
     Dead,
     Waiting,
     Running,
+    #[allow(dead_code)]
     Failed,
 }
 
@@ -108,15 +84,6 @@ impl AutomountState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutomountResult {
-    Success,
-    Resources,
-    Unmounted,
-    StartLimitHit,
-    MountStartLimitHit,
-}
-
 pub struct AutomountInstance {
     pub unit_name: String,
     pub state: AutomountState,
@@ -129,12 +96,10 @@ pub struct AutomountInstance {
     pub ioctl_fd: Option<i32>,
     pub tokens: Vec<u32>,
     pub expire_tokens: Vec<u32>,
-    pub associated_mount: String,
-    pub result: AutomountResult,
 }
 
 impl AutomountInstance {
-    pub fn new(unit_name: String, where_: String, associated_mount: String) -> Self {
+    pub fn new(unit_name: String, where_: String) -> Self {
         AutomountInstance {
             unit_name,
             state: AutomountState::Dead,
@@ -147,8 +112,6 @@ impl AutomountInstance {
             ioctl_fd: None,
             tokens: Vec::new(),
             expire_tokens: Vec::new(),
-            associated_mount,
-            result: AutomountResult::Success,
         }
     }
 }

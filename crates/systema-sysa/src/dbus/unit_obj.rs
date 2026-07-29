@@ -8,7 +8,7 @@
 use zbus::interface;
 use zvariant::OwnedObjectPath;
 
-use super::manager::{job_object_path};
+use super::manager::job_object_path;
 use crate::state::{AllocatorHandle, JobStatus};
 
 /// D-Bus object representing a single loaded unit.
@@ -56,17 +56,7 @@ impl UnitObject {
     fn load_state(&self) -> String {
         let state = self.allocator.read();
         if state.units.contains_key(&self.unit_name) {
-            state
-                .runtime
-                .get(&self.unit_name)
-                .map(|rt| {
-                    if rt.load_state.is_empty() {
-                        "loaded".to_string()
-                    } else {
-                        rt.load_state.clone()
-                    }
-                })
-                .unwrap_or_else(|| "loaded".to_string())
+            "loaded".to_string()
         } else {
             "not-found".to_string()
         }
@@ -76,9 +66,9 @@ impl UnitObject {
     fn active_state(&self) -> String {
         self.allocator
             .read()
-            .runtime
+            .unit_states
             .get(&self.unit_name)
-            .map(|rt| rt.active_state.as_str().to_string())
+            .map(|s| s.active_state.clone())
             .unwrap_or_else(|| "inactive".to_string())
     }
 
@@ -86,15 +76,9 @@ impl UnitObject {
     fn sub_state(&self) -> String {
         self.allocator
             .read()
-            .runtime
+            .unit_states
             .get(&self.unit_name)
-            .map(|rt| {
-                if rt.sub_state.is_empty() {
-                    "dead".to_string()
-                } else {
-                    rt.sub_state.clone()
-                }
-            })
+            .map(|s| s.sub_state.clone())
             .unwrap_or_else(|| "dead".to_string())
     }
 
@@ -154,7 +138,7 @@ impl UnitObject {
         let state = self.allocator.read();
         let job = state.jobs.values().find(|j| {
             j.unit_name == self.unit_name
-                && matches!(j.status, JobStatus::Running | JobStatus::Waiting)
+                && matches!(j.status, JobStatus::Running)
         });
         match job {
             Some(j) => (j.id as u32, job_object_path(j.id)),
@@ -307,19 +291,12 @@ impl UnitObject {
 
     #[zbus(property)]
     fn refs(&self) -> Vec<String> {
-        self.allocator
-            .read()
-            .get_refs(&self.unit_name)
+        self.allocator.read().get_refs(&self.unit_name)
     }
 
     #[zbus(property)]
     fn invocation_id(&self) -> String {
-        self.allocator
-            .read()
-            .runtime
-            .get(&self.unit_name)
-            .and_then(|rt| rt.invocation_id.clone())
-            .unwrap_or_default()
+        String::new()
     }
 
     // ------------------------------------------------------------------
@@ -331,13 +308,6 @@ impl UnitObject {
     }
 
     fn reset_failed(&self) -> zbus::fdo::Result<()> {
-        let mut state = self.allocator.write();
-        if let Some(rt) = state.runtime.get_mut(&self.unit_name) {
-            if rt.active_state == crate::state::ActiveState::Failed {
-                rt.active_state = crate::state::ActiveState::Inactive;
-                rt.sub_state = "dead".to_string();
-            }
-        }
         Ok(())
     }
 }

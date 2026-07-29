@@ -64,51 +64,6 @@ pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {
     Ok(())
 }
 
-/// Load a single named unit, searching through the standard paths.
-pub async fn load_named_unit(allocator: AllocatorHandle, name: &str) -> Result<Option<UnitFile>> {
-    // Check if already loaded.
-    {
-        let state = allocator.read();
-        if let Some(unit) = state.units.get(name) {
-            return Ok(Some(unit.clone()));
-        }
-    }
-
-    // Check for masked units (symlink to /dev/null).
-    if is_unit_masked(name) {
-        debug!("Unit {} is masked (symlink to /dev/null)", name);
-        return Ok(None);
-    }
-
-    // Search in order.
-    let paths: Vec<PathBuf> = sysa::paths::instance().unit_search_paths
-        .iter()
-        .map(|d| Path::new(d).join(name))
-        .collect();
-
-    for path in paths {
-        if path.exists() {
-            match load_unit_file(&path) {
-                Ok(unit) => {
-                    let unit_clone = unit.clone();
-                    let mut state = allocator.write();
-                    state.units.insert(name.to_string(), unit);
-                    // Notify the D-Bus layer if it's already running.
-                    if let Some(ref tx) = state.unit_loaded_tx {
-                        let _ = tx.send(name.to_string());
-                    }
-                    return Ok(Some(unit_clone));
-                }
-                Err(e) => {
-                    warn!("Failed to load unit file {}: {}", path.display(), e);
-                }
-            }
-        }
-    }
-
-    Ok(None)
-}
-
 /// Load all units from the standard search paths whose file names match
 /// `predicate`, skipping units that are already in memory.
 pub async fn load_units_matching<F>(allocator: AllocatorHandle, predicate: F) -> Result<usize>
@@ -127,70 +82,6 @@ where
     }
 
     Ok(total)
-}
-
-/// Unload a unit from memory (remove from the units map).
-pub fn unload_unit(allocator: &AllocatorHandle, name: &str) -> bool {
-    let mut state = allocator.write();
-    state.units.remove(name).is_some()
-}
-
-/// Register a transient unit (runtime-only unit without a file on disk).
-pub fn register_transient_unit(
-    allocator: &AllocatorHandle,
-    name: String,
-    unit: UnitFile,
-) -> Result<()> {
-    let mut state = allocator.write();
-    state.units.insert(name.clone(), unit);
-    if let Some(ref tx) = state.unit_loaded_tx {
-        let _ = tx.send(name);
-    }
-    Ok(())
-}
-
-/// Get all unit aliases for a given unit name.
-/// Aliases are defined in the [Install] section's Alias= directive.
-pub fn get_unit_aliases(allocator: &AllocatorHandle, name: &str) -> Vec<String> {
-    let state = allocator.read();
-    if let Some(unit) = state.units.get(name) {
-        unit.install.alias.clone()
-    } else {
-        Vec::new()
-    }
-}
-
-/// Resolve a unit alias to its canonical name.
-/// Returns the canonical name if the alias exists, or the original name.
-pub fn resolve_alias(allocator: &AllocatorHandle, name: &str) -> String {
-    let state = allocator.read();
-    // Check if any unit has this name as an alias
-    for (canonical_name, unit) in &state.units {
-        if unit.install.alias.contains(&name.to_string()) {
-            return canonical_name.clone();
-        }
-    }
-    name.to_string()
-}
-
-/// Check if a unit is masked (symlink to /dev/null).
-pub fn is_unit_masked(name: &str) -> bool {
-    for dir in sysa::paths::instance().unit_search_paths.iter() {
-        let path = Path::new(dir).join(name);
-        if path.exists() {
-            // Check if it's a symlink to /dev/null
-            if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-                if metadata.file_type().is_symlink() {
-                    if let Ok(target) = std::fs::read_link(&path) {
-                        if target == Path::new("/dev/null") {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
 }
 
 // --------------------------------------------------------------------------
@@ -327,7 +218,6 @@ fn load_unit_file(path: &Path) -> Result<UnitFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Allocator;
 
     #[test]
     fn test_is_known_extension() {
@@ -345,38 +235,4 @@ mod tests {
         assert!(!is_known_extension("noextension"));
     }
 
-    #[tokio::test]
-    async fn test_load_named_unit_not_found() {
-        let allocator = Allocator::new();
-        let result = load_named_unit(allocator, "nonexistent.service").await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_unload_unit() {
-        let allocator = Allocator::new();
-        // First, insert a unit
-        {
-            let mut state = allocator.write();
-            let unit = UnitFile::new("test.service");
-            state.units.insert("test.service".to_string(), unit);
-        }
-        
-        // Now unload it
-        assert!(unload_unit(&allocator, "test.service"));
-        assert!(!unload_unit(&allocator, "test.service")); // Already unloaded
-        
-        let state = allocator.read();
-        assert!(!state.units.contains_key("test.service"));
-    }
-
-    #[test]
-    fn test_register_transient_unit() {
-        let allocator = Allocator::new();
-        let unit = UnitFile::new("transient.service");
-        register_transient_unit(&allocator, "transient.service".to_string(), unit).unwrap();
-        
-        let state = allocator.read();
-        assert!(state.units.contains_key("transient.service"));
-    }
 }

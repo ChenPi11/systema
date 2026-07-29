@@ -17,6 +17,7 @@ pub enum TargetState {
 
 /// Runtime state for a single target instance.
 pub struct TargetInstance {
+    #[allow(dead_code)]
     pub unit_name: String,
     pub state: TargetState,
 }

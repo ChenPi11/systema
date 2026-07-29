@@ -1,3 +1,4 @@
+mod controller;
 mod ipc;
 mod mount;
 mod state;

@@ -6,6 +6,7 @@
 //! - Execute service processes (fork/exec), track their lifecycle.
 //! - Report `TaskResult` and publish `EventPublish` messages back to System A.
 
+mod controller;
 mod ipc;
 mod process;
 mod state;

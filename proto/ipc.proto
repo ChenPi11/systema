@@ -81,6 +81,89 @@ message EventPublish {
     bytes event_data = 3;
 }
 
+// Sent by System A to query a single unit's runtime state from its worker.
+message StateQuery {
+    // Unit name to query, e.g. "nginx.service".
+    string unit_name = 1;
+}
+
+// Response from a worker to StateQuery.
+message StateQueryResult {
+    // Unit name matching the query.
+    string unit_name = 1;
+    // Active state string, e.g. "active", "inactive", "failed", "activating", "deactivating".
+    string active_state = 2;
+    // Sub state string, e.g. "running", "dead", "failed", "start", "stop".
+    string sub_state = 3;
+    // PID of the main process (0 if not running).
+    uint32 main_pid = 4;
+    // Invocation ID (UUID v4) of the current activation, if any.
+    string invocation_id = 5;
+}
+
+// Sent by System A to query all units managed by a worker.
+message StateQueryAll {
+}
+
+// Response to StateQueryAll containing state for every unit this worker manages.
+message StateQueryAllResult {
+    repeated StateQueryResult units = 1;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Generic method call / result (replaces TaskDispatch, StateQuery,
+// StateQueryAll, StateSyncRequest, and their responses).
+// ──────────────────────────────────────────────────────────────────
+
+// Sent by System A to invoke a method on a unit managed by the worker.
+// Methods: "status", "start", "stop", "restart", "reload"
+message MethodCall {
+    // Method name (e.g. "status", "start", "stop").
+    string method = 1;
+    // The target unit name.
+    string unit_name = 2;
+    // Method-specific serialized arguments.
+    // For start/restart/reload this is a serialized UnitConfig.
+    // For status/stop this is empty.
+    bytes args = 3;
+    // Unique invocation ID for this activation (UUID v4).
+    // Set for start/restart calls; empty otherwise.
+    string invocation_id = 4;
+}
+
+// Response from a worker to a MethodCall.
+message MethodResult {
+    // Echoes the method name from the call.
+    string method = 1;
+    // Echoes the unit name from the call.
+    string unit_name = 2;
+    // True if the call succeeded.
+    bool success = 3;
+    // Human-readable error message (empty on success).
+    string error = 4;
+    // Method-specific serialized result.
+    // For "status" this is a serialized UnitStatus.
+    // For other methods this is empty.
+    bytes result = 5;
+}
+
+// Runtime state snapshot returned by a "status" call.
+message UnitStatus {
+    // Unit name.
+    string unit_name = 1;
+    // Active state: "active", "inactive", "activating", "deactivating", "failed".
+    string active_state = 2;
+    // Worker-specific sub-state (e.g. "running", "mounted", "listening", "dead").
+    string sub_state = 3;
+    // PID of the main process, or 0 if not running / not applicable.
+    uint32 main_pid = 4;
+    // Invocation ID (UUID v4) of the current activation, if any.
+    string invocation_id = 5;
+    // Worker-specific key-value extensions for properties that don't fit
+    // the common schema (e.g. "exec_main_code", "n_accepted").
+    map<string, string> extensions = 6;
+}
+
 // Sent by System A to acknowledge a worker registration.
 message RegisterAck {
     bool accepted = 1;
