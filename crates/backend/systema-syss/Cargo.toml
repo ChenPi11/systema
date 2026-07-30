@@ -1,24 +1,28 @@
 [package]
-name = "systema-syst"
+name = "systema-syss"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "systema-syst"
+name = "systema-syss"
 path = "src/main.rs"
 
 [dependencies]
-sysa = { path = "../libsysa" }
+sysa = { path = "../../libsysa" }
 
 tokio.workspace = true
 tokio-util.workspace = true
-prost.workspace = true
-bytes.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 futures.workspace = true
-parking_lot.workspace = true
 async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "signal", "user"] }

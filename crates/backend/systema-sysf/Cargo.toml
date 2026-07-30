@@ -9,7 +9,7 @@ name = "systema-sysf"
 path = "src/main.rs"
 
 [dependencies]
-sysa = { path = "../libsysa" }
+sysa = { path = "../../libsysa" }
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

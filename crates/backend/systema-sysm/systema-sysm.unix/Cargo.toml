@@ -1,15 +1,18 @@
+cargo-features = ["different-binary-name"]
+
 [package]
-name = "systema-syss"
+name = "systema-sysm-unix"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "systema-syss"
+name = "systema-sysm-unix"
+filename = "systema-sysm.unix"
 path = "src/main.rs"
 
 [dependencies]
-sysa = { path = "../libsysa" }
+sysa = { path = "../../../libsysa" }
 
 tokio.workspace = true
 tokio-util.workspace = true
@@ -23,6 +26,3 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["process", "signal", "user"] }

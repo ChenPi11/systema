@@ -1,28 +1,35 @@
-cargo-features = ["different-binary-name"]
-
 [package]
-name = "systema-sysm-unix"
+name = "systema-sysa"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "systema-sysm-unix"
-filename = "systema-sysm.unix"
+name = "systema-sysa"
 path = "src/main.rs"
 
 [dependencies]
 sysa = { path = "../../libsysa" }
+systema-sysf = { path = "../systema-sysf" }
 
 tokio.workspace = true
 tokio-util.workspace = true
+prost.workspace = true
+bytes.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-clap.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+uuid.workspace = true
+once_cell.workspace = true
+libc = "0.2"
+parking_lot.workspace = true
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-parking_lot.workspace = true
+petgraph.workspace = true
+configparser.workspace = true
+zbus.workspace = true
+zvariant.workspace = true
