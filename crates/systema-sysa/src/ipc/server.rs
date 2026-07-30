@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use prost::Message as ProstMessage;
 use tokio::net::UnixListener;
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use sysa::proto::{Envelope, EventPublish, MethodResult, RegisterAck, RegisterUnits, UnitRegistrationAck, WorkerRegistration};
+use sysa::proto::{AdminStagingOp, AdminStagingResult, Envelope, EventPublish, MethodResult, RegisterAck, RegisterUnits, StagingAreaEntry, StagingQueryResult, UnitRegistrationAck, WorkerRegistration};
 
 use crate::state::{next_request_id, AllocatorHandle, WorkerEntry};
 use sysa::event_bus::{Event, EventTopic};
@@ -109,11 +109,40 @@ async fn run_fdpass_acceptor(
     }
 }
 
+/// Extract the peer PID and UID from a Unix stream via SO_PEERCRED.
+fn peer_cred(stream: &UnixStream) -> Result<(u32, u32)> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            anyhow::bail!("SO_PEERCRED failed: {e}");
+        }
+        Ok((cred.pid as u32, cred.uid as u32))
+    }
+}
+
+/// The system UID (the UID running the allocator).
+fn system_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
 async fn handle_worker(
     stream: tokio::net::UnixStream,
     allocator: AllocatorHandle,
     _fdpass_map: FdPassMap,
 ) -> Result<()> {
+    let (client_pid, client_uid) = peer_cred(&stream)
+        .context("failed to get peer credentials")?;
     let mut framed = frame_stream(stream);
 
     let env = recv_envelope(&mut framed)
@@ -122,11 +151,13 @@ async fn handle_worker(
 
     match env.method.as_str() {
         "worker.register" => handle_worker_session(framed, env, allocator).await,
-        "finder.register_units" => handle_finder_register(framed, env, allocator).await,
-        "finder.commit_units" => handle_finder_commit(framed, env, allocator).await,
+        "finder.register_units" => handle_finder_register(framed, env, allocator, client_pid).await,
+        "finder.commit_units" => handle_finder_commit(framed, env, allocator, client_pid).await,
+        "staging.query" => handle_finder_query(framed, env, allocator, client_pid).await,
+        "admin.staging" => handle_admin_staging(framed, env, allocator, client_uid).await,
         other => {
             anyhow::bail!(sysa::l10n::fmt(
-                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', or 'finder.commit_units', got '{method}'"),
+                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', or 'admin.staging', got '{method}'"),
                 &[("method", other)],
             ))
         }
@@ -368,12 +399,13 @@ async fn handle_finder_register(
     mut framed: sysa::ipc::EnvelopeFramed,
     env: Envelope,
     allocator: AllocatorHandle,
+    client_pid: u32,
 ) -> Result<()> {
-    let result = try_finder_register(env, allocator).await;
-    let ack = match result {
-        Ok(ack) => ack,
+    let result = try_finder_register(env, allocator, client_pid).await;
+    let ack = match &result {
+        Ok(ack) => ack.clone(),
         Err(e) => {
-            warn!("Finder register failed: {}", e);
+            warn!("Finder register (PID={client_pid}) failed: {e}");
             UnitRegistrationAck {
                 success: false,
                 message: e.to_string(),
@@ -387,43 +419,51 @@ async fn handle_finder_register(
     Ok(())
 }
 
-async fn try_finder_register(env: Envelope, allocator: AllocatorHandle) -> Result<UnitRegistrationAck> {
-    info!("Finder (System F) registering units into staging");
-
+async fn try_finder_register(env: Envelope, allocator: AllocatorHandle, pid: u32) -> Result<UnitRegistrationAck> {
     let reg_msg = RegisterUnits::decode(env.payload.as_slice())?;
-    let json_bytes = reg_msg.units_json;
+    let label = reg_msg.debug_label;
+    info!("Finder (PID={pid}) registering units (label='{label}')");
 
     let units: std::collections::HashMap<String, systema_sysf::ir::UnitIR> =
-        serde_json::from_slice(&json_bytes)
+        serde_json::from_slice(&reg_msg.units_json)
             .map_err(|e| anyhow::anyhow!(sysa::l10n::fmt(
                 sysa::l10n::t_("Failed to deserialize UnitIR JSON: {error}"),
                 &[("error", &e.to_string())],
             )))?;
 
-    let unit_count = units.len();
-    {
-        let mut state = allocator.write();
-        state.set_staging_units(units);
+    let mut state = allocator.write();
+    match state.init_staging_area(pid, &label, units) {
+        Ok(count) => {
+            drop(state);
+            Ok(UnitRegistrationAck {
+                success: true,
+                message: sysa::l10n::fmt(sysa::l10n::t_("{count} units staged for PID {pid}."), &[("count", &count.to_string()), ("pid", &pid.to_string())]),
+                unit_count: count,
+            })
+        }
+        Err(msg) => {
+            drop(state);
+            warn!("{msg}");
+            Ok(UnitRegistrationAck {
+                success: false,
+                message: msg,
+                unit_count: 0,
+            })
+        }
     }
-    info!("Finder staged {} units", unit_count);
-
-    Ok(UnitRegistrationAck {
-        success: true,
-        message: sysa::l10n::fmt(sysa::l10n::t_("{count} units staged."), &[("count", &unit_count.to_string())]),
-        unit_count: unit_count as u32,
-    })
 }
 
 async fn handle_finder_commit(
     mut framed: sysa::ipc::EnvelopeFramed,
     _env: Envelope,
     allocator: AllocatorHandle,
+    client_pid: u32,
 ) -> Result<()> {
-    let result = try_finder_commit(allocator).await;
-    let ack = match result {
-        Ok(ack) => ack,
+    let result = try_finder_commit(allocator, client_pid).await;
+    let ack = match &result {
+        Ok(ack) => ack.clone(),
         Err(e) => {
-            warn!("Finder commit failed: {}", e);
+            warn!("Finder commit (PID={client_pid}) failed: {e}");
             UnitRegistrationAck {
                 success: false,
                 message: e.to_string(),
@@ -437,22 +477,188 @@ async fn handle_finder_commit(
     Ok(())
 }
 
-async fn try_finder_commit(allocator: AllocatorHandle) -> Result<UnitRegistrationAck> {
-    info!("Finder (System F) committing staging into active set");
+async fn try_finder_commit(allocator: AllocatorHandle, pid: u32) -> Result<UnitRegistrationAck> {
+    info!("Finder (PID={pid}) committing staging area");
 
-    let unit_count = {
-        let mut state = allocator.write();
-        let count = state.staging_units.len();
-        state.commit_staging();
-        count
+    let mut state = allocator.write();
+    match state.commit_staging(pid) {
+        Ok(count) => {
+            drop(state);
+            Ok(UnitRegistrationAck {
+                success: true,
+                message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed for PID {pid}."), &[("count", &count.to_string()), ("pid", &pid.to_string())]),
+                unit_count: count,
+            })
+        }
+        Err(msg) => {
+            drop(state);
+            warn!("{msg}");
+            Ok(UnitRegistrationAck {
+                success: false,
+                message: msg,
+                unit_count: 0,
+            })
+        }
+    }
+}
+
+async fn handle_finder_query(
+    mut framed: sysa::ipc::EnvelopeFramed,
+    _env: Envelope,
+    allocator: AllocatorHandle,
+    client_pid: u32,
+) -> Result<()> {
+    let result = try_finder_query(allocator, client_pid).await;
+    let ack = match &result {
+        Ok(ack) => ack.clone(),
+        Err(e) => {
+            warn!("Staging query (PID={client_pid}) failed: {e}");
+            StagingQueryResult {
+                success: false,
+                message: e.to_string(),
+                units_json: vec![],
+                unit_count: 0,
+            }
+        }
     };
-    info!("Finder committed {} units into active set", unit_count);
+    let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "staging.query_result", ack)?;
+    send_envelope(&mut framed, &ack_env).await?;
+    Ok(())
+}
 
-    Ok(UnitRegistrationAck {
-        success: true,
-        message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed."), &[("count", &unit_count.to_string())]),
-        unit_count: unit_count as u32,
-    })
+async fn try_finder_query(allocator: AllocatorHandle, pid: u32) -> Result<StagingQueryResult> {
+    let state = allocator.read();
+    match state.get_staging_area_by_pid(pid) {
+        Some(area) => {
+            let count = area.units.len() as u32;
+            let json = serde_json::to_vec(&area.units)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize staging units: {e}"))?;
+            Ok(StagingQueryResult {
+                success: true,
+                message: String::new(),
+                units_json: json,
+                unit_count: count,
+            })
+        }
+        None => {
+            let msg = format!("no staging area for PID {pid}");
+            warn!("{msg}");
+            Ok(StagingQueryResult {
+                success: false,
+                message: msg,
+                units_json: vec![],
+                unit_count: 0,
+            })
+        }
+    }
+}
+
+async fn handle_admin_staging(
+    mut framed: sysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<()> {
+    let sys_uid = system_uid();
+    if client_uid != 0 && client_uid != sys_uid {
+        let result = AdminStagingResult {
+            success: false,
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_("Permission denied (UID {uid}): only root or UID {sys_uid} may query staging areas."),
+                &[("uid", &client_uid.to_string()), ("sys_uid", &sys_uid.to_string())],
+            ),
+            entries: vec![],
+        };
+        let ack_env = make_envelope(next_request_id(), "system-a", "", "admin.staging.result", result)?;
+        send_envelope(&mut framed, &ack_env).await?;
+        return Ok(());
+    }
+
+    let op = AdminStagingOp::decode(env.payload.as_slice())?;
+
+    // Collect result data synchronously, drop the lock, then send async.
+    let result = build_admin_result(&op, &allocator);
+    let ack_env = make_envelope(next_request_id(), "system-a", "", "admin.staging.result", result)?;
+    send_envelope(&mut framed, &ack_env).await?;
+    Ok(())
+}
+
+fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> AdminStagingResult {
+    let state = allocator.read();
+    match op.op.as_str() {
+        "list" => {
+            let entries: Vec<StagingAreaEntry> = state.list_staging_areas().into_iter().map(|(pid, label)| {
+                let count = state.staging_areas.get(&pid).map(|a| a.units.len() as u32).unwrap_or(0);
+                StagingAreaEntry {
+                    pid,
+                    debug_label: label.to_string(),
+                    unit_count: count,
+                    units_json: vec![],
+                }
+            }).collect();
+            AdminStagingResult { success: true, message: String::new(), entries }
+        }
+        "by_pid" => {
+            match state.get_staging_area_by_pid(op.pid) {
+                Some(area) => {
+                    let json = serde_json::to_vec(&area.units).unwrap_or_default();
+                    AdminStagingResult {
+                        success: true,
+                        message: String::new(),
+                        entries: vec![StagingAreaEntry {
+                            pid: area.pid,
+                            debug_label: area.debug_label.clone(),
+                            unit_count: area.units.len() as u32,
+                            units_json: json,
+                        }],
+                    }
+                }
+                None => AdminStagingResult {
+                    success: false,
+                    message: format!("no staging area for PID {}", op.pid),
+                    entries: vec![],
+                },
+            }
+        }
+        "by_name" => {
+            let areas = state.get_staging_areas_by_name(&op.name);
+            if areas.is_empty() {
+                AdminStagingResult {
+                    success: false,
+                    message: format!("no staging area with label '{}'", op.name),
+                    entries: vec![],
+                }
+            } else {
+                let entries = areas.iter().map(|a| {
+                    let json = serde_json::to_vec(&a.units).unwrap_or_default();
+                    StagingAreaEntry {
+                        pid: a.pid,
+                        debug_label: a.debug_label.clone(),
+                        unit_count: a.units.len() as u32,
+                        units_json: json,
+                    }
+                }).collect();
+                AdminStagingResult { success: true, message: String::new(), entries }
+            }
+        }
+        "all" => {
+            let entries: Vec<StagingAreaEntry> = state.all_staging_areas().values().map(|a| {
+                let json = serde_json::to_vec(&a.units).unwrap_or_default();
+                StagingAreaEntry {
+                    pid: a.pid,
+                    debug_label: a.debug_label.clone(),
+                    unit_count: a.units.len() as u32,
+                    units_json: json,
+                }
+            }).collect();
+            AdminStagingResult { success: true, message: String::new(), entries }
+        }
+        other => AdminStagingResult {
+            success: false,
+            message: format!("unknown admin staging op '{other}'"),
+            entries: vec![],
+        },
+    }
 }
 
 /// Optimistically update the runtime cache when a task completes, based on

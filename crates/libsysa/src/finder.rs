@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use prost::Message;
 
 use crate::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use crate::proto::{CommitUnits, RegisterUnits, UnitRegistrationAck};
+use crate::proto::{CommitUnits, RegisterUnits, StagingQuery, StagingQueryResult, UnitRegistrationAck};
 
 pub struct UnitFinder {
     socket_path: String,
@@ -15,13 +15,16 @@ impl UnitFinder {
         }
     }
 
-    pub async fn register_units(&self, units_json: Vec<u8>) -> Result<UnitRegistrationAck> {
+    pub async fn register_units(&self, debug_label: &str, units_json: Vec<u8>) -> Result<UnitRegistrationAck> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
         let mut framed = frame_stream(stream);
 
-        let reg_msg = RegisterUnits { units_json };
+        let reg_msg = RegisterUnits {
+            debug_label: debug_label.to_string(),
+            units_json,
+        };
         let reg_env = make_envelope(1, "system-f", "system-a", "finder.register_units", reg_msg)?;
         send_envelope(&mut framed, &reg_env).await?;
 
@@ -44,7 +47,9 @@ impl UnitFinder {
             .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
         let mut framed = frame_stream(stream);
 
-        let commit_msg = CommitUnits {};
+        let commit_msg = CommitUnits {
+            debug_label: String::new(),
+        };
         let commit_env = make_envelope(1, "system-f", "system-a", "finder.commit_units", commit_msg)?;
         send_envelope(&mut framed, &commit_env).await?;
 
@@ -59,5 +64,28 @@ impl UnitFinder {
         let ack = UnitRegistrationAck::decode(ack_env.payload.as_slice())
             .context("Failed to decode UnitRegistrationAck")?;
         Ok(ack)
+    }
+
+    pub async fn query_staging(&self) -> Result<StagingQueryResult> {
+        let stream = tokio::net::UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
+        let mut framed = frame_stream(stream);
+
+        let query = StagingQuery {};
+        let query_env = make_envelope(1, "system-f", "system-a", "staging.query", query)?;
+        send_envelope(&mut framed, &query_env).await?;
+
+        let result_env = recv_envelope(&mut framed)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("System A disconnected before sending query result."))?;
+
+        if result_env.method != "staging.query_result" {
+            anyhow::bail!("Expected 'staging.query_result', got '{}'", result_env.method);
+        }
+
+        let result = StagingQueryResult::decode(result_env.payload.as_slice())
+            .context("Failed to decode StagingQueryResult")?;
+        Ok(result)
     }
 }

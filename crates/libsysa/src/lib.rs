@@ -11,6 +11,7 @@ pub mod finder;
 pub mod l10n;
 pub mod ipc;
 pub mod paths;
+pub mod staging_admin;
 pub mod worker_ipc;
 pub mod proto {
     //! Generated protobuf types for the IPC protocol.

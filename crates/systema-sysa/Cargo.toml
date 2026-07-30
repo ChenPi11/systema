@@ -24,6 +24,7 @@ futures.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
 once_cell.workspace = true
+libc = "0.2"
 parking_lot.workspace = true
 clap.workspace = true
 serde.workspace = true

@@ -193,15 +193,35 @@ message StateSyncReport {
     repeated SyncUnitState units = 1;
 }
 
-// Sent by System F (Finder) to register discovered units as JSON-serialized
-// UnitIR values.  System A stores them in staging until CommitUnits is sent.
+// Sent by a System Worker to register discovered units as JSON-serialized
+// UnitIR values bound to the caller's PID.
 message RegisterUnits {
+    // Debug label for the staging area (not used for identity).
+    string debug_label = 1;
     // JSON-serialized map of unit_id → UnitIR.
-    bytes units_json = 1;
+    bytes units_json = 2;
 }
 
-// Sent by System F to commit staged units into the active dependency graph.
+// Sent by a System Worker to commit its PID-bound staging area.
 message CommitUnits {
+    // Debug label (ignored; area is identified by caller PID).
+    string debug_label = 1;
+}
+
+// Sent by a System Worker to query its own PID-bound staging area.
+message StagingQuery {
+}
+
+// Response to a StagingQuery (worker's own area).
+message StagingQueryResult {
+    // True if the staging area was found.
+    bool success = 1;
+    // Human-readable message (empty on success).
+    string message = 2;
+    // JSON-serialized map of unit_id → UnitIR (empty on failure).
+    bytes units_json = 3;
+    // Number of units in the staging area (0 on failure).
+    uint32 unit_count = 4;
 }
 
 // Sent by System A to acknowledge a unit registration or commit.
@@ -209,6 +229,37 @@ message UnitRegistrationAck {
     bool success = 1;
     string message = 2;
     uint32 unit_count = 3;
+}
+
+// --- Staging area administration (root / systema-uid only) ---
+
+// Query a staging area or list all areas.
+message AdminStagingOp {
+    // "list"         → return pid + debug_label for every area
+    // "by_pid"       → return full data for the given pid
+    // "by_name"      → return full data for area(s) matching debug_label
+    // "all"          → return full data for every area
+    string op = 1;
+    // PID filter for "by_pid" operation.
+    uint32 pid = 2;
+    // Name filter for "by_name" operation.
+    string name = 3;
+}
+
+// One entry in an AdminStagingResult.
+message StagingAreaEntry {
+    uint32 pid = 1;
+    string debug_label = 2;
+    uint32 unit_count = 3;
+    // JSON-serialized map of unit_id → UnitIR (empty for "list").
+    bytes units_json = 4;
+}
+
+// Response to AdminStagingOp.
+message AdminStagingResult {
+    bool success = 1;
+    string message = 2;
+    repeated StagingAreaEntry entries = 3;
 }
 
 // Configuration for a .socket unit, sent inside UnitConfig.

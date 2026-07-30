@@ -15,7 +15,7 @@ use sysa::event_bus::EventBus;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock as TokioRwLock;
-use tracing::{debug, info};
+use tracing::info;
 use uuid::Uuid;
 
 use systema_sysf::ir::UnitIR;
@@ -209,6 +209,14 @@ pub struct WorkerEntry {
     pub pending_calls: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
 }
 
+/// A staging area bound to a single worker PID.
+#[derive(Debug, Clone)]
+pub struct StagingArea {
+    pub debug_label: String,
+    pub pid: u32,
+    pub units: HashMap<String, UnitIR>,
+}
+
 // --------------------------------------------------------------------------
 // Allocator state
 // --------------------------------------------------------------------------
@@ -245,12 +253,13 @@ pub struct AllocatorState {
     /// inside `tokio::spawn`-ed tasks (parking_lot guards are not `Send`).
     pub event_bus: Arc<TokioRwLock<EventBus>>,
 
-    /// Staging area for units discovered by System F.
+    /// Per-PID staging areas for unit registration.
     ///
-    /// Populated by `RegisterUnits` IPC, committed into the active unit set
-    /// by `CommitUnits`.  Between registration and commit the staging units
-    /// are not visible to the scheduler or D-Bus layer.
-    pub staging_units: HashMap<String, UnitIR>,
+    /// Each entry maps a worker PID to its staging area (debug label + units).
+    /// Areas are created by `RegisterUnits`, queried by `StagingQuery`,
+    /// committed by `CommitUnits` (which removes the area), and are
+    /// inaccessible to callers whose PID does not match.
+    pub staging_areas: HashMap<u32, StagingArea>,
 
     /// Reference counts between units — maps target unit name to the set of
     /// source unit names that hold a reference to it.
@@ -287,7 +296,7 @@ impl AllocatorState {
             serial_completion_txs: HashMap::new(),
             start_limit_state: HashMap::new(),
             event_bus: Arc::new(TokioRwLock::new(EventBus::new())),
-            staging_units: HashMap::new(),
+            staging_areas: HashMap::new(),
             ref_counts: HashMap::new(),
             n_refs: HashMap::new(),
             invocation_ids: HashMap::new(),
@@ -295,71 +304,65 @@ impl AllocatorState {
         }
     }
 
-    /// Replace the active unit set with the currently staged units.
+    /// Commit the staging area for a given PID into the active unit set.
     ///
-    /// This performs a "daemon-reload"-style replacement:
-    /// - Every staged `UnitIR` is converted into a `UnitFile` and replaces the
-    ///   corresponding entry in `self.units`.
-    /// - Units present in `self.units` but absent from staging are removed.
-    ///
-    /// After commit the staging area is emptied.
-    pub fn commit_staging(&mut self) {
-        let staging = std::mem::take(&mut self.staging_units);
+    /// Every `UnitIR` in the area is converted into a `UnitFile` and merged
+    /// into `self.units`.  The staging area is removed after commit.
+    pub fn commit_staging(&mut self, pid: u32) -> Result<u32, String> {
+        let area = self.staging_areas.remove(&pid)
+            .ok_or_else(|| format!("no staging area for PID {pid}"))?;
 
-        let mut names: Vec<&str> = staging.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        info!("commit_staging: loading {} units", names.len());
-        for name in &names {
-            info!("  loaded unit: {}", name);
-        }
+        let unit_count = area.units.len() as u32;
+        let label = &area.debug_label;
+        info!("commit_staging(PID={pid}, label={label}): loading {unit_count} units");
 
-        // Build the new unit map from UnitIR.
         let new_units: HashMap<String, UnitFile> =
-            staging.values().map(|ir| unit_file_from_ir(ir)).collect();
-
-        // Prune desired-state entries for removed units.
-        self.desired.retain(|name, _| new_units.contains_key(name));
-
-        self.units = new_units;
-
-        // Rebuild reference counts from the new unit set.
+            area.units.values().map(|ir| unit_file_from_ir(ir)).collect();
+        self.units.extend(new_units);
         self.rebuild_ref_counts();
 
-        // Notify the D-Bus layer so UnitObject interfaces get registered.
         if let Some(ref tx) = self.unit_loaded_tx {
             for name in self.units.keys() {
                 let _ = tx.send(name.clone());
             }
         }
+        Ok(unit_count)
     }
 
-    /// Replace the staging units (discards any prior staging set).
-    pub fn set_staging_units(&mut self, units: HashMap<String, UnitIR>) {
-        let old = std::mem::replace(&mut self.staging_units, units);
-
-        let mut added: Vec<&str> = self.staging_units.keys()
-            .filter(|k| !old.contains_key(*k))
-            .map(String::as_str)
-            .collect();
-        added.sort_unstable();
-
-        let mut removed: Vec<&str> = old.keys()
-            .filter(|k| !self.staging_units.contains_key(*k))
-            .map(String::as_str)
-            .collect();
-        removed.sort_unstable();
-
-        if !added.is_empty() || !removed.is_empty() {
-            debug!("staging_units changed:");
-            if !added.is_empty() {
-                debug!("  added ({}) {}", added.len(), added.join(", "));
-            }
-            if !removed.is_empty() {
-                debug!("  removed ({}) {}", removed.len(), removed.join(", "));
-            }
-        } else {
-            debug!("staging_units replaced — {} units (no change in keys)", self.staging_units.len());
+    /// Create a staging area for a given PID.
+    /// Returns an error if the PID already owns an area.
+    pub fn init_staging_area(&mut self, pid: u32, label: &str, units: HashMap<String, UnitIR>) -> Result<u32, String> {
+        if self.staging_areas.contains_key(&pid) {
+            return Err(format!("staging area for PID {pid} already exists"));
         }
+        let count = units.len() as u32;
+        self.staging_areas.insert(pid, StagingArea {
+            debug_label: label.to_string(),
+            pid,
+            units,
+        });
+        info!("init_staging_area(PID={pid}, label={label}): {count} units");
+        Ok(count)
+    }
+
+    /// Return the staging area for a given PID.
+    pub fn get_staging_area_by_pid(&self, pid: u32) -> Option<&StagingArea> {
+        self.staging_areas.get(&pid)
+    }
+
+    /// Find staging areas whose debug label matches.
+    pub fn get_staging_areas_by_name(&self, name: &str) -> Vec<&StagingArea> {
+        self.staging_areas.values().filter(|a| a.debug_label == name).collect()
+    }
+
+    /// List every staging area (pid + label, no units).
+    pub fn list_staging_areas(&self) -> Vec<(u32, &str)> {
+        self.staging_areas.iter().map(|(pid, a)| (*pid, a.debug_label.as_str())).collect()
+    }
+
+    /// Return all staging areas (full data).
+    pub fn all_staging_areas(&self) -> &HashMap<u32, StagingArea> {
+        &self.staging_areas
     }
 
     /// Record that `source` holds a reference to `target`.
