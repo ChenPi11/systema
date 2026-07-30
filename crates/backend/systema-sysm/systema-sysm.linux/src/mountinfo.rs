@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
-use std::time::{Duration, Instant};
-
-
+use std::sync::Arc;
 
 use anyhow::Result;
+use inotify::{Inotify, WatchMask};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use sysa::controller::UnitStatus;
@@ -132,11 +132,10 @@ fn mount_table_to_json() -> String {
     serde_json::json!({"mounts": mounts}).to_string()
 }
 
-/// MountInfo monitor: polls /proc/self/mountinfo and triggers state transitions.
+/// MountInfo monitor: watches /proc/self/mountinfo via inotify and triggers
+/// state transitions when the mount table changes.
 pub struct MountInfoMonitor {
     registry: MountRegistry,
-    check_interval: Duration,
-    last_check: Instant,
     last_snapshot: Option<MountInfoSnapshot>,
     event_pub: EventPublisher,
 }
@@ -145,16 +144,46 @@ impl MountInfoMonitor {
     pub fn new(registry: MountRegistry, event_pub: EventPublisher) -> Self {
         MountInfoMonitor {
             registry,
-            check_interval: Duration::from_millis(200),
-            last_check: Instant::now(),
             last_snapshot: None,
             event_pub,
         }
     }
 
     pub async fn run(&mut self) {
+        // Initial poll: full reconciliation on startup.
+        self.poll().await;
+
+        let mut inotify = match Inotify::init() {
+            Ok(inot) => inot,
+            Err(e) => {
+                warn!("Failed to initialize inotify: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = inotify.watches().add(
+            "/proc/self/mountinfo",
+            WatchMask::ATTRIB | WatchMask::MODIFY,
+        ) {
+            warn!("Failed to watch /proc/self/mountinfo: {e}");
+            return;
+        }
+
+        let notify = Arc::new(Notify::new());
+        let notify_clone = notify.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                if let Err(e) = inotify.read_events_blocking(&mut buffer) {
+                    warn!("inotify read error: {e}");
+                }
+                notify_clone.notify_one();
+            }
+        });
+
         loop {
-            tokio::time::sleep(self.check_interval).await;
+            notify.notified().await;
             self.poll().await;
         }
     }
@@ -272,7 +301,6 @@ impl MountInfoMonitor {
                 }
 
                 self.last_snapshot = Some(snapshot);
-                self.last_check = Instant::now();
                 return;
             }
         };
@@ -336,6 +364,5 @@ impl MountInfoMonitor {
         }
 
         self.last_snapshot = Some(snapshot);
-        self.last_check = Instant::now();
     }
 }

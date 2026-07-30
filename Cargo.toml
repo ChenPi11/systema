@@ -65,6 +65,9 @@ regex = "1"
 # Colored terminal output
 colored = "2"
 
+# inotify (Linux mount point monitoring)
+inotify = "0.10"
+
 # Internationalization
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 

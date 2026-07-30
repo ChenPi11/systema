@@ -28,3 +28,4 @@ serde_json.workspace = true
 parking_lot.workspace = true
 
 libc = "0.2"
+inotify.workspace = true
