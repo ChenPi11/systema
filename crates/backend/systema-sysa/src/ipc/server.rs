@@ -480,26 +480,44 @@ async fn handle_finder_commit(
 async fn try_finder_commit(allocator: AllocatorHandle, uid: u32) -> Result<UnitRegistrationAck> {
     info!("Finder (UID={uid}) committing staging area");
 
-    let mut state = allocator.write();
-    match state.commit_staging(uid) {
-        Ok(count) => {
-            drop(state);
-            Ok(UnitRegistrationAck {
-                success: true,
-                message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed for UID {uid}."), &[("count", &count.to_string()), ("uid", &uid.to_string())]),
-                unit_count: count,
-            })
+    // Collect unit names before commit_staging removes the staging area.
+    let unit_names: Vec<String> = {
+        let state = allocator.read();
+        state
+            .get_staging_area_by_uid(uid)
+            .map(|area| area.units.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    let count = {
+        let mut state = allocator.write();
+        match state.commit_staging(uid) {
+            Ok(count) => count,
+            Err(msg) => {
+                drop(state);
+                warn!("{msg}");
+                return Ok(UnitRegistrationAck {
+                    success: false,
+                    message: msg,
+                    unit_count: 0,
+                });
+            }
         }
-        Err(msg) => {
-            drop(state);
-            warn!("{msg}");
-            Ok(UnitRegistrationAck {
-                success: false,
-                message: msg,
-                unit_count: 0,
-            })
+    };
+
+    // Register D-Bus objects synchronously so the commit does not return
+    // until System A is fully ready to serve the registered units.
+    if let Some(conn) = crate::dbus::dbus_connection() {
+        for name in &unit_names {
+            crate::dbus::register_unit_object(conn, allocator.clone(), name).await;
         }
     }
+
+    Ok(UnitRegistrationAck {
+        success: true,
+        message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed for UID {uid}."), &[("count", &count.to_string()), ("uid", &uid.to_string())]),
+        unit_count: count,
+    })
 }
 
 async fn handle_finder_query(

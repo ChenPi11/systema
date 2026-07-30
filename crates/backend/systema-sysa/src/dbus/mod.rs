@@ -26,6 +26,14 @@ use crate::unit::types::UnitKind;
 /// The well-known D-Bus bus name we claim.
 pub const BUS_NAME: &str = "org.freedesktop.systemd1";
 
+/// Global D-Bus connection, set once by `try_run`.
+static DBUS_CONNECTION: OnceCell<zbus::Connection> = OnceCell::new();
+
+/// Return a reference to the global D-Bus connection, if available.
+pub(super) fn dbus_connection() -> Option<&'static zbus::Connection> {
+    DBUS_CONNECTION.get()
+}
+
 /// Register a per-unit D-Bus object for `unit_name` on the connection's
 /// object server.  Silently skips if the object is already registered.
 pub(super) async fn register_unit_object(
@@ -229,6 +237,8 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
 
     // Make the connection available to ManagerInterface methods.
     let _ = conn_cell.set(conn.clone());
+    // Also store globally so the commit handler can register D-Bus objects.
+    let _ = DBUS_CONNECTION.set(conn.clone());
 
     info!("D-Bus server running");
 

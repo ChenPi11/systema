@@ -321,11 +321,6 @@ impl AllocatorState {
         self.units.extend(new_units);
         self.rebuild_ref_counts();
 
-        if let Some(ref tx) = self.unit_loaded_tx {
-            for name in self.units.keys() {
-                let _ = tx.send(name.clone());
-            }
-        }
         Ok(unit_count)
     }
 
