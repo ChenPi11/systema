@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use anyhow::{Context, Result};
-use prost::Message;
-use sysa::controller::{UnitController, UnitStatus};
-use sysa::proto::{SyncUnitState, UnitConfig};
+use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
+use sysa::proto::SyncUnitState;
 use crate::socket::{self, SocketManager};
 
 pub struct SocketController {
@@ -45,7 +44,7 @@ impl UnitController for SocketController {
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], _invocation_id: &str) -> Result<()> {
-        let cfg = UnitConfig::decode(config).context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         let sc = cfg.socket.as_ref().context("no SocketConfig in UnitConfig")?;
         socket::start_socket(&self.manager, unit_name, sc)?;
         if sc.accept {

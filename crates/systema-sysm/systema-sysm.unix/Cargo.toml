@@ -16,8 +16,6 @@ sysa = { path = "../../libsysa" }
 
 tokio.workspace = true
 tokio-util.workspace = true
-prost.workspace = true
-bytes.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

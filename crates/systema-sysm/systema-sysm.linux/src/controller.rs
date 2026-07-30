@@ -1,9 +1,8 @@
 use std::collections::HashMap;
-use anyhow::{Context, Result};
-use prost::Message;
+use anyhow::Result;
 use tokio::sync::mpsc;
-use sysa::controller::{UnitController, UnitStatus};
-use sysa::proto::{SyncUnitState, UnitConfig};
+use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
+use sysa::proto::SyncUnitState;
 use sysa::worker_ipc::EventPublisher;
 use tracing::debug;
 use crate::automount::{automount_enter_dead, automount_enter_waiting, AutomountTrigger};
@@ -176,7 +175,7 @@ impl UnitController for MountController {
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], _invocation_id: &str) -> Result<()> {
-        let cfg = UnitConfig::decode(config).context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         match resolve_unit_type(&self.mount_registry, &self.automount_registry, unit_name) {
             "mount" => {
                 let mount_cfg = cfg.mount.as_ref()
@@ -219,7 +218,7 @@ impl UnitController for MountController {
     }
 
     async fn restart(&self, unit_name: &str, config: &[u8], _invocation_id: &str) -> Result<()> {
-        let cfg = UnitConfig::decode(config).context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         match resolve_unit_type(&self.mount_registry, &self.automount_registry, unit_name) {
             "mount" => {
                 let mount_cfg = cfg.mount.as_ref()
@@ -246,7 +245,7 @@ impl UnitController for MountController {
     }
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
-        let cfg = UnitConfig::decode(config).context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         let mount_cfg = cfg.mount.as_ref()
             .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
         do_remount(self.mount_registry.clone(), unit_name, mount_cfg).await?;

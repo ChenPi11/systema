@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use anyhow::{Context, Result};
-use prost::Message;
-use sysa::controller::{UnitController, UnitStatus};
-use sysa::proto::{SyncUnitState, UnitConfig};
+use anyhow::Result;
+use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
+use sysa::proto::SyncUnitState;
 use sysa::worker_ipc::EventPublisher;
 use crate::mount::{do_mount, do_remount, do_umount};
 use crate::state::{MountRegistry, MountState};
@@ -66,7 +65,7 @@ impl UnitController for MountController {
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], _invocation_id: &str) -> Result<()> {
-        let cfg = UnitConfig::decode(config).context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         let mount_cfg = cfg.mount.as_ref()
             .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
         do_mount(self.registry.clone(), unit_name, mount_cfg).await?;
@@ -87,7 +86,7 @@ impl UnitController for MountController {
     }
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
-        let cfg = UnitConfig::decode(config).context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         let mount_cfg = cfg.mount.as_ref()
             .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
         do_remount(self.registry.clone(), unit_name, mount_cfg).await?;

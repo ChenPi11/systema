@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use anyhow::{Context, Result};
-use prost::Message;
-use sysa::controller::{UnitController, UnitStatus};
-use sysa::proto::{SyncUnitState, UnitConfig};
+use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
+use sysa::proto::SyncUnitState;
 use sysa::worker_ipc::EventPublisher;
 use crate::process::{start_service, stop_service};
 use crate::state::{ServiceRegistry, ServiceState};
@@ -64,8 +63,7 @@ impl UnitController for ServiceController {
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
-        let cfg = UnitConfig::decode(config)
-            .context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         let inv_id = if invocation_id.is_empty() { None } else { Some(invocation_id.to_string()) };
         let (pid, child) = start_service(self.registry.clone(), &cfg, inv_id).await?;
         {
@@ -99,8 +97,7 @@ impl UnitController for ServiceController {
     }
 
     async fn restart(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
-        let cfg = UnitConfig::decode(config)
-            .context("failed to decode UnitConfig")?;
+        let cfg = decode_unit_config(config)?;
         let timeout = cfg.service.as_ref().map(|s| s.timeout_stop_secs).unwrap_or(30);
         stop_service(self.registry.clone(), unit_name, timeout).await?;
         let inv_id = if invocation_id.is_empty() { None } else { Some(invocation_id.to_string()) };

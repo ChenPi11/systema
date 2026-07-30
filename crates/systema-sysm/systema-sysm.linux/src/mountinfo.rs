@@ -5,8 +5,6 @@ use std::time::{Duration, Instant};
 
 
 use anyhow::Result;
-use bytes::BytesMut;
-use prost::Message;
 use tracing::{debug, info, warn};
 
 use sysa::controller::UnitStatus;
@@ -194,15 +192,10 @@ impl MountInfoMonitor {
             invocation_id: String::new(),
             extensions: HashMap::new(),
         };
-        let encoded = {
-            let proto = status.into_proto();
-            let mut buf = BytesMut::new();
-            if proto.encode(&mut buf).is_ok() {
-                buf.to_vec()
-            } else {
-                return;
-            }
-        };
+        let encoded = status.encode_to_vec();
+        if encoded.is_empty() {
+            return;
+        }
         let _ = self.event_pub.publish(
             "mount.status_update",
             unit_name,

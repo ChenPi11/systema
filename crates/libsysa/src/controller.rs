@@ -1,5 +1,13 @@
 use std::collections::HashMap;
 
+use anyhow::Context;
+
+/// Decode a `UnitConfig` from its protobuf-encoded bytes.
+pub fn decode_unit_config(bytes: &[u8]) -> anyhow::Result<crate::proto::UnitConfig> {
+    use prost::Message;
+    crate::proto::UnitConfig::decode(bytes).context("failed to decode UnitConfig")
+}
+
 /// Standardised runtime status of a unit, returned by `status()`.
 #[derive(Debug, Clone, Default)]
 pub struct UnitStatus {
