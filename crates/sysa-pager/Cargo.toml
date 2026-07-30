@@ -1,0 +1,8 @@
+[package]
+name = "sysa-pager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc = "0.2"

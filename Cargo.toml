@@ -8,6 +8,8 @@ members = [
     "crates/backend/systema-sysk",
     "crates/backend/systema-sysm/systema-sysm.unix",
     "crates/backend/systema-sysm/systema-sysm.linux",
+    "crates/sysa-pager",
+    "crates/frontend/systema-stagingctl",
 ]
 resolver = "2"
 
@@ -56,6 +58,12 @@ parking_lot = "0.12"
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
+
+# Regex
+regex = "1"
+
+# Colored terminal output
+colored = "2"
 
 # Internationalization
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
