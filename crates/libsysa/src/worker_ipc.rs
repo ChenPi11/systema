@@ -224,8 +224,8 @@ impl WorkerIpc {
                 let env = match Envelope::decode(bytes.freeze()) {
                     Ok(e) => e,
                     Err(e) => {
-                        warn!("Failed to decode envelope: {}", e);
-                        continue;
+                        warn!("Failed to decode envelope: {} — disconnecting", e);
+                        break;
                     }
                 };
 
@@ -234,8 +234,8 @@ impl WorkerIpc {
                         let call = match MethodCall::decode(env.payload.as_slice()) {
                             Ok(c) => c,
                             Err(e) => {
-                                warn!("Failed to decode MethodCall: {}", e);
-                                continue;
+                                warn!("Failed to decode MethodCall: {} — disconnecting", e);
+                                break;
                             }
                         };
                         debug!(

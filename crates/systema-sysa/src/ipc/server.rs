@@ -234,10 +234,10 @@ async fn handle_worker_session(
                         Ok(e) => e,
                         Err(e) => {
                             warn!(
-                                "Failed to decode envelope from worker '{}': {}",
+                                "Failed to decode envelope from worker '{}': {} — disconnecting",
                                 worker_id_recv, e
                             );
-                            continue;
+                            break;
                         }
                     };
                     debug!(
@@ -247,49 +247,53 @@ async fn handle_worker_session(
 
                     if env.method == "method.result" {
                         let qid = env.request_id;
-                        // Check if this request_id corresponds to a job
-                        // (via task_kinds in the allocator state).
                         let is_task = alloc_for_recv.read().task_kinds.contains_key(&qid);
                         if is_task {
-                            if let Ok(result) = MethodResult::decode(env.payload.as_slice()) {
-                                use crate::scheduler::handle_task_result;
-                                use sysa::controller::UnitStatus;
-                                let kind = alloc_for_recv
-                                    .read()
-                                    .task_kinds
-                                    .get(&qid)
-                                    .copied()
-                                    .unwrap_or(crate::state::JobKind::Start);
-                                handle_task_result(
-                                    alloc_for_recv.clone(),
-                                    qid,
-                                    result.success,
-                                    &result.error,
-                                    &result.unit_name,
-                                    kind,
-                                );
-                                // Update cache from method result payload.
-                                if !result.result.is_empty() {
-                                    if let Some(unit_status) = UnitStatus::decode_from(&result.result) {
-                                        let mut state = alloc_for_recv.write();
-                                        state.unit_states.insert(
-                                            result.unit_name.clone(),
-                                            crate::state::CachedUnitState {
-                                                active_state: unit_status.active_state,
-                                                sub_state: unit_status.sub_state,
-                                                main_pid: unit_status.main_pid,
-                                            },
-                                        );
-                                    }
-                                } else {
-                                    // Empty result — optimistically set based on kind.
-                                    update_cache_on_task_result(
-                                        &alloc_for_recv,
-                                        &result.unit_name,
-                                        kind,
-                                        result.success,
+                            let result = match MethodResult::decode(env.payload.as_slice()) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to decode MethodResult from worker '{}': {} — disconnecting",
+                                        worker_id_recv, e
+                                    );
+                                    break;
+                                }
+                            };
+                            use crate::scheduler::handle_task_result;
+                            use sysa::controller::UnitStatus;
+                            let kind = alloc_for_recv
+                                .read()
+                                .task_kinds
+                                .get(&qid)
+                                .copied()
+                                .unwrap_or(crate::state::JobKind::Start);
+                            handle_task_result(
+                                alloc_for_recv.clone(),
+                                qid,
+                                result.success,
+                                &result.error,
+                                &result.unit_name,
+                                kind,
+                            );
+                            if !result.result.is_empty() {
+                                if let Some(unit_status) = UnitStatus::decode_from(&result.result) {
+                                    let mut state = alloc_for_recv.write();
+                                    state.unit_states.insert(
+                                        result.unit_name.clone(),
+                                        crate::state::CachedUnitState {
+                                            active_state: unit_status.active_state,
+                                            sub_state: unit_status.sub_state,
+                                            main_pid: unit_status.main_pid,
+                                        },
                                     );
                                 }
+                            } else {
+                                update_cache_on_task_result(
+                                    &alloc_for_recv,
+                                    &result.unit_name,
+                                    kind,
+                                    result.success,
+                                );
                             }
                         } else if let Some(tx) = pending_for_recv.lock().remove(&qid) {
                             let _ = tx.send(env.payload.to_vec());
@@ -301,15 +305,19 @@ async fn handle_worker_session(
                         let event = match EventPublish::decode(env.payload.as_slice()) {
                             Ok(e) => e,
                             Err(e) => {
-                                warn!("Failed to decode EventPublish: {}", e);
-                                continue;
+                                warn!(
+                                    "EventPublish decode from worker '{}': {} — disconnecting",
+                                    worker_id_recv, e
+                                );
+                                break;
                             }
                         };
                         handle_event(alloc_for_recv.clone(), event).await;
                         continue;
                     }
 
-                    warn!("Unknown method from worker '{}': {}", worker_id_recv, env.method);
+                    warn!("Unknown method from worker '{}': {} — disconnecting", worker_id_recv, env.method);
+                    break;
                 }
             }
         }
@@ -361,6 +369,25 @@ async fn handle_finder_register(
     env: Envelope,
     allocator: AllocatorHandle,
 ) -> Result<()> {
+    let result = try_finder_register(env, allocator).await;
+    let ack = match result {
+        Ok(ack) => ack,
+        Err(e) => {
+            warn!("Finder register failed: {}", e);
+            UnitRegistrationAck {
+                success: false,
+                message: e.to_string(),
+                unit_count: 0,
+            }
+        }
+    };
+    let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;
+    send_envelope(&mut framed, &ack_env).await?;
+    info!("Finder register session complete — disconnecting");
+    Ok(())
+}
+
+async fn try_finder_register(env: Envelope, allocator: AllocatorHandle) -> Result<UnitRegistrationAck> {
     info!("Finder (System F) registering units into staging");
 
     let reg_msg = RegisterUnits::decode(env.payload.as_slice())?;
@@ -380,16 +407,11 @@ async fn handle_finder_register(
     }
     info!("Finder staged {} units", unit_count);
 
-    let ack = UnitRegistrationAck {
+    Ok(UnitRegistrationAck {
         success: true,
         message: sysa::l10n::fmt(sysa::l10n::t_("{count} units staged."), &[("count", &unit_count.to_string())]),
         unit_count: unit_count as u32,
-    };
-    let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;
-    send_envelope(&mut framed, &ack_env).await?;
-
-    info!("Finder register session complete — disconnecting");
-    Ok(())
+    })
 }
 
 async fn handle_finder_commit(
@@ -397,6 +419,25 @@ async fn handle_finder_commit(
     _env: Envelope,
     allocator: AllocatorHandle,
 ) -> Result<()> {
+    let result = try_finder_commit(allocator).await;
+    let ack = match result {
+        Ok(ack) => ack,
+        Err(e) => {
+            warn!("Finder commit failed: {}", e);
+            UnitRegistrationAck {
+                success: false,
+                message: e.to_string(),
+                unit_count: 0,
+            }
+        }
+    };
+    let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;
+    send_envelope(&mut framed, &ack_env).await?;
+    info!("Finder commit session complete — disconnecting");
+    Ok(())
+}
+
+async fn try_finder_commit(allocator: AllocatorHandle) -> Result<UnitRegistrationAck> {
     info!("Finder (System F) committing staging into active set");
 
     let unit_count = {
@@ -407,16 +448,11 @@ async fn handle_finder_commit(
     };
     info!("Finder committed {} units into active set", unit_count);
 
-    let ack = UnitRegistrationAck {
+    Ok(UnitRegistrationAck {
         success: true,
         message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed."), &[("count", &unit_count.to_string())]),
         unit_count: unit_count as u32,
-    };
-    let ack_env = make_envelope(next_request_id(), "system-a", "system-f", "finder.ack", ack)?;
-    send_envelope(&mut framed, &ack_env).await?;
-
-    info!("Finder commit session complete — disconnecting");
-    Ok(())
+    })
 }
 
 /// Optimistically update the runtime cache when a task completes, based on
