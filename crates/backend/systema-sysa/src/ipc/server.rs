@@ -725,7 +725,8 @@ async fn handle_event(allocator: AllocatorHandle, event: EventPublish) {
     bus.read().await.dispatch(&ev).await;
 
     match event.event_type.as_str() {
-        // Proactive status push from mount worker — update the cache directly.
+        // Proactive status push from mount worker — update the cache directly
+        // and immediately reconcile (event-driven, no polling needed).
         "mount.status_update" => {
             use sysa::controller::UnitStatus;
             if let Some(status) = UnitStatus::decode_from(&event.event_data) {
@@ -734,12 +735,19 @@ async fn handle_event(allocator: AllocatorHandle, event: EventPublish) {
                     sub_state: status.sub_state.clone(),
                     main_pid: status.main_pid,
                 };
-                let mut state = allocator.write();
-                state.unit_states.insert(status.unit_name.clone(), cs);
+                let unit_name = status.unit_name.clone();
+                {
+                    let mut state = allocator.write();
+                    state.unit_states.insert(unit_name.clone(), cs);
+                }
                 debug!(
                     "mount.status_update: {} active={} sub={}",
-                    status.unit_name, status.active_state, status.sub_state,
+                    unit_name, status.active_state, status.sub_state,
                 );
+
+                if let Err(e) = reconcile_unit(allocator, &unit_name).await {
+                    warn!("reconcile after mount.status_update failed: {e}");
+                }
             }
         }
 
@@ -790,25 +798,34 @@ async fn handle_event(allocator: AllocatorHandle, event: EventPublish) {
                         }
                     }
 
-                    // Now update the cache with a write lock.
-                    let mut guard = allocator.write();
+                    // Update the cache (guard dropped before .await below).
+                    {
+                        let mut guard = allocator.write();
+                        for name in &to_update {
+                            guard.unit_states.entry(name.clone()).or_insert(
+                                CachedUnitState {
+                                    active_state: "active".to_string(),
+                                    sub_state: "mounted".to_string(),
+                                    main_pid: 0,
+                                },
+                            );
+                            debug!("mount.table_update: populated cache for {}", name);
+                        }
+                    }
+
+                    // Reconcile every newly matched unit against desired state.
                     for name in &to_update {
-                        guard.unit_states.entry(name.clone()).or_insert(
-                            CachedUnitState {
-                                active_state: "active".to_string(),
-                                sub_state: "mounted".to_string(),
-                                main_pid: 0,
-                            },
-                        );
-                        debug!("mount.table_update: populated cache for {}", name);
+                        if let Err(e) = reconcile_unit(allocator.clone(), name).await {
+                            warn!("reconcile after mount.table_update failed: {e}");
+                        }
                     }
                 }
             }
         }
 
-        // Legacy mount.state_change — still runs reconciliation.
+        // Legacy mount.state_change — reconcile against cached state.
         "mount.state_change" => {
-            if let Err(e) = mount_state_change_reconcile(allocator, &event.unit_name).await {
+            if let Err(e) = reconcile_unit(allocator, &event.unit_name).await {
                 warn!("mount state change reconcile error: {}", e);
             }
         }
@@ -817,13 +834,13 @@ async fn handle_event(allocator: AllocatorHandle, event: EventPublish) {
     }
 }
 
-/// Called when a mount worker sends `mount.state_change`.  Checks desired
-/// state against the unit's actual runtime state and enqueues a start or
-/// stop job if a mismatch exists.
-async fn mount_state_change_reconcile(allocator: AllocatorHandle, unit_name: &str) -> Result<()> {
+/// Check desired state against cached runtime state and enqueue a job if
+/// there is a mismatch.  This function reads from `unit_states` cache —
+/// it does NOT query the worker via IPC.  If no cached state is available
+/// yet (worker hasn't pushed initial events), the unit is silently skipped.
+async fn reconcile_unit(allocator: AllocatorHandle, unit_name: &str) -> Result<()> {
     use crate::scheduler::enqueue_job;
     use crate::state::{DesiredState, JobKind, JobMode};
-    use crate::ipc::query_engine::method_call_status;
 
     let (desired, has_matching_job) = {
         let state = allocator.read();
@@ -844,16 +861,16 @@ async fn mount_state_change_reconcile(allocator: AllocatorHandle, unit_name: &st
         return Ok(());
     }
 
-    let current_state = method_call_status(&allocator, unit_name)
-        .await
-        .map(|s| s.active_state)
-        .unwrap_or_else(|_| "inactive".to_string());
+    let current_state = match allocator.read().unit_states.get(unit_name) {
+        Some(cs) => cs.active_state.clone(),
+        None => return Ok(()),          // no cached state yet — skip
+    };
 
     match desired {
         DesiredState::Active => {
             if current_state != "active" && current_state != "activating" {
                 debug!(
-                    "Mount state change: starting {} (desired=Active, current={})",
+                    "Reconcile: starting {} (desired=Active, current={})",
                     unit_name, current_state
                 );
                 enqueue_job(allocator, unit_name, JobKind::Start, JobMode::Replace).await?;
@@ -862,7 +879,7 @@ async fn mount_state_change_reconcile(allocator: AllocatorHandle, unit_name: &st
         DesiredState::Inactive => {
             if current_state == "active" || current_state == "activating" {
                 debug!(
-                    "Mount state change: stopping {} (desired=Inactive, current={})",
+                    "Reconcile: stopping {} (desired=Inactive, current={})",
                     unit_name, current_state
                 );
                 enqueue_job(allocator, unit_name, JobKind::Stop, JobMode::Replace).await?;

@@ -1348,16 +1348,17 @@ fn is_first_boot() -> bool {
 
 /// Run the reconciliation loop as a background task.
 ///
-/// Periodically compares desired state against actual runtime state for every
-/// unit and enqueues jobs to resolve any discrepancies:
-///
-/// - Units with `DesiredState::Active` but not currently active → enqueue Start
-/// - Units with `DesiredState::Inactive` but currently active → enqueue Stop
+/// Safety-net reconciliation that runs periodically against the cached
+/// `unit_states` (populated by worker push events).  This loop does NOT
+/// query workers via IPC — the primary reconciliation is event-driven,
+/// triggered by `mount.status_update` / `mount.state_change` /
+/// `mount.table_update` in the IPC server.
 ///
 /// The loop skips units that already have an in-flight job of the relevant kind
-/// to avoid fighting with the scheduler.
+/// to avoid fighting with the scheduler, and also skips units that have no
+/// cached state yet (worker hasn't pushed initial events).
 ///
-/// The `interval` controls how often the reconciliation runs (default: 5s).
+/// The `interval` controls how often the safety-net check runs (default: 5s).
 pub fn start_reconciliation_loop(allocator: AllocatorHandle, interval: Duration) {
     tokio::spawn(async move {
         loop {
@@ -1368,58 +1369,53 @@ pub fn start_reconciliation_loop(allocator: AllocatorHandle, interval: Duration)
                 state.desired.iter().map(|(k, v)| (k.clone(), *v)).collect()
             };
 
-            for (unit_name, desired) in units_to_check {
+            for (unit_name, desired) in &units_to_check {
                 let has_matching_job = {
                     let state = allocator.read();
                     state.jobs.values().any(|j| {
-                        j.unit_name == unit_name
+                        j.unit_name == *unit_name
                             && matches!(j.status, JobStatus::Running)
                     })
-                }; // drop read guard
+                };
 
-                let current_state = if has_matching_job {
-                    String::new()
-                } else {
-                    crate::ipc::query_engine::method_call_status(&allocator, &unit_name)
-                        .await
-                        .map(|s| s.active_state)
-                        .unwrap_or_else(|_| "inactive".to_string())
+                if has_matching_job {
+                    continue;
+                }
+
+                // Read from cached state — no IPC to workers.
+                let current_state = match allocator.read().unit_states.get(unit_name) {
+                    Some(cs) => cs.active_state.clone(),
+                    None => continue,   // no cache yet — skip
                 };
 
                 match desired {
                     DesiredState::Active => {
-                        if current_state != "active"
-                            && current_state != "activating"
-                            && !has_matching_job
-                        {
+                        if current_state != "active" && current_state != "activating" {
                             debug!(
-                                "Reconciliation: starting {} (desired=Active, current={})",
+                                "Safety-net reconcile: starting {} (desired=Active, current={})",
                                 unit_name, current_state
                             );
                             if let Err(e) =
-                                enqueue_job(allocator.clone(), &unit_name, JobKind::Start, JobMode::Replace).await
+                                enqueue_job(allocator.clone(), unit_name, JobKind::Start, JobMode::Replace).await
                             {
                                 warn!(
-                                    "Reconciliation: failed to start {}: {}",
+                                    "Safety-net reconcile: failed to start {}: {}",
                                     unit_name, e
                                 );
                             }
                         }
                     }
                     DesiredState::Inactive => {
-                        if (current_state == "active"
-                            || current_state == "activating")
-                            && !has_matching_job
-                        {
+                        if current_state == "active" || current_state == "activating" {
                             debug!(
-                                "Reconciliation: stopping {} (desired=Inactive, current={})",
+                                "Safety-net reconcile: stopping {} (desired=Inactive, current={})",
                                 unit_name, current_state
                             );
                             if let Err(e) =
-                                enqueue_job(allocator.clone(), &unit_name, JobKind::Stop, JobMode::Replace).await
+                                enqueue_job(allocator.clone(), unit_name, JobKind::Stop, JobMode::Replace).await
                             {
                                 warn!(
-                                    "Reconciliation: failed to stop {}: {}",
+                                    "Safety-net reconcile: failed to stop {}: {}",
                                     unit_name, e
                                 );
                             }
