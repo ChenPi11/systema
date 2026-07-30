@@ -235,20 +235,20 @@ message UnitRegistrationAck {
 
 // Query a staging area or list all areas.
 message AdminStagingOp {
-    // "list"         → return pid + debug_label for every area
-    // "by_pid"       → return full data for the given pid
+    // "list"         → return uid + debug_label for every area
+    // "by_uid"       → return full data for the given uid
     // "by_name"      → return full data for area(s) matching debug_label
     // "all"          → return full data for every area
     string op = 1;
-    // PID filter for "by_pid" operation.
-    uint32 pid = 2;
+    // UID filter for "by_uid" operation.
+    uint32 uid = 2;
     // Name filter for "by_name" operation.
     string name = 3;
 }
 
 // One entry in an AdminStagingResult.
 message StagingAreaEntry {
-    uint32 pid = 1;
+    uint32 uid = 1;
     string debug_label = 2;
     uint32 unit_count = 3;
     // JSON-serialized map of unit_id → UnitIR (empty for "list").

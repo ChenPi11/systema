@@ -20,18 +20,18 @@ impl StagingAdmin {
         }
     }
 
-    /// List every staging area as (PID, debug_label) pairs.
+    /// List every staging area as (UID, debug_label) pairs.
     pub async fn list(&self) -> Result<Vec<(u32, String)>> {
         let result = self.send_op("list", 0, "").await?;
         if !result.success {
             anyhow::bail!("{}", result.message);
         }
-        Ok(result.entries.into_iter().map(|e| (e.pid, e.debug_label)).collect())
+        Ok(result.entries.into_iter().map(|e| (e.uid, e.debug_label)).collect())
     }
 
-    /// Query a staging area by PID (returns raw JSON bytes).
-    pub async fn query_by_pid(&self, pid: u32) -> Result<AdminStagingResult> {
-        self.send_op("by_pid", pid, "").await
+    /// Query a staging area by UID (returns raw JSON bytes).
+    pub async fn query_by_uid(&self, uid: u32) -> Result<AdminStagingResult> {
+        self.send_op("by_uid", uid, "").await
     }
 
     /// Query staging areas by debug label (returns raw JSON bytes).
@@ -44,7 +44,7 @@ impl StagingAdmin {
         self.send_op("all", 0, "").await
     }
 
-    async fn send_op(&self, op: &str, pid: u32, name: &str) -> Result<AdminStagingResult> {
+    async fn send_op(&self, op: &str, uid: u32, name: &str) -> Result<AdminStagingResult> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
@@ -52,7 +52,7 @@ impl StagingAdmin {
 
         let query = AdminStagingOp {
             op: op.to_string(),
-            pid,
+            uid,
             name: name.to_string(),
         };
         let query_env = make_envelope(1, "", "system-a", "admin.staging", query)?;

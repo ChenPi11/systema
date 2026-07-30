@@ -209,11 +209,11 @@ pub struct WorkerEntry {
     pub pending_calls: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
 }
 
-/// A staging area bound to a single worker PID.
+/// A staging area bound to a single worker UID.
 #[derive(Debug, Clone)]
 pub struct StagingArea {
     pub debug_label: String,
-    pub pid: u32,
+    pub uid: u32,
     pub units: HashMap<String, UnitIR>,
 }
 
@@ -253,12 +253,12 @@ pub struct AllocatorState {
     /// inside `tokio::spawn`-ed tasks (parking_lot guards are not `Send`).
     pub event_bus: Arc<TokioRwLock<EventBus>>,
 
-    /// Per-PID staging areas for unit registration.
+    /// Per-UID staging areas for unit registration.
     ///
-    /// Each entry maps a worker PID to its staging area (debug label + units).
+    /// Each entry maps a worker UID to its staging area (debug label + units).
     /// Areas are created by `RegisterUnits`, queried by `StagingQuery`,
     /// committed by `CommitUnits` (which removes the area), and are
-    /// inaccessible to callers whose PID does not match.
+    /// inaccessible to callers whose UID does not match.
     pub staging_areas: HashMap<u32, StagingArea>,
 
     /// Reference counts between units — maps target unit name to the set of
@@ -304,17 +304,17 @@ impl AllocatorState {
         }
     }
 
-    /// Commit the staging area for a given PID into the active unit set.
+    /// Commit the staging area for a given UID into the active unit set.
     ///
     /// Every `UnitIR` in the area is converted into a `UnitFile` and merged
     /// into `self.units`.  The staging area is removed after commit.
-    pub fn commit_staging(&mut self, pid: u32) -> Result<u32, String> {
-        let area = self.staging_areas.remove(&pid)
-            .ok_or_else(|| format!("no staging area for PID {pid}"))?;
+    pub fn commit_staging(&mut self, uid: u32) -> Result<u32, String> {
+        let area = self.staging_areas.remove(&uid)
+            .ok_or_else(|| format!("no staging area for UID {uid}"))?;
 
         let unit_count = area.units.len() as u32;
         let label = &area.debug_label;
-        info!("commit_staging(PID={pid}, label={label}): loading {unit_count} units");
+        info!("commit_staging(UID={uid}, label={label}): loading {unit_count} units");
 
         let new_units: HashMap<String, UnitFile> =
             area.units.values().map(|ir| unit_file_from_ir(ir)).collect();
@@ -329,25 +329,25 @@ impl AllocatorState {
         Ok(unit_count)
     }
 
-    /// Create a staging area for a given PID.
-    /// Returns an error if the PID already owns an area.
-    pub fn init_staging_area(&mut self, pid: u32, label: &str, units: HashMap<String, UnitIR>) -> Result<u32, String> {
-        if self.staging_areas.contains_key(&pid) {
-            return Err(format!("staging area for PID {pid} already exists"));
+    /// Create a staging area for a given UID.
+    /// Returns an error if the UID already owns an area.
+    pub fn init_staging_area(&mut self, uid: u32, label: &str, units: HashMap<String, UnitIR>) -> Result<u32, String> {
+        if self.staging_areas.contains_key(&uid) {
+            return Err(format!("staging area for UID {uid} already exists"));
         }
         let count = units.len() as u32;
-        self.staging_areas.insert(pid, StagingArea {
+        self.staging_areas.insert(uid, StagingArea {
             debug_label: label.to_string(),
-            pid,
+            uid,
             units,
         });
-        info!("init_staging_area(PID={pid}, label={label}): {count} units");
+        info!("init_staging_area(UID={uid}, label={label}): {count} units");
         Ok(count)
     }
 
-    /// Return the staging area for a given PID.
-    pub fn get_staging_area_by_pid(&self, pid: u32) -> Option<&StagingArea> {
-        self.staging_areas.get(&pid)
+    /// Return the staging area for a given UID.
+    pub fn get_staging_area_by_uid(&self, uid: u32) -> Option<&StagingArea> {
+        self.staging_areas.get(&uid)
     }
 
     /// Find staging areas whose debug label matches.
@@ -355,9 +355,9 @@ impl AllocatorState {
         self.staging_areas.values().filter(|a| a.debug_label == name).collect()
     }
 
-    /// List every staging area (pid + label, no units).
+    /// List every staging area (uid + label, no units).
     pub fn list_staging_areas(&self) -> Vec<(u32, &str)> {
-        self.staging_areas.iter().map(|(pid, a)| (*pid, a.debug_label.as_str())).collect()
+        self.staging_areas.iter().map(|(uid, a)| (*uid, a.debug_label.as_str())).collect()
     }
 
     /// Return all staging areas (full data).

@@ -27,9 +27,9 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Commit the PID-bound staging area into the active set
+    /// Commit the UID-bound staging area into the active set
     Commit,
-    /// Query the current PID-bound staging area contents
+    /// Query the current UID-bound staging area contents
     Query,
 }
 
@@ -45,8 +45,8 @@ async fn main() -> Result<()> {
             .mut_arg("debug", |a| a.help(sysa::l10n::t_("Enable debug-level logging.")))
             .mut_arg("log_level", |a| a.help(sysa::l10n::t_("Log level (trace, debug, info, warn, error).")))
             .mut_arg("label", |a| a.help(sysa::l10n::t_("Debug label for the staging area.")))
-            .mut_subcommand("commit", |cmd| cmd.about(sysa::l10n::t_("Commit the PID-bound staging area.")))
-            .mut_subcommand("query", |cmd| cmd.about(sysa::l10n::t_("Query the PID-bound staging area.")));
+            .mut_subcommand("commit", |cmd| cmd.about(sysa::l10n::t_("Commit the UID-bound staging area.")))
+            .mut_subcommand("query", |cmd| cmd.about(sysa::l10n::t_("Query the UID-bound staging area.")));
         Args::from_arg_matches(&cmd.get_matches())
             .unwrap_or_else(|e| e.exit())
     };

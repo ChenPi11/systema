@@ -55,9 +55,9 @@ enum Commands {
     List {
         #[arg(
             long,
-            help = "Filter by PID (can be specified multiple times)"
+            help = "Filter by UID (can be specified multiple times)"
         )]
-        pid: Vec<u32>,
+        uid: Vec<u32>,
 
         #[arg(
             help = "Regex pattern(s) to match staging area name"
@@ -84,7 +84,7 @@ fn print_json(entries: &[StagingAreaEntry]) -> Result<()> {
         .map(|e| {
             let units = parse_units_json(&e.units_json).unwrap_or_default();
             serde_json::json!({
-                "pid": e.pid,
+                "uid": e.uid,
                 "name": e.debug_label,
                 "unit_count": e.unit_count,
                 "units": units,
@@ -99,8 +99,8 @@ fn print_json(entries: &[StagingAreaEntry]) -> Result<()> {
 fn print_entry_friendly(entry: &StagingAreaEntry) -> Result<()> {
     pager_println!(
         "  {} {}  {} {}",
-        "PID:".bold().cyan(),
-        entry.pid.to_string().bold(),
+        "UID:".bold().cyan(),
+        entry.uid.to_string().bold(),
         "Name:".bold().cyan(),
         entry.debug_label.bold(),
     );
@@ -176,7 +176,7 @@ fn print_value(value: &Value, indent: &str) {
     }
 }
 
-async fn run_list(json: bool, pids: Vec<u32>, regex_strs: Vec<String>) -> Result<()> {
+async fn run_list(json: bool, uids: Vec<u32>, regex_strs: Vec<String>) -> Result<()> {
     let admin = StagingAdmin::new();
 
     let regexes: Vec<Regex> = regex_strs
@@ -188,19 +188,19 @@ async fn run_list(json: bool, pids: Vec<u32>, regex_strs: Vec<String>) -> Result
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let has_pid_filter = !pids.is_empty();
+    let has_uid_filter = !uids.is_empty();
     let has_regex_filter = !regexes.is_empty();
 
-    let entries: Vec<StagingAreaEntry> = if has_pid_filter {
+    let entries: Vec<StagingAreaEntry> = if has_uid_filter {
         let mut results = Vec::new();
-        for pid in &pids {
-            let result = admin.query_by_pid(*pid).await?;
+        for uid in &uids {
+            let result = admin.query_by_uid(*uid).await?;
             if result.success {
                 results.extend(result.entries);
             } else {
                 pager_eprintln!(
                     "{}",
-                    l10n::fmt(l10n::t_("Warning: PID {pid}: {message}"), &[("pid", &pid.to_string()), ("message", &result.message)])
+                    l10n::fmt(l10n::t_("Warning: UID {uid}: {message}"), &[("uid", &uid.to_string()), ("message", &result.message)])
                     .yellow()
                 );
             }
@@ -253,8 +253,8 @@ fn build_localized_cli() -> clap::Command {
         .mut_arg("color", |a| a.help(l10n::t_("When to use colors (always, auto, never).")))
         .mut_subcommand("list", |cmd| {
             cmd.about(l10n::t_("List staging areas and their contents."))
-                .mut_arg("pid", |a| {
-                    a.help(l10n::t_("Filter by PID (can be specified multiple times)."))
+                .mut_arg("uid", |a| {
+                    a.help(l10n::t_("Filter by UID (can be specified multiple times)."))
                 })
                 .mut_arg("regex", |a| {
                     a.help(l10n::t_("Regex pattern(s) to match staging area name."))
@@ -295,8 +295,8 @@ async fn main() -> Result<()> {
 
     let result = match matches.subcommand() {
         Some(("list", sub_m)) => {
-            let pids: Vec<u32> = sub_m
-                .get_many::<u32>("pid")
+            let uids: Vec<u32> = sub_m
+                .get_many::<u32>("uid")
                 .unwrap_or_default()
                 .copied()
                 .collect();
@@ -305,7 +305,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default()
                 .cloned()
                 .collect();
-            run_list(json, pids, regex_strs).await
+            run_list(json, uids, regex_strs).await
         }
         None => {
             run_list(json, vec![], vec![]).await

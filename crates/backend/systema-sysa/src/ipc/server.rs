@@ -141,7 +141,7 @@ async fn handle_worker(
     allocator: AllocatorHandle,
     _fdpass_map: FdPassMap,
 ) -> Result<()> {
-    let (client_pid, client_uid) = peer_cred(&stream)
+    let (_client_pid, client_uid) = peer_cred(&stream)
         .context("failed to get peer credentials")?;
     let mut framed = frame_stream(stream);
 
@@ -151,9 +151,9 @@ async fn handle_worker(
 
     match env.method.as_str() {
         "worker.register" => handle_worker_session(framed, env, allocator).await,
-        "finder.register_units" => handle_finder_register(framed, env, allocator, client_pid).await,
-        "finder.commit_units" => handle_finder_commit(framed, env, allocator, client_pid).await,
-        "staging.query" => handle_finder_query(framed, env, allocator, client_pid).await,
+        "finder.register_units" => handle_finder_register(framed, env, allocator, client_uid).await,
+        "finder.commit_units" => handle_finder_commit(framed, env, allocator, client_uid).await,
+        "staging.query" => handle_finder_query(framed, env, allocator, client_uid).await,
         "admin.staging" => handle_admin_staging(framed, env, allocator, client_uid).await,
         other => {
             anyhow::bail!(sysa::l10n::fmt(
@@ -399,13 +399,13 @@ async fn handle_finder_register(
     mut framed: sysa::ipc::EnvelopeFramed,
     env: Envelope,
     allocator: AllocatorHandle,
-    client_pid: u32,
+    client_uid: u32,
 ) -> Result<()> {
-    let result = try_finder_register(env, allocator, client_pid).await;
+    let result = try_finder_register(env, allocator, client_uid).await;
     let ack = match &result {
         Ok(ack) => ack.clone(),
         Err(e) => {
-            warn!("Finder register (PID={client_pid}) failed: {e}");
+            warn!("Finder register (UID={client_uid}) failed: {e}");
             UnitRegistrationAck {
                 success: false,
                 message: e.to_string(),
@@ -419,10 +419,10 @@ async fn handle_finder_register(
     Ok(())
 }
 
-async fn try_finder_register(env: Envelope, allocator: AllocatorHandle, pid: u32) -> Result<UnitRegistrationAck> {
+async fn try_finder_register(env: Envelope, allocator: AllocatorHandle, uid: u32) -> Result<UnitRegistrationAck> {
     let reg_msg = RegisterUnits::decode(env.payload.as_slice())?;
     let label = reg_msg.debug_label;
-    info!("Finder (PID={pid}) registering units (label='{label}')");
+    info!("Finder (UID={uid}) registering units (label='{label}')");
 
     let units: std::collections::HashMap<String, systema_sysf::ir::UnitIR> =
         serde_json::from_slice(&reg_msg.units_json)
@@ -432,12 +432,12 @@ async fn try_finder_register(env: Envelope, allocator: AllocatorHandle, pid: u32
             )))?;
 
     let mut state = allocator.write();
-    match state.init_staging_area(pid, &label, units) {
+    match state.init_staging_area(uid, &label, units) {
         Ok(count) => {
             drop(state);
             Ok(UnitRegistrationAck {
                 success: true,
-                message: sysa::l10n::fmt(sysa::l10n::t_("{count} units staged for PID {pid}."), &[("count", &count.to_string()), ("pid", &pid.to_string())]),
+                message: sysa::l10n::fmt(sysa::l10n::t_("{count} units staged for UID {uid}."), &[("count", &count.to_string()), ("uid", &uid.to_string())]),
                 unit_count: count,
             })
         }
@@ -457,13 +457,13 @@ async fn handle_finder_commit(
     mut framed: sysa::ipc::EnvelopeFramed,
     _env: Envelope,
     allocator: AllocatorHandle,
-    client_pid: u32,
+    client_uid: u32,
 ) -> Result<()> {
-    let result = try_finder_commit(allocator, client_pid).await;
+    let result = try_finder_commit(allocator, client_uid).await;
     let ack = match &result {
         Ok(ack) => ack.clone(),
         Err(e) => {
-            warn!("Finder commit (PID={client_pid}) failed: {e}");
+            warn!("Finder commit (UID={client_uid}) failed: {e}");
             UnitRegistrationAck {
                 success: false,
                 message: e.to_string(),
@@ -477,16 +477,16 @@ async fn handle_finder_commit(
     Ok(())
 }
 
-async fn try_finder_commit(allocator: AllocatorHandle, pid: u32) -> Result<UnitRegistrationAck> {
-    info!("Finder (PID={pid}) committing staging area");
+async fn try_finder_commit(allocator: AllocatorHandle, uid: u32) -> Result<UnitRegistrationAck> {
+    info!("Finder (UID={uid}) committing staging area");
 
     let mut state = allocator.write();
-    match state.commit_staging(pid) {
+    match state.commit_staging(uid) {
         Ok(count) => {
             drop(state);
             Ok(UnitRegistrationAck {
                 success: true,
-                message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed for PID {pid}."), &[("count", &count.to_string()), ("pid", &pid.to_string())]),
+                message: sysa::l10n::fmt(sysa::l10n::t_("{count} units committed for UID {uid}."), &[("count", &count.to_string()), ("uid", &uid.to_string())]),
                 unit_count: count,
             })
         }
@@ -506,13 +506,13 @@ async fn handle_finder_query(
     mut framed: sysa::ipc::EnvelopeFramed,
     _env: Envelope,
     allocator: AllocatorHandle,
-    client_pid: u32,
+    client_uid: u32,
 ) -> Result<()> {
-    let result = try_finder_query(allocator, client_pid).await;
+    let result = try_finder_query(allocator, client_uid).await;
     let ack = match &result {
         Ok(ack) => ack.clone(),
         Err(e) => {
-            warn!("Staging query (PID={client_pid}) failed: {e}");
+            warn!("Staging query (UID={client_uid}) failed: {e}");
             StagingQueryResult {
                 success: false,
                 message: e.to_string(),
@@ -526,9 +526,9 @@ async fn handle_finder_query(
     Ok(())
 }
 
-async fn try_finder_query(allocator: AllocatorHandle, pid: u32) -> Result<StagingQueryResult> {
+async fn try_finder_query(allocator: AllocatorHandle, uid: u32) -> Result<StagingQueryResult> {
     let state = allocator.read();
-    match state.get_staging_area_by_pid(pid) {
+    match state.get_staging_area_by_uid(uid) {
         Some(area) => {
             let count = area.units.len() as u32;
             let json = serde_json::to_vec(&area.units)
@@ -541,7 +541,7 @@ async fn try_finder_query(allocator: AllocatorHandle, pid: u32) -> Result<Stagin
             })
         }
         None => {
-            let msg = format!("no staging area for PID {pid}");
+            let msg = format!("no staging area for UID {uid}");
             warn!("{msg}");
             Ok(StagingQueryResult {
                 success: false,
@@ -587,10 +587,10 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
     let state = allocator.read();
     match op.op.as_str() {
         "list" => {
-            let entries: Vec<StagingAreaEntry> = state.list_staging_areas().into_iter().map(|(pid, label)| {
-                let count = state.staging_areas.get(&pid).map(|a| a.units.len() as u32).unwrap_or(0);
+            let entries: Vec<StagingAreaEntry> = state.list_staging_areas().into_iter().map(|(uid, label)| {
+                let count = state.staging_areas.get(&uid).map(|a| a.units.len() as u32).unwrap_or(0);
                 StagingAreaEntry {
-                    pid,
+                    uid,
                     debug_label: label.to_string(),
                     unit_count: count,
                     units_json: vec![],
@@ -598,15 +598,15 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
             }).collect();
             AdminStagingResult { success: true, message: String::new(), entries }
         }
-        "by_pid" => {
-            match state.get_staging_area_by_pid(op.pid) {
+        "by_uid" => {
+            match state.get_staging_area_by_uid(op.uid) {
                 Some(area) => {
                     let json = serde_json::to_vec(&area.units).unwrap_or_default();
                     AdminStagingResult {
                         success: true,
                         message: String::new(),
                         entries: vec![StagingAreaEntry {
-                            pid: area.pid,
+                            uid: area.uid,
                             debug_label: area.debug_label.clone(),
                             unit_count: area.units.len() as u32,
                             units_json: json,
@@ -615,7 +615,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
                 }
                 None => AdminStagingResult {
                     success: false,
-                    message: format!("no staging area for PID {}", op.pid),
+                    message: format!("no staging area for UID {}", op.uid),
                     entries: vec![],
                 },
             }
@@ -632,7 +632,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
                 let entries = areas.iter().map(|a| {
                     let json = serde_json::to_vec(&a.units).unwrap_or_default();
                     StagingAreaEntry {
-                        pid: a.pid,
+                        uid: a.uid,
                         debug_label: a.debug_label.clone(),
                         unit_count: a.units.len() as u32,
                         units_json: json,
@@ -645,7 +645,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
             let entries: Vec<StagingAreaEntry> = state.all_staging_areas().values().map(|a| {
                 let json = serde_json::to_vec(&a.units).unwrap_or_default();
                 StagingAreaEntry {
-                    pid: a.pid,
+                    uid: a.uid,
                     debug_label: a.debug_label.clone(),
                     unit_count: a.units.len() as u32,
                     units_json: json,
