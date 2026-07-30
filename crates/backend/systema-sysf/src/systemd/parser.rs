@@ -873,7 +873,7 @@ fn parse_mount_section(config: &Ini, mnt: &mut MountSection, name: &str) -> Resu
     mnt.what = expand_specifiers(&get_str(config, "mount", "what"), name);
     mnt.where_ = expand_specifiers(&get_str(config, "mount", "where"), name);
     mnt.type_ = get_str(config, "mount", "type");
-    mnt.options = get_str(config, "mount", "options");
+    mnt.options = expand_specifiers(&get_str(config, "mount", "options"), name);
     mnt.timeout_sec = get_u32(config, "mount", "timeoutsec", 90);
     mnt.lazy_unmount = get_bool(config, "mount", "lazyunmount", false);
     mnt.force_unmount = get_bool(config, "mount", "forceunmount", false);

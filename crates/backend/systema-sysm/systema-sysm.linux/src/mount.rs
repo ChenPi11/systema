@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use sysa::proto::MountConfig;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::mountinfo;
 use crate::state::{MountInstance, MountRegistry, MountState};
@@ -47,6 +47,18 @@ pub async fn do_mount(
         }
     }
 
+    // Idempotency: skip if already mounted (matches systemd behavior).
+    if mountinfo::mount_point_is_mounted(&mount_point) {
+        info!("Already mounted, skipping: {}", mount_point);
+        {
+            let mut reg = registry.lock();
+            if let Some(inst) = reg.get_mut(unit_name) {
+                inst.state = MountState::Mounted;
+            }
+        }
+        return Ok(());
+    }
+
     // Build mount command.
     let mut cmd = Command::new("mount");
     if config.sloppy_options {
@@ -78,6 +90,7 @@ pub async fn do_mount(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("mount {} failed: {}", mount_point, stderr.trim());
         let err = anyhow::anyhow!("mount failed: {}", stderr.trim());
         return Err(err);
     }
@@ -168,6 +181,7 @@ pub async fn do_umount(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("umount {} failed: {}", mount_point, stderr.trim());
         let err = anyhow::anyhow!("umount failed: {}", stderr.trim());
         return Err(err);
     }
@@ -244,6 +258,7 @@ pub async fn do_remount(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("remount {} failed: {}", mount_point, stderr.trim());
         anyhow::bail!("remount failed: {}", stderr.trim());
     }
 
