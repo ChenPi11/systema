@@ -443,7 +443,7 @@ impl UnitController for MountController {
     async fn sync_state(&self) -> Vec<UnitStatus> {
         // Discover already-mounted filesystems so the connect-time full
         // snapshot includes them even if the mountinfo monitor has not run
-        // its first reconcile yet (e.g. tmp.mount for the kernel-mounted /tmp).
+        // its first poll yet (e.g. tmp.mount for the kernel-mounted /tmp).
         if let Ok(snapshot) = mountinfo::MountInfoSnapshot::refresh() {
             mountinfo::reconcile_mount_registry(&self.mount_registry, &snapshot);
         }

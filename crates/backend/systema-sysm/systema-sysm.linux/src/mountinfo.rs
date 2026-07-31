@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use anyhow::Result;
-use inotify::{Inotify, WatchMask};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use sysa::controller::UnitStatus;
+use sysa::finder::UnitFinder;
 use sysa::worker_ipc::EventPublisher;
+use systema_sysf::ir::{DependencySet, MountConfig as IrMountConfig, UnitIR, UnitType};
 
 use crate::state::{MountInstance, MountRegistry, MountState};
 
@@ -80,37 +82,25 @@ pub fn mount_point_is_mounted(mount_point: &str) -> bool {
 }
 
 /// Derive the mount unit name for a mount point, following systemd's
-/// path escaping: the leading `/` is dropped, `/` separators become `-`,
-/// printable ASCII passes through, and a literal `-` right after a `/` is
-/// escaped (`/mnt/-x` → `mnt-\x2dx.mount`).  The root path `/` → `-.mount`.
+/// `unit_name_from_path()` escaping exactly: leading `/` is dropped and
+/// `/` separators become `-`, every literal `-` becomes `\x2d`, `\` becomes
+/// `\x5c`, `:`/`_`/`.` (but not a leading `.`) pass through, any other byte
+/// becomes lowercase `\xHH`, and the root path `/` → `-.mount`.
 pub fn mount_unit_name_from_path(path: &str) -> String {
-    let mut name = String::new();
-    // After a '/', a literal '-' must be escaped (systemd rule).
-    let mut dash_needs_escape = true;
-    for (i, &b) in path.as_bytes().iter().enumerate() {
-        if b == b'/' {
-            if i == 0 {
-                continue;
-            }
-            name.push('-');
-            dash_needs_escape = true;
-        } else if b == b'-' {
-            if dash_needs_escape {
-                name.push_str("\\x2d");
-            } else {
-                name.push('-');
-            }
-            dash_needs_escape = false;
-        } else if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
-            name.push(b as char);
-            dash_needs_escape = false;
-        } else {
-            name.push_str(&format!("\\x{:02x}", b));
-            dash_needs_escape = false;
-        }
+    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "-.mount".to_string();
     }
-    if name.is_empty() {
-        name.push('-');
+    let mut name = String::with_capacity(trimmed.len());
+    for (i, &b) in trimmed.as_bytes().iter().enumerate() {
+        match b {
+            b'/' => name.push('-'),
+            b'-' => name.push_str("\\x2d"),
+            b'\\' => name.push_str("\\x5c"),
+            b':' | b'_' | b'.' if i > 0 => name.push(b as char),
+            _ if b.is_ascii_alphanumeric() => name.push(b as char),
+            _ => name.push_str(&format!("\\x{:02x}", b)),
+        }
     }
     name.push_str(".mount");
     name
@@ -197,12 +187,47 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry> {
     })
 }
 
-/// MountInfo monitor: watches /proc/self/mountinfo via inotify and triggers
-/// state transitions when the mount table changes.
+/// MountInfo monitor: waits for changes to /proc/self/mountinfo (poll(2)
+/// with POLLPRI, the documented procfs mechanism — inotify emits no events
+/// for this file) and reconciles the registry against the real mount table.
 pub struct MountInfoMonitor {
     registry: MountRegistry,
     last_snapshot: Option<MountInfoSnapshot>,
     event_pub: EventPublisher,
+}
+
+/// Build a dynamic mount `UnitIR` from mount-table facts, mirroring what a
+/// `.mount` unit file derived from the same mount point would look like.
+fn build_mount_unit_ir(
+    unit_name: &str,
+    mount_point: &str,
+    what: &str,
+    fstype: &str,
+    options: &str,
+) -> UnitIR {
+    UnitIR {
+        id: unit_name.to_string(),
+        unit_type: UnitType::Mount,
+        description: format!("Mounted at {}", mount_point),
+        source_format: "dynamic".to_string(),
+        source_path: None,
+        dependencies: DependencySet::default(),
+        service: None,
+        mount: Some(IrMountConfig {
+            what: what.to_string(),
+            where_: mount_point.to_string(),
+            type_: fstype.to_string(),
+            options: options.to_string(),
+            timeout_sec: 0,
+        }),
+        automount: None,
+        timer: None,
+        socket: None,
+        conditions: vec![],
+        asserts: vec![],
+        wanted_by: vec![],
+        required_by: vec![],
+    }
 }
 
 impl MountInfoMonitor {
@@ -214,43 +239,112 @@ impl MountInfoMonitor {
         }
     }
 
-    pub async fn run(&mut self) {
-        // Initial reconcile: capture the current mount table on startup
-        // (inotify only reports changes, not the present state).
-        self.reconcile().await;
+    /// How often to rescan the mount table as a safety net.  poll(2) on
+    /// /proc/self/mountinfo is the documented change-notification mechanism,
+    /// but a periodic rescan guarantees convergence even if a wakeup is
+    /// ever missed.  Every rescan diffs against the previous snapshot, so an
+    /// unchanged table produces no events and no state updates.
+    const RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-        let mut inotify = match Inotify::init() {
-            Ok(inot) => inot,
+    pub async fn run(&mut self) {
+        // Initial poll: capture the current mount table on startup
+        // (change notifications only report changes, not the present state).
+        self.poll().await;
+
+        // Block on the mountinfo fd until the kernel reports a mount-table
+        // change.  poll(2) with POLLPRI on /proc/self/mountinfo is the
+        // documented procfs mechanism for this; inotify never fires for
+        // this file.
+        let file = match fs::File::open("/proc/self/mountinfo") {
+            Ok(f) => f,
             Err(e) => {
-                warn!("Failed to initialize inotify: {e}");
+                warn!("Failed to open /proc/self/mountinfo for polling: {e}");
                 return;
             }
         };
-
-        if let Err(e) = inotify.watches().add(
-            "/proc/self/mountinfo",
-            WatchMask::ATTRIB | WatchMask::MODIFY,
-        ) {
-            warn!("Failed to watch /proc/self/mountinfo: {e}");
-            return;
-        }
+        let fd = file.as_raw_fd();
 
         let notify = Arc::new(Notify::new());
         let notify_clone = notify.clone();
-
         tokio::task::spawn_blocking(move || {
-            let mut buffer = [0u8; 4096];
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLPRI,
+                revents: 0,
+            };
             loop {
-                if let Err(e) = inotify.read_events_blocking(&mut buffer) {
-                    warn!("inotify read error: {e}");
+                let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    warn!("poll on /proc/self/mountinfo failed: {err}");
+                    return;
                 }
-                notify_clone.notify_one();
+                // A non-zero revents (POLLPRI/POLLERR, or POLLNVAL) means the
+                // table changed; any read that follows clears the flag, so
+                // poll() resets it.  POLLNVAL is a real error.
+                if pfd.revents & libc::POLLNVAL != 0 {
+                    warn!("poll on /proc/self/mountinfo: invalid fd");
+                    return;
+                }
+                if pfd.revents != 0 {
+                    notify_clone.notify_one();
+                }
             }
         });
 
         loop {
-            notify.notified().await;
-            self.reconcile().await;
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(Self::RESCAN_INTERVAL) => {}
+            }
+            self.poll().await;
+        }
+    }
+
+    /// Register + commit dynamically generated mount UnitIRs with System A
+    /// via the UnitFinder API.  Returns `true` on success.
+    async fn commit_mount_units(&self, units: &HashMap<String, UnitIR>) -> bool {
+        let json = match serde_json::to_vec(units) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("Failed to serialize discovered mount UnitIRs: {e}");
+                return false;
+            }
+        };
+        let finder = UnitFinder::new();
+        match finder
+            .register_units("system-m mount discovery", json)
+            .await
+        {
+            Ok(ack) if !ack.success => {
+                warn!("Unit registration rejected: {}", ack.message);
+                return false;
+            }
+            Err(e) => {
+                warn!("Failed to register discovered mount units: {e}");
+                return false;
+            }
+            Ok(_) => {}
+        }
+        match finder.commit_units().await {
+            Ok(ack) if !ack.success => {
+                warn!("Unit commit rejected: {}", ack.message);
+                return false;
+            }
+            Err(e) => {
+                warn!("Failed to commit discovered mount units: {e}");
+                return false;
+            }
+            Ok(ack) => {
+                info!(
+                    "Committed {} dynamically discovered mount unit(s) to System A",
+                    ack.unit_count
+                );
+                true
+            }
         }
     }
 
@@ -284,9 +378,13 @@ impl MountInfoMonitor {
             .publish_unit_state_update(vec![status], false);
     }
 
-    /// Reconcile the registry against the current mount table.  Runs on
-    /// startup and on every inotify change to /proc/self/mountinfo.
-    async fn reconcile(&mut self) {
+    /// Poll the registry against the current mount table.  Runs on
+    /// startup, on every mount-table change (poll(2) wakeup), and on a
+    /// periodic safety-net timer.  Every run re-probes the table, discovers
+    /// mount points that are not yet in the registry, commits their UnitIRs
+    /// to System A *before* any state update for them is published, and
+    /// diffs known units' states against the previous snapshot.
+    async fn poll(&mut self) {
         let snapshot = match MountInfoSnapshot::refresh() {
             Ok(s) => s,
             Err(e) => {
@@ -295,10 +393,90 @@ impl MountInfoMonitor {
             }
         };
 
+        // Discover mount points not yet in the registry (already-mounted
+        // filesystems at boot, or new mounts appearing later).
+        let created = reconcile_mount_registry(&self.registry, &snapshot);
+
+        // Dynamically generate a UnitIR for every discovered mount unit and
+        // commit it to System A so the unit is KNOWN before any state update
+        // for it is published.  A state_update for a unit SysA does not know
+        // would be ignored.
+        let first_run = self.last_snapshot.is_none();
+        if !created.is_empty() || first_run {
+            let mut irs: HashMap<String, UnitIR> = HashMap::new();
+            if first_run {
+                // The connect-time snapshot may already have created entries
+                // before this monitor started; commit those too.
+                let discovered: Vec<(String, String, String, String, String)> = {
+                    let reg = self.registry.lock();
+                    reg.iter()
+                        .filter(|(_, inst)| inst.from_mountinfo)
+                        .map(|(name, inst)| {
+                            (
+                                name.clone(),
+                                inst.mount_point.clone(),
+                                inst.what.clone(),
+                                inst.fstype.clone(),
+                                inst.options.clone(),
+                            )
+                        })
+                        .collect()
+                };
+                for (name, mp, what, fstype, options) in discovered {
+                    irs.insert(
+                        name.clone(),
+                        build_mount_unit_ir(&name, &mp, &what, &fstype, &options),
+                    );
+                }
+            }
+            for name in &created {
+                if let Some(entry) = snapshot
+                    .entries
+                    .iter()
+                    .find(|e| mount_unit_name_from_path(&e.mount_point) == *name)
+                {
+                    irs.insert(
+                        name.clone(),
+                        build_mount_unit_ir(
+                            name,
+                            &entry.mount_point,
+                            &entry.mount_source,
+                            &entry.filesystem_type,
+                            &entry.mount_options,
+                        ),
+                    );
+                }
+            }
+            if !irs.is_empty() {
+                self.commit_mount_units(&irs).await;
+            }
+        }
+
+        // Only now (commit completed) publish the state of the new units.
+        if !created.is_empty() {
+            info!(
+                "Discovered {} new mount unit(s): {:?}",
+                created.len(),
+                created
+            );
+            let statuses: Vec<UnitStatus> = created
+                .iter()
+                .map(|name| UnitStatus {
+                    unit_name: name.clone(),
+                    active_state: "active".to_string(),
+                    sub_state: "mounted".to_string(),
+                    main_pid: 0,
+                    invocation_id: String::new(),
+                    extensions: HashMap::new(),
+                })
+                .collect();
+            self.event_pub.publish_unit_state_update(statuses, false);
+        }
+
         let prev = match &self.last_snapshot {
             Some(p) => p,
             None => {
-                // First reconcile: initial reconciliation.
+                // First poll: initial reconciliation.
                 info!("Mount table ({} entries):", snapshot.entries.len());
                 for entry in &snapshot.entries {
                     info!(
@@ -308,29 +486,6 @@ impl MountInfoMonitor {
                         entry.filesystem_type,
                         entry.mount_options,
                     );
-                }
-
-                // Discover already-mounted filesystems (e.g. tmp.mount for
-                // the kernel-mounted tmpfs on /tmp) and report them.
-                let created = reconcile_mount_registry(&self.registry, &snapshot);
-                if !created.is_empty() {
-                    info!(
-                        "Initial reconciliation: discovered {} already-mounted unit(s): {:?}",
-                        created.len(),
-                        created
-                    );
-                    let statuses: Vec<UnitStatus> = created
-                        .iter()
-                        .map(|name| UnitStatus {
-                            unit_name: name.clone(),
-                            active_state: "active".to_string(),
-                            sub_state: "mounted".to_string(),
-                            main_pid: 0,
-                            invocation_id: String::new(),
-                            extensions: HashMap::new(),
-                        })
-                        .collect();
-                    self.event_pub.publish_unit_state_update(statuses, false);
                 }
 
                 // Check every registry entry against the snapshot.
@@ -435,7 +590,10 @@ mod tests {
         assert_eq!(mount_unit_name_from_path("/mnt/data"), "mnt-data.mount");
         assert_eq!(mount_unit_name_from_path("/var/run"), "var-run.mount");
         assert_eq!(mount_unit_name_from_path("/mnt/-x"), "mnt-\\x2dx.mount");
+        assert_eq!(mount_unit_name_from_path("/foo-bar"), "foo\\x2dbar.mount");
         assert_eq!(mount_unit_name_from_path("/mnt/a_b.c"), "mnt-a_b.c.mount");
+        assert_eq!(mount_unit_name_from_path("/mnt/a:b"), "mnt-a:b.mount");
+        assert_eq!(mount_unit_name_from_path("/.dotdir"), "\\x2edotdir.mount");
     }
 
     fn entry(mount_point: &str, fstype: &str) -> MountInfoEntry {
@@ -477,6 +635,21 @@ mod tests {
         assert_eq!(tmp.mount_point, "/tmp");
         assert!(tmp.from_mountinfo);
         assert_eq!(tmp.fstype, "tmpfs");
+    }
+
+    #[test]
+    fn build_mount_unit_ir_maps_mount_facts() {
+        let ir = build_mount_unit_ir("tmp.mount", "/tmp", "tmpfs", "tmpfs", "rw,nosuid");
+        assert_eq!(ir.id, "tmp.mount");
+        assert_eq!(ir.unit_type, UnitType::Mount);
+        assert_eq!(ir.source_format, "dynamic");
+        let mnt = ir.mount.unwrap();
+        assert_eq!(mnt.what, "tmpfs");
+        assert_eq!(mnt.where_, "/tmp");
+        assert_eq!(mnt.type_, "tmpfs");
+        assert_eq!(mnt.options, "rw,nosuid");
+        assert!(ir.service.is_none());
+        assert!(ir.automount.is_none());
     }
 
     #[test]
