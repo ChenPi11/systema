@@ -29,6 +29,9 @@ pub struct CachedUnitState {
     pub active_state: String,
     pub sub_state: String,
     pub main_pid: u32,
+    /// Invocation ID (UUID v4) of the current activation, as reported by
+    /// the owning worker.  Cleared when the unit reaches `inactive`/`dead`.
+    pub invocation_id: String,
     /// Worker-specific extensions (e.g. `last_exit_code`, `last_error`).
     pub extensions: HashMap<String, String>,
 }

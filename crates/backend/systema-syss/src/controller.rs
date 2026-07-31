@@ -38,7 +38,7 @@ impl ServiceController {
                     .to_string(),
                     sub_state: inst.state.as_str().to_string(),
                     main_pid: inst.main_pid.unwrap_or(0),
-                    invocation_id: String::new(),
+                    invocation_id: inst.invocation_id.clone().unwrap_or_default(),
                     extensions,
                 }
             }

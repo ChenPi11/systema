@@ -64,6 +64,7 @@ pub(crate) async fn monitor_service(
                         inst.state = state;
                         inst.main_pid = None;
                         inst.last_exit_code = status.code();
+                        inst.invocation_id = None;
                     }
                 }
                 publish_service_state(&registry, &event_pub, &unit_name);
@@ -77,6 +78,7 @@ pub(crate) async fn monitor_service(
                     if let Some(inst) = reg.get_mut(&unit_name) {
                         inst.state = ServiceState::Failed;
                         inst.main_pid = None;
+                        inst.invocation_id = None;
                     }
                 }
                 publish_service_state(&registry, &event_pub, &unit_name);
@@ -113,7 +115,7 @@ fn publish_service_state(registry: &ServiceRegistry, event_pub: &EventPublisher,
         .to_string(),
         sub_state: inst.state.as_str().to_string(),
         main_pid: inst.main_pid.unwrap_or(0),
-        invocation_id: String::new(),
+        invocation_id: inst.invocation_id.clone().unwrap_or_default(),
         extensions,
     };
     drop(reg);

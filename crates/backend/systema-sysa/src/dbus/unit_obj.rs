@@ -296,7 +296,18 @@ impl UnitObject {
 
     #[zbus(property)]
     fn invocation_id(&self) -> String {
-        String::new()
+        let state = self.allocator.read();
+        // The worker-reported ID is authoritative (it is what the running
+        // activation was actually started with).  Until the worker reports
+        // (or once it has cleared it), fall back to the ID System A
+        // generated when dispatching the Start/Restart job.
+        state
+            .unit_states
+            .get(&self.unit_name)
+            .map(|s| s.invocation_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| state.invocation_ids.get(&self.unit_name).cloned())
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
@@ -309,5 +320,72 @@ impl UnitObject {
 
     fn reset_failed(&self) -> zbus::fdo::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::state::{AllocatorState, CachedUnitState};
+
+    use super::*;
+
+    fn handle() -> AllocatorHandle {
+        Arc::new(parking_lot::RwLock::new(AllocatorState::new()))
+    }
+
+    fn obj(alloc: AllocatorHandle) -> UnitObject {
+        UnitObject {
+            allocator: alloc,
+            unit_name: "demo.service".to_string(),
+        }
+    }
+
+    #[test]
+    fn invocation_id_prefers_worker_reported_over_dispatched() {
+        let alloc = handle();
+        {
+            let mut s = alloc.write();
+            s.invocation_ids
+                .insert("demo.service".to_string(), "dispatched-id".to_string());
+            s.unit_states.insert(
+                "demo.service".to_string(),
+                CachedUnitState {
+                    active_state: "active".to_string(),
+                    sub_state: "running".to_string(),
+                    main_pid: 42,
+                    invocation_id: "reported-id".to_string(),
+                    extensions: Default::default(),
+                },
+            );
+        }
+        assert_eq!(obj(alloc).invocation_id(), "reported-id");
+    }
+
+    #[test]
+    fn invocation_id_falls_back_to_dispatched_until_worker_reports() {
+        let alloc = handle();
+        alloc
+            .write()
+            .invocation_ids
+            .insert("demo.service".to_string(), "dispatched-id".to_string());
+        assert_eq!(obj(alloc).invocation_id(), "dispatched-id");
+    }
+
+    #[test]
+    fn invocation_id_empty_without_report_or_dispatch() {
+        let alloc = handle();
+        alloc.write().unit_states.insert(
+            "demo.service".to_string(),
+            CachedUnitState {
+                active_state: "active".to_string(),
+                sub_state: "running".to_string(),
+                main_pid: 42,
+                invocation_id: String::new(),
+                extensions: Default::default(),
+            },
+        );
+        assert_eq!(obj(alloc).invocation_id(), "");
     }
 }

@@ -81,6 +81,7 @@ pub async fn start_service(
             .entry(unit_name.clone())
             .or_insert_with(ServiceInstance::new);
         inst.state = ServiceState::Starting;
+        inst.invocation_id = invocation_id.clone();
     }
 
     // Build the Command.
@@ -205,6 +206,7 @@ pub async fn stop_service(
         if let Some(inst) = reg.get_mut(unit_name) {
             inst.state = ServiceState::Dead;
             inst.main_pid = None;
+            inst.invocation_id = None;
         }
     }
 

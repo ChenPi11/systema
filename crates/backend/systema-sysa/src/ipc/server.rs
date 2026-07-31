@@ -316,6 +316,7 @@ async fn handle_worker_session(
                                             active_state: unit_status.active_state,
                                             sub_state: unit_status.sub_state,
                                             main_pid: unit_status.main_pid,
+                                            invocation_id: unit_status.invocation_id.clone(),
                                             extensions: unit_status.extensions.clone(),
                                         },
                                     );
@@ -802,6 +803,7 @@ fn update_cache_on_task_result(
         crate::state::JobKind::Stop => {
             entry.active_state = "inactive".to_string();
             entry.sub_state = "dead".to_string();
+            entry.invocation_id.clear();
         }
         crate::state::JobKind::Reload => {}
     }
@@ -863,17 +865,24 @@ async fn handle_state_update(
         // Cache update only.
         {
             let mut state = allocator.write();
+            let dead = status.active_state == "inactive" && status.sub_state == "dead";
+            let invocation_id = if dead {
+                String::new()
+            } else {
+                status.invocation_id.clone()
+            };
             state.unit_states.insert(
                 status.unit_name.clone(),
                 crate::state::CachedUnitState {
                     active_state: status.active_state.clone(),
                     sub_state: status.sub_state.clone(),
                     main_pid: status.main_pid,
+                    invocation_id,
                     extensions: status.extensions.clone(),
                 },
             );
             // Ownership ends when the unit reaches its dead state.
-            if status.active_state == "inactive" && status.sub_state == "dead" {
+            if dead {
                 state.unit_owners.remove(&status.unit_name);
             }
         }
