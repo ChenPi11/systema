@@ -158,12 +158,12 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
     // We use a throw-away connection so the check is independent of the
     // name-claim that follows.
     {
-        let probe = zbus::Connection::system()
-            .await
-            .map_err(|e| anyhow::anyhow!(sysa::l10n::fmt(
+        let probe = zbus::Connection::system().await.map_err(|e| {
+            anyhow::anyhow!(sysa::l10n::fmt(
                 sysa::l10n::t_("D-Bus safety check failed (cannot connect to system bus): {error}"),
                 &[("error", &e.to_string())],
-            )))?;
+            ))
+        })?;
         let has_owner: bool = probe
             .call_method(
                 Some("org.freedesktop.DBus"),
@@ -173,16 +173,20 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
                 &(BUS_NAME,),
             )
             .await
-            .map_err(|e| anyhow::anyhow!(sysa::l10n::fmt(
-                sysa::l10n::t_("D-Bus safety check failed (NameHasOwner query): {error}"),
-                &[("error", &e.to_string())],
-            )))?
+            .map_err(|e| {
+                anyhow::anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("D-Bus safety check failed (NameHasOwner query): {error}"),
+                    &[("error", &e.to_string())],
+                ))
+            })?
             .body()
             .deserialize()
-            .map_err(|e| anyhow::anyhow!(sysa::l10n::fmt(
-                sysa::l10n::t_("D-Bus safety check failed (parse reply): {error}"),
-                &[("error", &e.to_string())],
-            )))?;
+            .map_err(|e| {
+                anyhow::anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("D-Bus safety check failed (parse reply): {error}"),
+                    &[("error", &e.to_string())],
+                ))
+            })?;
         if has_owner {
             anyhow::bail!(sysa::l10n::fmt(
                 sysa::l10n::t_("D-Bus name '{bus_name}' is already owned by another process. Refusing to run to avoid conflicting with an existing init system."),
@@ -228,10 +232,7 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
     {
         Ok(_) => {}
         Err(e) => {
-            warn!(
-                "Failed to register custom Properties on manager: {}",
-                e
-            );
+            warn!("Failed to register custom Properties on manager: {}", e);
         }
     }
 
@@ -349,10 +350,7 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                warn!(
-                    "D-Bus connection failed: {}; retrying in {:?}",
-                    e, backoff
-                );
+                warn!("D-Bus connection failed: {}; retrying in {:?}", e, backoff);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }

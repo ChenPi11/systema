@@ -2,50 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Topics that can be subscribed to on the event bus.
+///
+/// Workers no longer emit free-form event strings; all runtime state
+/// changes flow through the unified `unit.state_update` protocol, which
+/// SysA re-dispatches as [`EventTopic::UnitStateChange`].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum EventTopic {
-    /// A service process exited.
-    ProcessExit,
-    /// A service started successfully.
-    ServiceStarted,
-    /// A service failed unexpectedly.
-    ServiceFailed,
-    /// A unit's active state changed.
+    /// A unit's runtime state changed (unified `unit.state_update`).
     UnitStateChange,
     /// Subscribe to **all** topics.
     All,
-}
-
-impl EventTopic {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "process.exit" => EventTopic::ProcessExit,
-            "service.started" => EventTopic::ServiceStarted,
-            "service.failed" => EventTopic::ServiceFailed,
-            "unit.state_change"
-            | "mount.state_change"
-            | "mount.status_update"
-            | "mount.table_update"
-            | "mount.done"
-            | "automount.done"
-            | "automount.trigger"
-            | "automount.expire" => EventTopic::UnitStateChange,
-            _ => {
-                tracing::warn!("Unknown event topic string: {}", s);
-                EventTopic::ProcessExit
-            }
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            EventTopic::ProcessExit => "process.exit",
-            EventTopic::ServiceStarted => "service.started",
-            EventTopic::ServiceFailed => "service.failed",
-            EventTopic::UnitStateChange => "unit.state_change",
-            EventTopic::All => "all",
-        }
-    }
 }
 
 /// An event published on the event bus.

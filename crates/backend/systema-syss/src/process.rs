@@ -43,18 +43,26 @@ pub async fn start_service(
     invocation_id: Option<String>,
 ) -> Result<(u32, Child)> {
     let unit_name = config.unit_name.clone();
-    let svc = config
-        .service
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!(sysa::l10n::fmt(sysa::l10n::t_("No [Service] config for {unit_name}."), &[("unit_name", &unit_name)])))?;
+    let svc = config.service.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("No [Service] config for {unit_name}."),
+            &[("unit_name", &unit_name)]
+        ))
+    })?;
 
     if svc.exec_start.is_empty() {
-        bail!(sysa::l10n::fmt(sysa::l10n::t_("ExecStart is empty for {unit_name}."), &[("unit_name", &unit_name)]));
+        bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("ExecStart is empty for {unit_name}."),
+            &[("unit_name", &unit_name)]
+        ));
     }
 
     // Parse the ExecStart command line (prefixes, word splitting, % specifiers).
     let parsed = parse_exec_start(&svc.exec_start, &unit_name)?;
-    info!("Starting {}: {} {:?}", unit_name, parsed.program, parsed.args);
+    info!(
+        "Starting {}: {} {:?}",
+        unit_name, parsed.program, parsed.args
+    );
 
     // Build environment lookup table (process env + unit Environment=).
     let env_table = build_env_table(&svc.environment);
@@ -71,7 +79,7 @@ pub async fn start_service(
         let mut reg = registry.lock();
         let inst = reg
             .entry(unit_name.clone())
-            .or_insert_with(|| ServiceInstance::new(unit_name.clone()));
+            .or_insert_with(ServiceInstance::new);
         inst.state = ServiceState::Starting;
     }
 
@@ -107,13 +115,19 @@ pub async fn start_service(
 
     // Spawn the child process. We deliberately do NOT wait here — the child
     // is monitored asynchronously via `monitor_child`.
-    let child = cmd
-        .spawn()
-        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to spawn {program}."), &[("program", &parsed.program)]))?;
+    let child = cmd.spawn().with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Failed to spawn {program}."),
+            &[("program", &parsed.program)],
+        )
+    })?;
 
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!(sysa::l10n::fmt(sysa::l10n::t_("Failed to get PID for {unit_name}."), &[("unit_name", &unit_name)])))?;
+    let pid = child.id().ok_or_else(|| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("Failed to get PID for {unit_name}."),
+            &[("unit_name", &unit_name)]
+        ))
+    })?;
 
     info!("Service {} started, PID={}", unit_name, pid);
 
@@ -250,7 +264,9 @@ fn parse_exec_start(raw: &str, unit_name: &str) -> Result<ParsedExec> {
     // Split the remainder into words (respects quotes, C-escapes).
     let words = split_words(rest);
     if words.is_empty() {
-        bail!(sysa::l10n::t_("Empty ExecStart command after prefix stripping."));
+        bail!(sysa::l10n::t_(
+            "Empty ExecStart command after prefix stripping."
+        ));
     }
 
     // Expand % specifiers in each word.
@@ -262,7 +278,9 @@ fn parse_exec_start(raw: &str, unit_name: &str) -> Result<ParsedExec> {
     if flags.custom_argv0 {
         // @ prefix: first word is argv[0], second word is the program.
         if words.len() < 2 {
-            bail!(sysa::l10n::t_("@ prefix requires at least two tokens (argv0 program)."));
+            bail!(sysa::l10n::t_(
+                "@ prefix requires at least two tokens (argv0 program)."
+            ));
         }
         // We don't have a way to set argv[0] natively in tokio::process::Command,
         // so we just use the program as-is and note the custom argv0 in the log.
@@ -476,7 +494,10 @@ fn parse_hex_escape(chars: &[char], start: usize) -> (usize, Option<u8>) {
     if hex.len() < 2 {
         return (0, None);
     }
-    u8::from_str_radix(&hex, 16).ok().map(|b| (2, Some(b))).unwrap_or((0, None))
+    u8::from_str_radix(&hex, 16)
+        .ok()
+        .map(|b| (2, Some(b)))
+        .unwrap_or((0, None))
 }
 
 /// Parse \uNNNN or \UNNNNNNNN unicode escape.
@@ -486,7 +507,9 @@ fn parse_unicode_escape(chars: &[char], start: usize, digits: usize) -> (usize, 
     }
     let hex: String = chars[start..start + digits].iter().collect();
     match u32::from_str_radix(&hex, 16).ok() {
-        Some(code) => char::from_u32(code).map(|c| (digits, Some(c))).unwrap_or((0, None)),
+        Some(code) => char::from_u32(code)
+            .map(|c| (digits, Some(c)))
+            .unwrap_or((0, None)),
         None => (0, None),
     }
 }
@@ -660,7 +683,9 @@ fn is_standalone_var_ref(word: &str) -> bool {
     if bytes[1] == b'{' {
         return false;
     }
-    bytes[1..].iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Expand `${VAR}`, `${VAR:-default}`, `${VAR:+alternate}`, `$VAR`, `$$` within
@@ -718,7 +743,10 @@ fn expand_braced_expr(
     let mut name = String::new();
     let mut substitution: Option<(char, String)> = None;
 
-    enum Phase { Name, Default }
+    enum Phase {
+        Name,
+        Default,
+    }
     let mut phase = Phase::Name;
     let mut op = ' '; // '-' or '+'
 
@@ -741,18 +769,27 @@ fn expand_braced_expr(
                             env.get(&name)
                                 .map(|v| {
                                     if v.is_empty() {
-                                        substitution.as_ref().map(|(_, d)| d.clone()).unwrap_or_default()
+                                        substitution
+                                            .as_ref()
+                                            .map(|(_, d)| d.clone())
+                                            .unwrap_or_default()
                                     } else {
                                         v.clone()
                                     }
                                 })
                                 .unwrap_or_else(|| {
-                                    substitution.as_ref().map(|(_, d)| d.clone()).unwrap_or_default()
+                                    substitution
+                                        .as_ref()
+                                        .map(|(_, d)| d.clone())
+                                        .unwrap_or_default()
                                 })
                         } else {
                             // '+'
                             if env.get(&name).is_some_and(|v| !v.is_empty()) {
-                                substitution.as_ref().map(|(_, a)| a.clone()).unwrap_or_default()
+                                substitution
+                                    .as_ref()
+                                    .map(|(_, a)| a.clone())
+                                    .unwrap_or_default()
                             } else {
                                 String::new()
                             }
@@ -774,20 +811,17 @@ fn expand_braced_expr(
             Some(ch) if matches!(phase, Phase::Name) => {
                 name.push(ch);
             }
-            Some(ch) if matches!(phase, Phase::Default) => {
-                match substitution {
-                    Some((opchar, ref mut val)) => {
-                        if opchar != ch as char {
-                        }
-                        val.push(ch);
-                    }
-                    None => {
-                        let mut val = String::new();
-                        val.push(ch);
-                        substitution = Some((op, val));
-                    }
+            Some(ch) if matches!(phase, Phase::Default) => match substitution {
+                Some((opchar, ref mut val)) => {
+                    if opchar != ch as char {}
+                    val.push(ch);
                 }
-            }
+                None => {
+                    let mut val = String::new();
+                    val.push(ch);
+                    substitution = Some((op, val));
+                }
+            },
             _ => unreachable!(),
         }
     }
@@ -987,7 +1021,10 @@ mod tests {
 
     #[test]
     fn expand_percent_noop() {
-        assert_eq!(expand_specifiers("hello world", "foo.service"), "hello world");
+        assert_eq!(
+            expand_specifiers("hello world", "foo.service"),
+            "hello world"
+        );
     }
 
     #[test]

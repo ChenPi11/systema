@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use sysa::proto::MountConfig;
+use tokio::task::JoinHandle;
 
 // ---------------------------------------------------------------------------
 // Mount state machine
@@ -14,16 +16,6 @@ pub enum MountState {
     Unmounting,
 }
 
-impl MountState {
-    pub fn as_str(&self) -> &str {
-        match self {
-            MountState::Dead => "dead",
-            MountState::Mounted => "mounted",
-            MountState::Unmounting => "unmounting",
-        }
-    }
-}
-
 pub struct MountInstance {
     pub unit_name: String,
     pub state: MountState,
@@ -33,7 +25,6 @@ pub struct MountInstance {
     pub options: String,
     pub from_mountinfo: bool,
     pub from_fragment: bool,
-    pub control_pid: Option<u32>,
     pub n_retry_umount: u32,
 }
 
@@ -48,7 +39,6 @@ impl MountInstance {
             options: String::new(),
             from_mountinfo: false,
             from_fragment: false,
-            control_pid: None,
             n_retry_umount: 0,
         }
     }
@@ -69,19 +59,6 @@ pub enum AutomountState {
     Dead,
     Waiting,
     Running,
-    #[allow(dead_code)]
-    Failed,
-}
-
-impl AutomountState {
-    pub fn as_str(&self) -> &str {
-        match self {
-            AutomountState::Dead => "dead",
-            AutomountState::Waiting => "waiting",
-            AutomountState::Running => "running",
-            AutomountState::Failed => "failed",
-        }
-    }
 }
 
 pub struct AutomountInstance {
@@ -94,8 +71,13 @@ pub struct AutomountInstance {
     pub pipe_fd: Option<i32>,
     pub dev_id: u64,
     pub ioctl_fd: Option<i32>,
-    pub tokens: Vec<u32>,
-    pub expire_tokens: Vec<u32>,
+    /// Preloaded config of the companion `.mount` unit, used to satisfy
+    /// kernel mount requests without a round-trip to SysA.
+    pub mount_config: Option<MountConfig>,
+    /// Failure message of the last trigger attempt (cleared on success).
+    pub last_error: Option<String>,
+    /// Handle of the idle-expire timer task (aborted on teardown).
+    pub expire_handle: Option<JoinHandle<()>>,
 }
 
 impl AutomountInstance {
@@ -110,8 +92,9 @@ impl AutomountInstance {
             pipe_fd: None,
             dev_id: 0,
             ioctl_fd: None,
-            tokens: Vec::new(),
-            expire_tokens: Vec::new(),
+            mount_config: None,
+            last_error: None,
+            expire_handle: None,
         }
     }
 }

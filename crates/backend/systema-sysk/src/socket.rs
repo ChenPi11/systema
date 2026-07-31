@@ -37,11 +37,7 @@ pub fn new_manager() -> SocketManager {
 }
 
 /// Start a socket unit: create, bind, and listen on all configured addresses.
-pub fn start_socket(
-    manager: &SocketManager,
-    unit_name: &str,
-    config: &SocketConfig,
-) -> Result<()> {
+pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketConfig) -> Result<()> {
     let mut guard = manager.lock();
     if guard.contains_key(unit_name) {
         anyhow::bail!(sysa::l10n::t_("Socket '{unit_name}' is already running."));
@@ -51,29 +47,53 @@ pub fn start_socket(
 
     for addr in &config.listen {
         if !addr.stream.is_empty() {
-            let listener = bind_stream(&addr.stream, config.backlog)
-                .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to bind ListenStream '{addr_stream}'."), &[("addr_stream", &addr.stream.to_string())]))?;
+            let listener = bind_stream(&addr.stream, config.backlog).with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Failed to bind ListenStream '{addr_stream}'."),
+                    &[("addr_stream", &addr.stream.to_string())],
+                )
+            })?;
             listeners.push(listener);
         }
         if !addr.datagram.is_empty() {
-            let fd = bind_datagram(&addr.datagram)
-                .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to bind ListenDatagram '{addr_datagram}'."), &[("addr_datagram", &addr.datagram.to_string())]))?;
+            let fd = bind_datagram(&addr.datagram).with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Failed to bind ListenDatagram '{addr_datagram}'."),
+                    &[("addr_datagram", &addr.datagram.to_string())],
+                )
+            })?;
             listeners.push(BoundSocket::Udp(fd));
         }
         if !addr.sequential_packet.is_empty() {
-            let listener = bind_seqpacket(&addr.sequential_packet, config.backlog)
-                .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to bind ListenSequentialPacket '{addr_sequential_packet}'."), &[("addr_sequential_packet", &addr.sequential_packet.to_string())]))?;
+            let listener =
+                bind_seqpacket(&addr.sequential_packet, config.backlog).with_context(|| {
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_(
+                            "Failed to bind ListenSequentialPacket '{addr_sequential_packet}'.",
+                        ),
+                        &[(
+                            "addr_sequential_packet",
+                            &addr.sequential_packet.to_string(),
+                        )],
+                    )
+                })?;
             listeners.push(listener);
         }
         if !addr.fifo.is_empty() {
-            create_fifo(&addr.fifo, &config.socket_mode)
-                .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to create FIFO '{addr_fifo}'."), &[("addr_fifo", &addr.fifo.to_string())]))?;
+            create_fifo(&addr.fifo, &config.socket_mode).with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Failed to create FIFO '{addr_fifo}'."),
+                    &[("addr_fifo", &addr.fifo.to_string())],
+                )
+            })?;
             listeners.push(BoundSocket::Fifo);
         }
     }
 
     if listeners.is_empty() {
-        anyhow::bail!(sysa::l10n::t_("Socket '{unit_name}' has no listen addresses configured."));
+        anyhow::bail!(sysa::l10n::t_(
+            "Socket '{unit_name}' has no listen addresses configured."
+        ));
     }
 
     let n = listeners.len();
@@ -89,10 +109,7 @@ pub fn start_socket(
 
 /// Spawn accept loops for Accept=yes sockets.  Each accepted connection
 /// spawns a child process with the accepted fd as fd 3.
-pub fn spawn_accept_loops(
-    manager: &SocketManager,
-    unit_name: &str,
-) {
+pub fn spawn_accept_loops(manager: &SocketManager, unit_name: &str) {
     let accept_tasks = {
         let mut guard = manager.lock();
         let ms = match guard.get_mut(unit_name) {
@@ -130,14 +147,11 @@ pub fn spawn_accept_loops(
 }
 
 /// Stop and clean up a socket unit.
-pub fn stop_socket(
-    manager: &SocketManager,
-    unit_name: &str,
-) -> Result<()> {
+pub fn stop_socket(manager: &SocketManager, unit_name: &str) -> Result<()> {
     let mut guard = manager.lock();
-    let managed = guard.remove(unit_name).ok_or_else(|| {
-        anyhow::anyhow!(sysa::l10n::t_("Socket '{unit_name}' is not running."))
-    })?;
+    let managed = guard
+        .remove(unit_name)
+        .ok_or_else(|| anyhow::anyhow!(sysa::l10n::t_("Socket '{unit_name}' is not running.")))?;
 
     // Abort accept loops.
     for handle in &managed.accept_tasks {
@@ -171,9 +185,12 @@ fn resolve_tcp_addr(address: &str) -> Result<std::net::SocketAddr> {
     if let Ok(port) = address.parse::<u16>() {
         return Ok((std::net::Ipv4Addr::UNSPECIFIED, port).into());
     }
-    address
-        .parse()
-        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Cannot parse TCP address '{address}'."), &[("address", &address.to_string())]))
+    address.parse().with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Cannot parse TCP address '{address}'."),
+            &[("address", &address.to_string())],
+        )
+    })
 }
 
 fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
@@ -182,29 +199,45 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
     } else if address.starts_with('/') {
         let path = PathBuf::from(address);
         let _ = std::fs::remove_file(&path);
-        let listener = std::os::unix::net::UnixListener::bind(&path)
-            .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Cannot bind Unix stream at '{address}'."), &[("address", &address.to_string())]))?;
+        let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot bind Unix stream at '{address}'."),
+                &[("address", &address.to_string())],
+            )
+        })?;
         // Set listen backlog (std UnixListener doesn't expose a method for this,
         // so it uses the kernel default (SOMAXCONN).  systemd's Backlog= maps to
         // listen(fd, backlog) which is already called by bind().
         let _ = backlog;
         listener.set_nonblocking(true)?;
-        let listener = UnixListener::from_std(listener)
-            .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Cannot convert Unix listener '{address}'."), &[("address", &address.to_string())]))?;
+        let listener = UnixListener::from_std(listener).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot convert Unix listener '{address}'."),
+                &[("address", &address.to_string())],
+            )
+        })?;
         info!("Bound Unix stream at '{}'", address);
         Ok(BoundSocket::UnixStream(listener))
     } else {
         let addr = resolve_tcp_addr(address)?;
-        let std_listener = std::net::TcpListener::bind(addr)
-            .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Cannot bind TCP at '{address}'."), &[("address", &address.to_string())]))?;
+        let std_listener = std::net::TcpListener::bind(addr).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot bind TCP at '{address}'."),
+                &[("address", &address.to_string())],
+            )
+        })?;
         if backlog > 0 {
             // std::net::TcpListener already calls listen() with SOMAXCONN.
             // To set a custom backlog we need libc::listen(). We do that below.
             let _ = backlog;
         }
         std_listener.set_nonblocking(true)?;
-        let listener = TcpListener::from_std(std_listener)
-            .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Cannot convert TCP listener '{address}'."), &[("address", &address.to_string())]))?;
+        let listener = TcpListener::from_std(std_listener).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot convert TCP listener '{address}'."),
+                &[("address", &address.to_string())],
+            )
+        })?;
         info!("Bound TCP stream at '{}'", address);
         Ok(BoundSocket::Tcp(listener))
     }
@@ -216,7 +249,10 @@ fn new_socket_fd() -> Result<RawFd> {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
             let e = std::io::Error::last_os_error();
-            anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("socket(AF_UNIX) failed: {e}."), &[("e", &e.to_string())]));
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("socket(AF_UNIX) failed: {e}."),
+                &[("e", &e.to_string())]
+            ));
         }
         // Set FD_CLOEXEC portably (SOCK_CLOEXEC is not available on macOS).
         let flags = libc::fcntl(fd, libc::F_GETFD, 0);
@@ -257,7 +293,10 @@ fn bind_abstract_unix(address: &str, backlog: u32) -> Result<BoundSocket> {
         if ret < 0 {
             let e = std::io::Error::last_os_error();
             libc::close(fd);
-            anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("bind abstract '{address}' failed: {e}."), &[("address", &address.to_string()), ("e", &e.to_string())]));
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("bind abstract '{address}' failed: {e}."),
+                &[("address", &address.to_string()), ("e", &e.to_string())]
+            ));
         }
 
         let backlog = if backlog > 0 { backlog as i32 } else { 128 };
@@ -266,8 +305,12 @@ fn bind_abstract_unix(address: &str, backlog: u32) -> Result<BoundSocket> {
 
     let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
     std_listener.set_nonblocking(true)?;
-    let listener = UnixListener::from_std(std_listener)
-        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Cannot convert abstract Unix listener '{address}'."), &[("address", &address.to_string())]))?;
+    let listener = UnixListener::from_std(std_listener).with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Cannot convert abstract Unix listener '{address}'."),
+            &[("address", &address.to_string())],
+        )
+    })?;
 
     info!("Bound abstract Unix stream at '{}'", address);
     Ok(BoundSocket::UnixStream(listener))
@@ -285,7 +328,10 @@ fn bind_datagram(address: &str) -> Result<RawFd> {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd < 0 {
             let e = std::io::Error::last_os_error();
-            anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("socket(AF_INET, SOCK_DGRAM) failed: {e}."), &[("e", &e.to_string())]));
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("socket(AF_INET, SOCK_DGRAM) failed: {e}."),
+                &[("e", &e.to_string())]
+            ));
         }
         // Set CLOEXEC portably.
         let flags = libc::fcntl(fd, libc::F_GETFD, 0);
@@ -313,7 +359,10 @@ fn bind_datagram(address: &str) -> Result<RawFd> {
         if ret < 0 {
             let e = std::io::Error::last_os_error();
             libc::close(fd);
-            anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("bind datagram '{address}' failed: {e}."), &[("address", &address.to_string()), ("e", &e.to_string())]));
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("bind datagram '{address}' failed: {e}."),
+                &[("address", &address.to_string()), ("e", &e.to_string())]
+            ));
         }
         fd
     };
@@ -332,19 +381,25 @@ fn bind_seqpacket(address: &str, backlog: u32) -> Result<BoundSocket> {
 }
 
 fn create_fifo(path: &str, mode: &str) -> Result<()> {
-    let cpath = CString::new(path)
-        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Invalid FIFO path '{path}'."), &[("path", &path.to_string())]))?;
+    let cpath = CString::new(path).with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Invalid FIFO path '{path}'."),
+            &[("path", &path.to_string())],
+        )
+    })?;
     let mode_int = if mode.is_empty() {
         0o644
     } else {
-        u32::from_str_radix(mode.trim_start_matches('0'), 8)
-            .unwrap_or(0o644)
+        u32::from_str_radix(mode.trim_start_matches('0'), 8).unwrap_or(0o644)
     };
     let ret = unsafe { libc::mkfifo(cpath.as_ptr(), mode_int) };
     if ret < 0 {
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::AlreadyExists {
-            anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("mkfifo '{path}' failed: {e}."), &[("path", &path.to_string()), ("e", &e.to_string())]));
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("mkfifo '{path}' failed: {e}."),
+                &[("path", &path.to_string()), ("e", &e.to_string())]
+            ));
         }
         // File already exists — that's OK.
         warn!("FIFO '{}' already exists", path);
@@ -358,10 +413,7 @@ fn create_fifo(path: &str, mode: &str) -> Result<()> {
 // Accept loops for Accept=yes
 // ---------------------------------------------------------------------------
 
-async fn accept_loop_tcp(
-    listener: TcpListener,
-    unit_name: &str,
-) {
+async fn accept_loop_tcp(listener: TcpListener, unit_name: &str) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -381,10 +433,7 @@ async fn accept_loop_tcp(
     }
 }
 
-async fn accept_loop_unix(
-    listener: UnixListener,
-    unit_name: &str,
-) {
+async fn accept_loop_unix(listener: UnixListener, unit_name: &str) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -410,8 +459,11 @@ async fn spawn_child_with_fd(unit_name: &str, fd: RawFd) -> Result<()> {
     // In a real deployment, the service path would come from the associated
     // service unit's ExecStart.  Here we use a placeholder — the convention
     // is that the child reads from / writes to fd 3.
-    let service_path = std::env::var("SYSTEMK_SERVICE_PATH")
-        .unwrap_or_else(|_| sysa::paths::instance().systema_socket_handler_path.to_string());
+    let service_path = std::env::var("SYSTEMK_SERVICE_PATH").unwrap_or_else(|_| {
+        sysa::paths::instance()
+            .systema_socket_handler_path
+            .to_string()
+    });
 
     // Extract the raw fd value before the async move so the closure owns it.
     let raw_fd = fd;
@@ -434,11 +486,19 @@ async fn spawn_child_with_fd(unit_name: &str, fd: RawFd) -> Result<()> {
         });
     }
 
-    let mut child = cmd.spawn()
-        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to spawn child for '{unit_name}'."), &[("unit_name", &unit_name.to_string())]))?;
+    let mut child = cmd.spawn().with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Failed to spawn child for '{unit_name}'."),
+            &[("unit_name", &unit_name.to_string())],
+        )
+    })?;
 
-    let status = child.wait().await
-        .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Failed to wait for child for '{unit_name}'."), &[("unit_name", &unit_name.to_string())]))?;
+    let status = child.wait().await.with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Failed to wait for child for '{unit_name}'."),
+            &[("unit_name", &unit_name.to_string())],
+        )
+    })?;
 
     if !status.success() {
         warn!("Child for '{}' exited with: {}", unit_name, status);
@@ -476,7 +536,9 @@ fn try_clone_unix(l: &UnixListener) -> UnixListener {
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if dup < 0 {
         warn!("Failed to dup Unix listener fd, accept may race");
-        unsafe { UnixListener::from_std(std::os::unix::net::UnixListener::from_raw_fd(fd)).unwrap() }
+        unsafe {
+            UnixListener::from_std(std::os::unix::net::UnixListener::from_raw_fd(fd)).unwrap()
+        }
     } else {
         unsafe {
             let std = std::os::unix::net::UnixListener::from_raw_fd(dup);

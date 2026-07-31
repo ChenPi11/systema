@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-use anyhow::Result;
-use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
-use sysa::proto::SyncUnitState;
-use sysa::worker_ipc::EventPublisher;
 use crate::mount::{do_mount, do_remount, do_umount};
 use crate::state::{MountRegistry, MountState};
+use anyhow::Result;
+use std::collections::HashMap;
+use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
+use sysa::worker_ipc::EventPublisher;
 
 #[derive(Clone)]
 pub struct MountController {
@@ -14,13 +13,13 @@ pub struct MountController {
 
 impl MountController {
     pub fn new(registry: MountRegistry, event_pub: EventPublisher) -> Self {
-        MountController { registry, event_pub }
+        MountController {
+            registry,
+            event_pub,
+        }
     }
-}
 
-#[async_trait::async_trait]
-impl UnitController for MountController {
-    async fn status(&self, unit_name: &str) -> Result<UnitStatus> {
+    fn status_of(&self, unit_name: &str) -> UnitStatus {
         let guard = self.registry.lock();
         match guard.get(unit_name) {
             Some(inst) => {
@@ -31,51 +30,61 @@ impl UnitController for MountController {
                     MountState::Unmounting => ("deactivating", "unmounting"),
                     MountState::Failed => ("failed", "failed"),
                 };
-                Ok(UnitStatus {
+                UnitStatus {
                     unit_name: unit_name.to_string(),
                     active_state: active_state.to_string(),
                     sub_state: sub_state.to_string(),
                     main_pid: 0,
                     invocation_id: String::new(),
                     extensions: HashMap::new(),
-                })
+                }
             }
-            None => Ok(UnitStatus {
+            None => UnitStatus {
                 unit_name: unit_name.to_string(),
                 active_state: "inactive".to_string(),
                 sub_state: "dead".to_string(),
                 main_pid: 0,
                 invocation_id: String::new(),
                 extensions: HashMap::new(),
-            }),
+            },
         }
     }
 
-    async fn sync_state(&self) -> Vec<SyncUnitState> {
-        let guard = self.registry.lock();
-        guard
-            .values()
-            .map(|inst| SyncUnitState {
-                unit_name: inst.unit_name.clone(),
-                main_pid: 0,
-                state: inst.state.as_str().to_string(),
-                last_exit_code: 0,
-            })
-            .collect()
+    fn publish_state(&self, unit_name: &str) {
+        let status = self.status_of(unit_name);
+        self.event_pub
+            .publish_unit_state_update(vec![status], false);
+    }
+}
+
+#[async_trait::async_trait]
+impl UnitController for MountController {
+    async fn status(&self, unit_name: &str) -> Result<UnitStatus> {
+        Ok(self.status_of(unit_name))
+    }
+
+    async fn sync_state(&self) -> Vec<UnitStatus> {
+        let names: Vec<String> = {
+            let guard = self.registry.lock();
+            guard.keys().cloned().collect()
+        };
+        names.iter().map(|n| self.status_of(n)).collect()
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], _invocation_id: &str) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let mount_cfg = cfg.mount.as_ref()
+        let mount_cfg = cfg
+            .mount
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
         do_mount(self.registry.clone(), unit_name, mount_cfg).await?;
-        self.event_pub.publish("mount.done", unit_name, b"")?;
+        self.publish_state(unit_name);
         Ok(())
     }
 
     async fn stop(&self, unit_name: &str) -> Result<()> {
         do_umount(self.registry.clone(), unit_name, None).await?;
-        self.event_pub.publish("mount.done", unit_name, b"")?;
+        self.publish_state(unit_name);
         Ok(())
     }
 
@@ -87,10 +96,12 @@ impl UnitController for MountController {
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let mount_cfg = cfg.mount.as_ref()
+        let mount_cfg = cfg
+            .mount
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
         do_remount(self.registry.clone(), unit_name, mount_cfg).await?;
-        self.event_pub.publish("mount.done", unit_name, b"")?;
+        self.publish_state(unit_name);
         Ok(())
     }
 }

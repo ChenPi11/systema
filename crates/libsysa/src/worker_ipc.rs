@@ -1,44 +1,122 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use prost::Message as ProstMessage;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::controller::UnitController;
+use crate::controller::{UnitController, UnitStatus};
 use crate::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use crate::proto::*;
 
-/// Handle for publishing events from within a unit controller.
+/// Handle for publishing unit state updates from within a unit controller.
 ///
 /// Obtained via [`WorkerIpc::run`]'s factory closure and stored inside the
-/// controller so it can emit `event.publish` messages at any time.
+/// controller so it can emit `unit.state_update` messages at any time.
+///
+/// Publishing is asynchronous: each call serializes the update and spawns a
+/// background task that sends it and waits for the `unit.state_update_ack`
+/// from System A (5s timeout, up to 3 attempts, logging each failure, then
+/// giving up without blocking the caller).  This keeps publish safe to call
+/// from inside the reader task, which is also the task that resolves ACKs.
 #[derive(Clone)]
 pub struct EventPublisher {
     tx: mpsc::UnboundedSender<bytes::Bytes>,
     worker_id: String,
+    next_request_id: Arc<AtomicU64>,
+    pending_acks: Arc<Mutex<HashMap<u64, oneshot::Sender<UnitStateUpdateAck>>>>,
 }
 
 impl EventPublisher {
-    pub fn new(tx: mpsc::UnboundedSender<bytes::Bytes>, worker_id: &str) -> Self {
-        EventPublisher { tx, worker_id: worker_id.to_string() }
+    pub fn new(
+        tx: mpsc::UnboundedSender<bytes::Bytes>,
+        worker_id: &str,
+        pending_acks: Arc<Mutex<HashMap<u64, oneshot::Sender<UnitStateUpdateAck>>>>,
+    ) -> Self {
+        EventPublisher {
+            tx,
+            worker_id: worker_id.to_string(),
+            next_request_id: Arc::new(AtomicU64::new(1)),
+            pending_acks,
+        }
     }
 
-    /// Publish a `event.publish` envelope to System A.
-    pub fn publish(&self, event_type: &str, unit_name: &str, data: &[u8]) -> Result<()> {
-        let event = EventPublish {
-            event_type: event_type.to_string(),
-            unit_name: unit_name.to_string(),
-            event_data: data.to_vec(),
+    /// Publish a `unit.state_update` envelope (fire-and-forget from the
+    /// caller's perspective; ACK waiting and retries happen in the
+    /// background).
+    pub fn publish_unit_state_update(&self, units: Vec<UnitStatus>, full_snapshot: bool) {
+        let update = UnitStateUpdate {
+            units: units.into_iter().map(UnitStatus::into_proto).collect(),
+            full_snapshot,
+            seq: 0,
         };
-        let env = make_envelope(0, &self.worker_id, "system-a", "event.publish", event)?;
-        let mut buf = BytesMut::new();
-        env.encode(&mut buf)
-            .context(crate::l10n::t_("Failed to encode Envelope."))?;
-        self.tx.send(buf.freeze())
-            .map_err(|_| anyhow::anyhow!(crate::l10n::t_("Outgoing channel closed.")))
+        let publisher = self.clone();
+        tokio::spawn(async move {
+            const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+            const MAX_ATTEMPTS: u32 = 3;
+
+            for attempt in 1..=MAX_ATTEMPTS {
+                let request_id = publisher.next_request_id.fetch_add(1, Ordering::Relaxed);
+                if request_id == 0 {
+                    continue;
+                }
+                let env = match make_envelope(
+                    request_id,
+                    &publisher.worker_id,
+                    "system-a",
+                    "unit.state_update",
+                    update.clone(),
+                )
+                .and_then(encode_envelope)
+                {
+                    Ok(env) => env,
+                    Err(e) => {
+                        error!("Failed to encode unit.state_update: {}", e);
+                        return;
+                    }
+                };
+
+                let (ack_tx, ack_rx) = oneshot::channel();
+                publisher
+                    .pending_acks
+                    .lock()
+                    .unwrap()
+                    .insert(request_id, ack_tx);
+                if publisher.tx.send(env).is_err() {
+                    error!("Outgoing channel closed; cannot send unit.state_update");
+                    return;
+                }
+
+                match tokio::time::timeout(ACK_TIMEOUT, ack_rx).await {
+                    Ok(Ok(ack)) => {
+                        if !ack.accepted {
+                            error!(
+                                "unit.state_update rejected by System A: {} (ignored units: {:?})",
+                                ack.message, ack.ignored_units
+                            );
+                        }
+                        return;
+                    }
+                    Ok(Err(_)) => {
+                        error!("unit.state_update_ack channel closed");
+                        return;
+                    }
+                    Err(_) => {
+                        publisher.pending_acks.lock().unwrap().remove(&request_id);
+                        error!(
+                            "unit.state_update ACK timed out (attempt {}/{}); retrying",
+                            attempt, MAX_ATTEMPTS
+                        );
+                    }
+                }
+            }
+            error!("Giving up on unit.state_update after {MAX_ATTEMPTS} attempts");
+        });
     }
 }
 
@@ -100,7 +178,10 @@ impl WorkerIpc {
         let mut backoff = Duration::from_millis(500);
         loop {
             let (out_tx, out_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-            match self.try_run_inner(&controller_factory, &custom_handler, out_tx, out_rx).await {
+            match self
+                .try_run_inner(&controller_factory, &custom_handler, out_tx, out_rx)
+                .await
+            {
                 Ok(()) => {
                     info!("Worker loop exited cleanly");
                     return Ok(());
@@ -134,19 +215,17 @@ impl WorkerIpc {
             crate::paths::instance().ipc_socket_path
         );
 
-        let stream = tokio::net::UnixStream::connect(
-            crate::paths::instance().ipc_socket_path,
-        )
-        .await
-        .with_context(|| {
-            crate::l10n::fmt(
-                crate::l10n::t_("Cannot connect to {path}."),
-                &[(
-                    "path",
-                    &crate::paths::instance().ipc_socket_path.to_string(),
-                )],
-            )
-        })?;
+        let stream = tokio::net::UnixStream::connect(crate::paths::instance().ipc_socket_path)
+            .await
+            .with_context(|| {
+                crate::l10n::fmt(
+                    crate::l10n::t_("Cannot connect to {path}."),
+                    &[(
+                        "path",
+                        &crate::paths::instance().ipc_socket_path.to_string(),
+                    )],
+                )
+            })?;
 
         info!("Connected to System A");
 
@@ -156,22 +235,12 @@ impl WorkerIpc {
             worker_id: self.worker_id.clone(),
             unit_types: self.unit_types.clone(),
         };
-        let env = make_envelope(
-            0,
-            &self.worker_id,
-            "system-a",
-            "worker.register",
-            reg,
-        )?;
+        let env = make_envelope(0, &self.worker_id, "system-a", "worker.register", reg)?;
         send_envelope(&mut framed, &env).await?;
 
-        let ack_env = recv_envelope(&mut framed)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(crate::l10n::t_(
-                    "System A closed connection before ack."
-                ))
-            })?;
+        let ack_env = recv_envelope(&mut framed).await?.ok_or_else(|| {
+            anyhow::anyhow!(crate::l10n::t_("System A closed connection before ack."))
+        })?;
         let ack = RegisterAck::decode(ack_env.payload.as_slice())?;
         if !ack.accepted {
             anyhow::bail!(crate::l10n::fmt(
@@ -192,7 +261,11 @@ impl WorkerIpc {
         let mut reader = FramedRead::new(reader_half, make_codec());
         let mut writer = FramedWrite::new(writer_half, make_codec());
 
-        let event_publisher = EventPublisher::new(out_tx.clone(), &self.worker_id);
+        let pending_acks: Arc<Mutex<HashMap<u64, oneshot::Sender<UnitStateUpdateAck>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let event_publisher =
+            EventPublisher::new(out_tx.clone(), &self.worker_id, pending_acks.clone());
         let controller = controller_factory(event_publisher.clone());
 
         // Writer task: drain out_rx → write to socket
@@ -208,6 +281,14 @@ impl WorkerIpc {
 
         // Reader task: read envelopes → dispatch
         let reader_task = async {
+            // Publish the initial full snapshot so System A's runtime cache
+            // is populated right after (re)connection.  The ACK is awaited
+            // in the background — the reader loop below resolves it.
+            {
+                let units = controller.sync_state().await;
+                event_publisher.publish_unit_state_update(units, true);
+            }
+
             loop {
                 let bytes = match reader.next().await {
                     None => {
@@ -244,31 +325,25 @@ impl WorkerIpc {
                         );
 
                         let method_result = match call.method.as_str() {
-                            "status" => {
-                                match controller.status(&call.unit_name).await {
-                                    Ok(status) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: true,
-                                        error: String::new(),
-                                        result: status.encode_to_vec(),
-                                    },
-                                    Err(e) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: false,
-                                        error: e.to_string(),
-                                        result: vec![],
-                                    },
-                                }
-                            }
+                            "status" => match controller.status(&call.unit_name).await {
+                                Ok(status) => MethodResult {
+                                    method: call.method.clone(),
+                                    unit_name: call.unit_name.clone(),
+                                    success: true,
+                                    error: String::new(),
+                                    result: status.encode_to_vec(),
+                                },
+                                Err(e) => MethodResult {
+                                    method: call.method.clone(),
+                                    unit_name: call.unit_name.clone(),
+                                    success: false,
+                                    error: e.to_string(),
+                                    result: vec![],
+                                },
+                            },
                             "start" => {
                                 match controller
-                                    .start(
-                                        &call.unit_name,
-                                        &call.args,
-                                        &call.invocation_id,
-                                    )
+                                    .start(&call.unit_name, &call.args, &call.invocation_id)
                                     .await
                                 {
                                     Ok(()) => MethodResult {
@@ -287,31 +362,25 @@ impl WorkerIpc {
                                     },
                                 }
                             }
-                            "stop" => {
-                                match controller.stop(&call.unit_name).await {
-                                    Ok(()) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: true,
-                                        error: String::new(),
-                                        result: vec![],
-                                    },
-                                    Err(e) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: false,
-                                        error: e.to_string(),
-                                        result: vec![],
-                                    },
-                                }
-                            }
+                            "stop" => match controller.stop(&call.unit_name).await {
+                                Ok(()) => MethodResult {
+                                    method: call.method.clone(),
+                                    unit_name: call.unit_name.clone(),
+                                    success: true,
+                                    error: String::new(),
+                                    result: vec![],
+                                },
+                                Err(e) => MethodResult {
+                                    method: call.method.clone(),
+                                    unit_name: call.unit_name.clone(),
+                                    success: false,
+                                    error: e.to_string(),
+                                    result: vec![],
+                                },
+                            },
                             "restart" => {
                                 match controller
-                                    .restart(
-                                        &call.unit_name,
-                                        &call.args,
-                                        &call.invocation_id,
-                                    )
+                                    .restart(&call.unit_name, &call.args, &call.invocation_id)
                                     .await
                                 {
                                     Ok(()) => MethodResult {
@@ -331,10 +400,7 @@ impl WorkerIpc {
                                 }
                             }
                             "reload" => {
-                                match controller
-                                    .reload(&call.unit_name, &call.args)
-                                    .await
-                                {
+                                match controller.reload(&call.unit_name, &call.args).await {
                                     Ok(()) => MethodResult {
                                         method: call.method.clone(),
                                         unit_name: call.unit_name.clone(),
@@ -379,14 +445,37 @@ impl WorkerIpc {
                         }
                     }
 
-                    "state.sync_request" => {
+                    "unit.state_update_ack" => {
+                        if let Some(ack_tx) = pending_acks.lock().unwrap().remove(&env.request_id) {
+                            let ack = UnitStateUpdateAck::decode(env.payload.as_slice())
+                                .unwrap_or_else(|_| UnitStateUpdateAck {
+                                    accepted: false,
+                                    ignored_units: vec![],
+                                    message: "failed to decode ack".to_string(),
+                                });
+                            let _ = ack_tx.send(ack);
+                        } else {
+                            debug!(
+                                "unit.state_update_ack with unknown request_id {} — ignoring",
+                                env.request_id
+                            );
+                        }
+                    }
+
+                    "unit.sync_request" => {
                         let units = controller.sync_state().await;
-                        let report = StateSyncReport { units };
+                        let report = UnitSyncReport {
+                            snapshot: Some(UnitStateUpdate {
+                                units: units.into_iter().map(UnitStatus::into_proto).collect(),
+                                full_snapshot: true,
+                                seq: 0,
+                            }),
+                        };
                         match make_envelope(
                             env.request_id,
                             &self.worker_id,
                             "system-a",
-                            "state.sync_report",
+                            "unit.sync_report",
                             report,
                         )
                         .and_then(encode_envelope)

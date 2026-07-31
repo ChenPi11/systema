@@ -33,7 +33,6 @@ impl ServiceState {
 
 /// Runtime state for a single service instance.
 pub struct ServiceInstance {
-    pub unit_name: String,
     pub state: ServiceState,
     pub main_pid: Option<u32>,
     pub last_exit_code: Option<i32>,
@@ -42,14 +41,19 @@ pub struct ServiceInstance {
 }
 
 impl ServiceInstance {
-    pub fn new(unit_name: String) -> Self {
+    pub fn new() -> Self {
         ServiceInstance {
-            unit_name,
             state: ServiceState::Dead,
             main_pid: None,
             last_exit_code: None,
             timeout_stop_secs: None,
         }
+    }
+}
+
+impl Default for ServiceInstance {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

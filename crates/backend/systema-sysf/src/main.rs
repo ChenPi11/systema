@@ -15,10 +15,19 @@ struct Args {
     #[arg(long, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
 
-    #[arg(long, default_value = "info", help = "Log level (trace, debug, info, warn, error)")]
+    #[arg(
+        long,
+        default_value = "info",
+        help = "Log level (trace, debug, info, warn, error)"
+    )]
     log_level: String,
 
-    #[arg(long, short = 'l', default_value = "", help = "Debug label for the staging area")]
+    #[arg(
+        long,
+        short = 'l',
+        default_value = "",
+        help = "Debug label for the staging area"
+    )]
     label: String,
 
     #[command(subcommand)]
@@ -42,13 +51,24 @@ async fn main() -> Result<()> {
         use clap::{CommandFactory, FromArgMatches};
         let cmd = Args::command()
             .about(sysa::l10n::t_("System F — System Finder Worker"))
-            .mut_arg("debug", |a| a.help(sysa::l10n::t_("Enable debug-level logging.")))
-            .mut_arg("log_level", |a| a.help(sysa::l10n::t_("Log level (trace, debug, info, warn, error).")))
-            .mut_arg("label", |a| a.help(sysa::l10n::t_("Debug label for the staging area.")))
-            .mut_subcommand("commit", |cmd| cmd.about(sysa::l10n::t_("Commit the UID-bound staging area.")))
-            .mut_subcommand("query", |cmd| cmd.about(sysa::l10n::t_("Query the UID-bound staging area.")));
-        Args::from_arg_matches(&cmd.get_matches())
-            .unwrap_or_else(|e| e.exit())
+            .mut_arg("debug", |a| {
+                a.help(sysa::l10n::t_("Enable debug-level logging."))
+            })
+            .mut_arg("log_level", |a| {
+                a.help(sysa::l10n::t_(
+                    "Log level (trace, debug, info, warn, error).",
+                ))
+            })
+            .mut_arg("label", |a| {
+                a.help(sysa::l10n::t_("Debug label for the staging area."))
+            })
+            .mut_subcommand("commit", |cmd| {
+                cmd.about(sysa::l10n::t_("Commit the UID-bound staging area."))
+            })
+            .mut_subcommand("query", |cmd| {
+                cmd.about(sysa::l10n::t_("Query the UID-bound staging area."))
+            });
+        Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
@@ -77,7 +97,10 @@ async fn run_register(label: &str) -> Result<()> {
         info!("Staging successful: {} units registered", ack.unit_count);
     } else {
         error!("Staging failed: {}", ack.message);
-        anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("Staging failed: {message}."), &[("message", &ack.message)]));
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("Staging failed: {message}."),
+            &[("message", &ack.message)]
+        ));
     }
 
     info!("System F register complete");
@@ -93,7 +116,10 @@ async fn run_commit() -> Result<()> {
         info!("Commit successful: {} units committed", ack.unit_count);
     } else {
         error!("Commit failed: {}", ack.message);
-        anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("Commit failed: {message}."), &[("message", &ack.message)]));
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("Commit failed: {message}."),
+            &[("message", &ack.message)]
+        ));
     }
 
     info!("System F commit complete");
@@ -113,7 +139,10 @@ async fn run_query() -> Result<()> {
         }
     } else {
         error!("Query failed: {}", result.message);
-        anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("Query failed: {message}."), &[("message", &result.message)]));
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("Query failed: {message}."),
+            &[("message", &result.message)]
+        ));
     }
 
     Ok(())

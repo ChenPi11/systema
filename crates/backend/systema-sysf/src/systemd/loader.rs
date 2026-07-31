@@ -8,8 +8,16 @@ use super::types::UnitFile;
 pub fn is_known_extension(name: &str) -> bool {
     matches!(
         name.rsplit('.').next().unwrap_or(""),
-        "service" | "target" | "mount" | "timer" | "socket" | "slice" | "scope"
-            | "swap" | "path" | "device"
+        "service"
+            | "target"
+            | "mount"
+            | "timer"
+            | "socket"
+            | "slice"
+            | "scope"
+            | "swap"
+            | "path"
+            | "device"
     )
 }
 
@@ -19,8 +27,12 @@ pub fn discover_all() -> Result<Vec<UnitFile>> {
     for dir in sysa::paths::instance().unit_search_paths.iter() {
         let path = Path::new(dir);
         if path.exists() {
-            load_units_from_dir_recursive(path, &mut units)
-                .with_context(|| sysa::l10n::fmt(sysa::l10n::t_("Scanning {dir} ..."), &[("dir", &dir.to_string())]))?;
+            load_units_from_dir_recursive(path, &mut units).with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Scanning {dir} ..."),
+                    &[("dir", &dir.to_string())],
+                )
+            })?;
         }
     }
     info!("Systemd finder discovered {} unit(s)", units.len());

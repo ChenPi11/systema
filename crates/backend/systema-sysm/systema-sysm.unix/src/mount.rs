@@ -55,10 +55,8 @@ pub async fn do_mount(
         &config.directory_mode
     };
     if !mount_point_path.exists() {
-        fs::create_dir_all(&mount_point)
-            .context("create_dir_all for mount point failed")?;
-        let mode = u32::from_str_radix(dir_mode.trim_start_matches('0'), 8)
-            .unwrap_or(0o755);
+        fs::create_dir_all(&mount_point).context("create_dir_all for mount point failed")?;
+        let mode = u32::from_str_radix(dir_mode.trim_start_matches('0'), 8).unwrap_or(0o755);
         fs::set_permissions(&mount_point, fs::Permissions::from_mode(mode))
             .context("set_permissions for mount point failed")?;
     }
@@ -122,7 +120,7 @@ pub async fn do_mount(
         } else {
             reg.insert(
                 unit_name.to_string(),
-                MountInstance::new(unit_name.to_string(), mount_point.clone()),
+                MountInstance::new(mount_point.clone()),
             );
             if let Some(inst) = reg.get_mut(unit_name) {
                 inst.state = MountState::Mounted;
@@ -144,7 +142,10 @@ pub async fn do_umount(
         reg.get(unit_name)
             .map(|inst| inst.mount_point.clone())
             .unwrap_or_else(|| {
-                warn!("No mount point found for {}; using default cleanup", unit_name);
+                warn!(
+                    "No mount point found for {}; using default cleanup",
+                    unit_name
+                );
                 String::new()
             })
     };
@@ -228,8 +229,7 @@ pub async fn do_remount(
 ) -> Result<()> {
     let mount_point = {
         let reg = registry.lock();
-        reg.get(unit_name)
-            .map(|inst| inst.mount_point.clone())
+        reg.get(unit_name).map(|inst| inst.mount_point.clone())
     };
 
     let mount_point = match mount_point {
@@ -257,13 +257,11 @@ pub async fn do_remount(
 
     info!("Remounting: {:?}", cmd.as_std());
 
-    let timeout = Duration::from_secs(
-        if config.timeout_sec > 0 {
-            config.timeout_sec as u64
-        } else {
-            30
-        },
-    );
+    let timeout = Duration::from_secs(if config.timeout_sec > 0 {
+        config.timeout_sec as u64
+    } else {
+        30
+    });
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await

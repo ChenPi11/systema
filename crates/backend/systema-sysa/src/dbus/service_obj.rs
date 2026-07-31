@@ -7,6 +7,17 @@ use zbus::interface;
 
 use crate::state::AllocatorHandle;
 
+/// Exit status of the main process, reported by the worker via the
+/// unified `unit.state_update` protocol (`last_exit_code` extension).
+fn last_exit_code(allocator: &AllocatorHandle, unit_name: &str) -> Option<i32> {
+    allocator
+        .read()
+        .unit_states
+        .get(unit_name)
+        .and_then(|s| s.extensions.get("last_exit_code"))
+        .and_then(|code| code.parse::<i32>().ok())
+}
+
 /// Service-specific D-Bus object bound to a unit path.
 pub struct ServiceObject {
     pub allocator: AllocatorHandle,
@@ -58,18 +69,16 @@ impl ServiceObject {
     }
 
     #[zbus(property)]
-    fn exec_main_code(&self) -> i32 {
-        0
-    }
-
-    #[zbus(property)]
     fn exec_main_status(&self) -> i32 {
-        0
+        last_exit_code(&self.allocator, &self.unit_name).unwrap_or(0)
     }
 
     #[zbus(property)]
     fn result(&self) -> String {
-        "success".to_string()
+        match last_exit_code(&self.allocator, &self.unit_name) {
+            Some(code) if code != 0 => "exit-code".to_string(),
+            _ => "success".to_string(),
+        }
     }
 
     #[zbus(property)]

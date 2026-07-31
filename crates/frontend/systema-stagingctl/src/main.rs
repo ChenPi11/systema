@@ -3,13 +3,13 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
 use colored::*;
-use tracing_subscriber::EnvFilter;
 use regex::Regex;
 use serde_json::Value;
 use sysa::l10n;
 use sysa::proto::StagingAreaEntry;
 use sysa::staging_admin::StagingAdmin;
 use sysa_pager::{pager_eprintln, pager_print, pager_println, PagerConfig, PagerGuard};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
@@ -23,7 +23,12 @@ struct Args {
     #[arg(long, global = true, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
 
-    #[arg(long, global = true, default_value = "warn", help = "Log level (trace, debug, info, warn, error)")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "warn",
+        help = "Log level (trace, debug, info, warn, error)"
+    )]
     log_level: String,
 
     #[arg(long, global = true, help = "Do not pipe output into a pager")]
@@ -53,15 +58,10 @@ enum ColorChoice {
 enum Commands {
     #[command(about = "List staging areas and their contents")]
     List {
-        #[arg(
-            long,
-            help = "Filter by UID (can be specified multiple times)"
-        )]
+        #[arg(long, help = "Filter by UID (can be specified multiple times)")]
         uid: Vec<u32>,
 
-        #[arg(
-            help = "Regex pattern(s) to match staging area name"
-        )]
+        #[arg(help = "Regex pattern(s) to match staging area name")]
         regex: Vec<String>,
     },
 }
@@ -155,9 +155,7 @@ fn print_value(value: &Value, indent: &str) {
                 pager_println!("{}{}", indent, l10n::t_("(empty)").dimmed());
                 return;
             }
-            if arr.len() <= 3
-                && arr.iter().all(|v| matches!(v, Value::String(_)))
-            {
+            if arr.len() <= 3 && arr.iter().all(|v| matches!(v, Value::String(_))) {
                 let items: Vec<&str> = arr.iter().map(|v| v.as_str().unwrap_or("?")).collect();
                 pager_println!("{}{}", indent, items.join(", "));
                 return;
@@ -200,13 +198,19 @@ async fn run_list(json: bool, uids: Vec<u32>, regex_strs: Vec<String>) -> Result
             } else {
                 pager_eprintln!(
                     "{}",
-                    l10n::fmt(l10n::t_("Warning: UID {uid}: {message}"), &[("uid", &uid.to_string()), ("message", &result.message)])
+                    l10n::fmt(
+                        l10n::t_("Warning: UID {uid}: {message}"),
+                        &[("uid", &uid.to_string()), ("message", &result.message)]
+                    )
                     .yellow()
                 );
             }
         }
         if has_regex_filter {
-            results.into_iter().filter(|e| regexes.iter().any(|r| r.is_match(&e.debug_label))).collect()
+            results
+                .into_iter()
+                .filter(|e| regexes.iter().any(|r| r.is_match(&e.debug_label)))
+                .collect()
         } else {
             results
         }
@@ -248,9 +252,15 @@ fn build_localized_cli() -> clap::Command {
         .about(l10n::t_("System A — Staging Area Controller"))
         .mut_arg("json", |a| a.help(l10n::t_("Output in JSON format.")))
         .mut_arg("debug", |a| a.help(l10n::t_("Enable debug-level logging.")))
-        .mut_arg("log_level", |a| a.help(l10n::t_("Log level (trace, debug, info, warn, error).")))
-        .mut_arg("no_pager", |a| a.help(l10n::t_("Do not pipe output into a pager.")))
-        .mut_arg("color", |a| a.help(l10n::t_("When to use colors (always, auto, never).")))
+        .mut_arg("log_level", |a| {
+            a.help(l10n::t_("Log level (trace, debug, info, warn, error)."))
+        })
+        .mut_arg("no_pager", |a| {
+            a.help(l10n::t_("Do not pipe output into a pager."))
+        })
+        .mut_arg("color", |a| {
+            a.help(l10n::t_("When to use colors (always, auto, never)."))
+        })
         .mut_subcommand("list", |cmd| {
             cmd.about(l10n::t_("List staging areas and their contents."))
                 .mut_arg("uid", |a| {
@@ -271,9 +281,14 @@ async fn main() -> Result<()> {
     let matches = build_localized_cli().get_matches();
     let json = *matches.get_one::<bool>("json").unwrap_or(&false);
     let debug = *matches.get_one::<bool>("debug").unwrap_or(&false);
-    let log_level = matches.get_one::<String>("log_level").map(|s| s.as_str()).unwrap_or("warn");
+    let log_level = matches
+        .get_one::<String>("log_level")
+        .map(|s| s.as_str())
+        .unwrap_or("warn");
     let no_pager = *matches.get_one::<bool>("no_pager").unwrap_or(&false);
-    let color = *matches.get_one::<ColorChoice>("color").unwrap_or(&ColorChoice::Auto);
+    let color = *matches
+        .get_one::<ColorChoice>("color")
+        .unwrap_or(&ColorChoice::Auto);
 
     let level = if debug { "debug" } else { log_level };
     init_tracing(level);
@@ -307,9 +322,7 @@ async fn main() -> Result<()> {
                 .collect();
             run_list(json, uids, regex_strs).await
         }
-        None => {
-            run_list(json, vec![], vec![]).await
-        }
+        None => run_list(json, vec![], vec![]).await,
         _ => {
             let mut cmd = build_localized_cli();
             cmd.print_help()?;

@@ -19,7 +19,8 @@ use crate::state::AllocatorHandle;
 
 /// Load all unit files from the default search paths into the allocator.
 pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {
-    let paths: Vec<PathBuf> = sysa::paths::instance().unit_search_paths
+    let paths: Vec<PathBuf> = sysa::paths::instance()
+        .unit_search_paths
         .iter()
         .map(PathBuf::from)
         .filter(|p| p.exists())
@@ -70,7 +71,8 @@ pub async fn load_units_matching<F>(allocator: AllocatorHandle, predicate: F) ->
 where
     F: Fn(&str) -> bool,
 {
-    let paths: Vec<PathBuf> = sysa::paths::instance().unit_search_paths
+    let paths: Vec<PathBuf> = sysa::paths::instance()
+        .unit_search_paths
         .iter()
         .map(PathBuf::from)
         .filter(|p| p.exists())
@@ -206,8 +208,16 @@ async fn load_units_from_dir(dir: &Path, allocator: AllocatorHandle) -> Result<u
 fn is_known_extension(name: &str) -> bool {
     matches!(
         name.rsplit('.').next().unwrap_or(""),
-        "service" | "target" | "mount" | "timer" | "socket" | "slice" | "scope"
-            | "swap" | "path" | "device"
+        "service"
+            | "target"
+            | "mount"
+            | "timer"
+            | "socket"
+            | "slice"
+            | "scope"
+            | "swap"
+            | "path"
+            | "device"
     )
 }
 
@@ -234,5 +244,4 @@ mod tests {
         assert!(!is_known_extension("unknown.txt"));
         assert!(!is_known_extension("noextension"));
     }
-
 }

@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-use anyhow::{Context, Result};
-use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
-use sysa::proto::SyncUnitState;
-use sysa::worker_ipc::EventPublisher;
 use crate::process::{start_service, stop_service};
 use crate::state::{ServiceRegistry, ServiceState};
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
+use sysa::worker_ipc::EventPublisher;
 
 pub struct ServiceController {
     registry: ServiceRegistry,
@@ -13,70 +12,83 @@ pub struct ServiceController {
 
 impl ServiceController {
     pub fn new(registry: ServiceRegistry, event_pub: EventPublisher) -> Self {
-        ServiceController { registry, event_pub }
+        ServiceController {
+            registry,
+            event_pub,
+        }
     }
-}
 
-#[async_trait::async_trait]
-impl UnitController for ServiceController {
-    async fn status(&self, unit_name: &str) -> Result<UnitStatus> {
+    fn status_of(&self, unit_name: &str) -> UnitStatus {
         let reg = self.registry.lock();
         match reg.get(unit_name) {
-            Some(inst) => Ok(UnitStatus {
-                unit_name: unit_name.to_string(),
-                active_state: match inst.state {
-                    ServiceState::Dead => "inactive",
-                    ServiceState::Failed => "failed",
-                    ServiceState::Running => "active",
-                    ServiceState::Starting => "activating",
-                    ServiceState::Stopping => "deactivating",
-                }.to_string(),
-                sub_state: inst.state.as_str().to_string(),
-                main_pid: inst.main_pid.unwrap_or(0),
-                invocation_id: String::new(),
-                extensions: HashMap::new(),
-            }),
-            None => Ok(UnitStatus {
+            Some(inst) => {
+                let mut extensions = HashMap::new();
+                if let Some(code) = inst.last_exit_code {
+                    extensions.insert("last_exit_code".to_string(), code.to_string());
+                }
+                UnitStatus {
+                    unit_name: unit_name.to_string(),
+                    active_state: match inst.state {
+                        ServiceState::Dead => "inactive",
+                        ServiceState::Failed => "failed",
+                        ServiceState::Running => "active",
+                        ServiceState::Starting => "activating",
+                        ServiceState::Stopping => "deactivating",
+                    }
+                    .to_string(),
+                    sub_state: inst.state.as_str().to_string(),
+                    main_pid: inst.main_pid.unwrap_or(0),
+                    invocation_id: String::new(),
+                    extensions,
+                }
+            }
+            None => UnitStatus {
                 unit_name: unit_name.to_string(),
                 active_state: "inactive".to_string(),
                 sub_state: "dead".to_string(),
                 main_pid: 0,
                 invocation_id: String::new(),
                 extensions: HashMap::new(),
-            }),
+            },
         }
     }
 
-    async fn sync_state(&self) -> Vec<SyncUnitState> {
-        let guard = self.registry.lock();
-        guard
-            .values()
-            .map(|inst| {
-                SyncUnitState {
-                    unit_name: inst.unit_name.clone(),
-                    main_pid: inst.main_pid.unwrap_or(0),
-                    state: inst.state.as_str().to_string(),
-                    last_exit_code: inst.last_exit_code.unwrap_or(0),
-                }
-            })
-            .collect()
+    fn publish_state(&self, unit_name: &str) {
+        let status = self.status_of(unit_name);
+        self.event_pub
+            .publish_unit_state_update(vec![status], false);
+    }
+}
+
+#[async_trait::async_trait]
+impl UnitController for ServiceController {
+    async fn status(&self, unit_name: &str) -> Result<UnitStatus> {
+        Ok(self.status_of(unit_name))
+    }
+
+    async fn sync_state(&self) -> Vec<UnitStatus> {
+        let names: Vec<String> = {
+            let guard = self.registry.lock();
+            guard.keys().cloned().collect()
+        };
+        names.iter().map(|n| self.status_of(n)).collect()
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let inv_id = if invocation_id.is_empty() { None } else { Some(invocation_id.to_string()) };
-        let (pid, child) = start_service(self.registry.clone(), &cfg, inv_id).await?;
+        let inv_id = if invocation_id.is_empty() {
+            None
+        } else {
+            Some(invocation_id.to_string())
+        };
+        let (_pid, child) = start_service(self.registry.clone(), &cfg, inv_id).await?;
         {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
                 inst.timeout_stop_secs = cfg.service.as_ref().map(|s| s.timeout_stop_secs);
             }
         }
-        self.event_pub.publish(
-            "service.started",
-            unit_name,
-            serde_json::json!({ "pid": pid }).to_string().as_bytes(),
-        )?;
+        self.publish_state(unit_name);
         tokio::spawn(crate::ipc::monitor_service(
             self.registry.clone(),
             unit_name.to_string(),
@@ -89,30 +101,36 @@ impl UnitController for ServiceController {
     async fn stop(&self, unit_name: &str) -> Result<()> {
         let timeout = {
             let reg = self.registry.lock();
-            reg.get(unit_name).and_then(|inst| inst.timeout_stop_secs).unwrap_or(30)
+            reg.get(unit_name)
+                .and_then(|inst| inst.timeout_stop_secs)
+                .unwrap_or(30)
         };
         stop_service(self.registry.clone(), unit_name, timeout).await?;
-        self.event_pub.publish("process.exit", unit_name, b"")?;
+        self.publish_state(unit_name);
         Ok(())
     }
 
     async fn restart(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let timeout = cfg.service.as_ref().map(|s| s.timeout_stop_secs).unwrap_or(30);
+        let timeout = cfg
+            .service
+            .as_ref()
+            .map(|s| s.timeout_stop_secs)
+            .unwrap_or(30);
         stop_service(self.registry.clone(), unit_name, timeout).await?;
-        let inv_id = if invocation_id.is_empty() { None } else { Some(invocation_id.to_string()) };
-        let (pid, child) = start_service(self.registry.clone(), &cfg, inv_id).await?;
+        let inv_id = if invocation_id.is_empty() {
+            None
+        } else {
+            Some(invocation_id.to_string())
+        };
+        let (_pid, child) = start_service(self.registry.clone(), &cfg, inv_id).await?;
         {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
                 inst.timeout_stop_secs = cfg.service.as_ref().map(|s| s.timeout_stop_secs);
             }
         }
-        self.event_pub.publish(
-            "service.started",
-            unit_name,
-            serde_json::json!({ "pid": pid }).to_string().as_bytes(),
-        )?;
+        self.publish_state(unit_name);
         tokio::spawn(crate::ipc::monitor_service(
             self.registry.clone(),
             unit_name.to_string(),

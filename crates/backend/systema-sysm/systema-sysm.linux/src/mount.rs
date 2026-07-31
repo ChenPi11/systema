@@ -24,9 +24,17 @@ pub async fn do_mount(
         &config.directory_mode
     };
     if !mount_point_path.exists() {
-        Command::new("mkdir").arg("-p").arg(&mount_point).status().await
+        Command::new("mkdir")
+            .arg("-p")
+            .arg(&mount_point)
+            .status()
+            .await
             .context("mkdir -p for mount point failed")?;
-        Command::new("chmod").arg(dir_mode).arg(&mount_point).status().await
+        Command::new("chmod")
+            .arg(dir_mode)
+            .arg(&mount_point)
+            .status()
+            .await
             .context("chmod for mount point failed")?;
     }
 
@@ -114,7 +122,10 @@ pub async fn do_mount(
     if actually_mounted {
         info!("Mount succeeded: {}", mount_point);
     } else {
-        warn!("Mount command reported success but kernel disagrees: {}", mount_point);
+        warn!(
+            "Mount command reported success but kernel disagrees: {}",
+            mount_point
+        );
     }
 
     Ok(())
@@ -182,6 +193,21 @@ pub async fn do_umount(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         error!("umount {} failed: {}", mount_point, stderr.trim());
+        // Restore the state from the kernel: a failed umount leaves the fs
+        // mounted (or it may have gone away concurrently).  Do not linger in
+        // Unmounting.
+        let still_mounted = mountinfo::mount_point_is_mounted(&mount_point);
+        {
+            let mut reg = registry.lock();
+            if let Some(inst) = reg.get_mut(unit_name) {
+                if still_mounted {
+                    inst.state = MountState::Mounted;
+                } else {
+                    inst.state = MountState::Dead;
+                    inst.from_mountinfo = false;
+                }
+            }
+        }
         let err = anyhow::anyhow!("umount failed: {}", stderr.trim());
         return Err(err);
     }
@@ -229,8 +255,7 @@ pub async fn do_remount(
 ) -> Result<()> {
     let mount_point = {
         let reg = registry.lock();
-        reg.get(unit_name)
-            .map(|inst| inst.mount_point.clone())
+        reg.get(unit_name).map(|inst| inst.mount_point.clone())
     };
 
     let mount_point = match mount_point {

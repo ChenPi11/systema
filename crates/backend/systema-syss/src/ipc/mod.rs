@@ -66,9 +66,7 @@ pub(crate) async fn monitor_service(
                         inst.last_exit_code = status.code();
                     }
                 }
-                if state == ServiceState::Failed {
-                    let _ = event_pub.publish("service.failed", &unit_name, b"");
-                }
+                publish_service_state(&registry, &event_pub, &unit_name);
                 break;
             }
             Ok(None) => {}
@@ -81,9 +79,43 @@ pub(crate) async fn monitor_service(
                         inst.main_pid = None;
                     }
                 }
-                let _ = event_pub.publish("service.failed", &unit_name, b"");
+                publish_service_state(&registry, &event_pub, &unit_name);
                 break;
             }
         }
     }
+}
+
+/// Publish the current runtime state of a service as a unified
+/// `unit.state_update` (with `last_exit_code` in the extensions).
+fn publish_service_state(registry: &ServiceRegistry, event_pub: &EventPublisher, unit_name: &str) {
+    use std::collections::HashMap;
+    use sysa::controller::UnitStatus;
+
+    let mut extensions = HashMap::new();
+    let reg = registry.lock();
+    let inst = match reg.get(unit_name) {
+        Some(inst) => inst,
+        None => return,
+    };
+    if let Some(code) = inst.last_exit_code {
+        extensions.insert("last_exit_code".to_string(), code.to_string());
+    }
+    let status = UnitStatus {
+        unit_name: unit_name.to_string(),
+        active_state: match inst.state {
+            ServiceState::Dead => "inactive",
+            ServiceState::Failed => "failed",
+            ServiceState::Running => "active",
+            ServiceState::Starting => "activating",
+            ServiceState::Stopping => "deactivating",
+        }
+        .to_string(),
+        sub_state: inst.state.as_str().to_string(),
+        main_pid: inst.main_pid.unwrap_or(0),
+        invocation_id: String::new(),
+        extensions,
+    };
+    drop(reg);
+    event_pub.publish_unit_state_update(vec![status], false);
 }

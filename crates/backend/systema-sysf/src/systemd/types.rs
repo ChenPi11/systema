@@ -248,7 +248,6 @@ pub struct UnitSection {
     // ------------------------------------------------------------------
     // Condition checks — parsed; evaluated by the scheduler before start.
     // ------------------------------------------------------------------
-
     /// `ConditionPathExists=` — skip start if path does not exist.
     /// A `!`-prefixed value negates the check.
     pub condition_path_exists: Vec<String>,
@@ -282,7 +281,6 @@ pub struct UnitSection {
     // ------------------------------------------------------------------
     // Assert checks — like Condition but cause a hard failure if not met.
     // ------------------------------------------------------------------
-
     /// `AssertPathExists=`
     pub assert_path_exists: Vec<String>,
     /// `AssertPathExistsGlob=`
@@ -922,7 +920,10 @@ mod tests {
     #[test]
     fn exec_command_line_with_args() {
         let cmd = ExecCommand::parse("-/usr/sbin/sshd -D -f /etc/ssh/sshd_config");
-        assert_eq!(cmd.command_line(), "/usr/sbin/sshd -D -f /etc/ssh/sshd_config");
+        assert_eq!(
+            cmd.command_line(),
+            "/usr/sbin/sshd -D -f /etc/ssh/sshd_config"
+        );
     }
 
     #[test]

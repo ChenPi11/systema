@@ -5,6 +5,6 @@
 //! continues to work unchanged. The loader submodule remains here because
 //! it couples to `AllocatorState`.
 
-pub use systema_sysf::systemd::types;
 pub use systema_sysf::systemd::parser;
+pub use systema_sysf::systemd::types;
 pub mod loader;

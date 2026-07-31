@@ -3,13 +3,11 @@ use std::os::unix::io::RawFd;
 use std::time::Duration;
 
 use anyhow::Result;
-use sysa::proto::AutomountConfig;
+use sysa::proto::{AutomountConfig, MountConfig};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
-use crate::state::{
-    AutomountInstance, AutomountRegistry, AutomountState,
-};
+use crate::state::{AutomountInstance, AutomountRegistry, AutomountState};
 
 // ---------------------------------------------------------------------------
 // Linux ioctl / autofs constants
@@ -50,12 +48,14 @@ const AUTOFS_DEV_IOCTL_SIZEOF: usize = std::mem::size_of::<AutofsDevIoctl>();
 const AUTOFS_DEV_IOCTL_VERSION: libc::c_ulong = iowr(AUTOFS_TYPE, 0x00, AUTOFS_DEV_IOCTL_SIZEOF);
 const AUTOFS_DEV_IOCTL_OPENMOUNT: libc::c_ulong = iowr(AUTOFS_TYPE, 0x04, AUTOFS_DEV_IOCTL_SIZEOF);
 const AUTOFS_DEV_IOCTL_PROTOVER: libc::c_ulong = iowr(AUTOFS_TYPE, 0x01, AUTOFS_DEV_IOCTL_SIZEOF);
-const AUTOFS_DEV_IOCTL_PROTOSUBVER: libc::c_ulong = iowr(AUTOFS_TYPE, 0x02, AUTOFS_DEV_IOCTL_SIZEOF);
+const AUTOFS_DEV_IOCTL_PROTOSUBVER: libc::c_ulong =
+    iowr(AUTOFS_TYPE, 0x02, AUTOFS_DEV_IOCTL_SIZEOF);
 const AUTOFS_DEV_IOCTL_TIMEOUT: libc::c_ulong = iowr(AUTOFS_TYPE, 0x0b, AUTOFS_DEV_IOCTL_SIZEOF);
 const AUTOFS_DEV_IOCTL_EXPIRE: libc::c_ulong = iowr(AUTOFS_TYPE, 0x0c, AUTOFS_DEV_IOCTL_SIZEOF);
+const AUTOFS_DEV_IOCTL_ACK: libc::c_ulong = iowr(AUTOFS_TYPE, 0x09, AUTOFS_DEV_IOCTL_SIZEOF);
+const AUTOFS_DEV_IOCTL_FAIL: libc::c_ulong = iowr(AUTOFS_TYPE, 0x0d, AUTOFS_DEV_IOCTL_SIZEOF);
 
-const AUTOFS_DEV_IOCTL_OPENMOUNT_SIZEOF: usize =
-    AUTOFS_DEV_IOCTL_SIZEOF + 256; // room for path
+const AUTOFS_DEV_IOCTL_OPENMOUNT_SIZEOF: usize = AUTOFS_DEV_IOCTL_SIZEOF + 256; // room for path
 
 // ---------------------------------------------------------------------------
 // Autofs v5 packet
@@ -195,11 +195,7 @@ fn check_autofs_protocol(dev_autofs_fd: i32, ioctl_fd: i32) -> Result<()> {
     Ok(())
 }
 
-fn set_autofs_timeout(
-    dev_autofs_fd: i32,
-    ioctl_fd: i32,
-    timeout_sec: u32,
-) -> Result<()> {
+fn set_autofs_timeout(dev_autofs_fd: i32, ioctl_fd: i32, timeout_sec: u32) -> Result<()> {
     unsafe {
         let mut params: AutofsDevIoctl = Default::default();
         params.ioctlfd = ioctl_fd;
@@ -217,25 +213,63 @@ fn set_autofs_timeout(
     Ok(())
 }
 
+fn send_ack_or_fail(ioctl_fd: i32, token: u32, success: bool) -> Result<()> {
+    let dev_autofs_fd = ensure_dev_autofs()?;
+    unsafe {
+        let mut params: AutofsDevIoctl = Default::default();
+        params.ioctlfd = ioctl_fd;
+        params.arg1 = token as u64;
+        let cmd = if success {
+            AUTOFS_DEV_IOCTL_ACK
+        } else {
+            AUTOFS_DEV_IOCTL_FAIL
+        };
+        let rc = libc::ioctl(
+            dev_autofs_fd,
+            cmd,
+            &mut params as *mut _ as *mut libc::c_void,
+        );
+        if rc < 0 {
+            anyhow::bail!(
+                "autofs reply (token={}) failed: {}",
+                token,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Acknowledge a kernel autofs request (mount or expire) as handled.
+pub fn autofs_send_ready(ioctl_fd: i32, token: u32) -> Result<()> {
+    send_ack_or_fail(ioctl_fd, token, true)
+}
+
+/// Tell the kernel the autofs request failed (mount not performed).
+/// The blocked accessor gets ENOENT; the trap stays armed for the next access.
+pub fn autofs_send_fail(ioctl_fd: i32, token: u32) -> Result<()> {
+    send_ack_or_fail(ioctl_fd, token, false)
+}
+
 // ---------------------------------------------------------------------------
 // Mount(2) helper for autofs
 // ---------------------------------------------------------------------------
 
-fn mount_autofs(
-    pipe_write_fd: RawFd,
-    where_: &str,
-    extra_options: &str,
-    pgrp: i32,
-) -> Result<()> {
+fn mount_autofs(pipe_write_fd: RawFd, where_: &str, extra_options: &str) -> Result<()> {
     let source = format!("systemd-{}", unsafe { libc::getpid() });
     let fstype = CString::new("autofs").unwrap();
     let target = CString::new(where_).unwrap();
+    // NOTE: no explicit pgrp= option.  The kernel records the process group
+    // of the mounting process and treats every request from that group as
+    // coming from the automount daemon (see Documentation/filesystems/
+    // autofs.rst, "detecting the daemon").  Passing an explicit pgrp= would
+    // only be correct if this process were a process-group leader.
     let options = if extra_options.is_empty() {
-        format!("fd={},pgrp={},minproto=5,maxproto=5,direct", pipe_write_fd, pgrp)
+        format!("fd={},minproto=5,maxproto=5,direct", pipe_write_fd)
     } else {
         format!(
-            "fd={},pgrp={},minproto=5,maxproto=5,direct,{}",
-            pipe_write_fd, pgrp, extra_options
+            "fd={},minproto=5,maxproto=5,direct,{}",
+            pipe_write_fd, extra_options
         )
     };
     let options_c = CString::new(options).unwrap();
@@ -280,6 +314,7 @@ pub async fn automount_enter_waiting(
     registry: AutomountRegistry,
     unit_name: &str,
     config: &AutomountConfig,
+    mount_config: Option<&MountConfig>,
     mount_event_tx: tokio::sync::mpsc::UnboundedSender<AutomountTrigger>,
 ) -> Result<()> {
     let where_ = config.r#where.clone();
@@ -314,7 +349,7 @@ pub async fn automount_enter_waiting(
         .status();
 
     // Mount autofs.
-    mount_autofs(pipe_fds[1], &where_, &config.extra_options, std::process::id() as i32)?;
+    mount_autofs(pipe_fds[1], &where_, &config.extra_options)?;
 
     // Close write end in parent.
     unsafe {
@@ -347,13 +382,40 @@ pub async fn automount_enter_waiting(
         set_autofs_timeout(dev_autofs_fd, ioctl_fd, timeout_idle_sec)?;
     }
 
+    // Spawn expire timer if timeout_idle is set.  The task is started before
+    // the instance is registered and its handle is stored atomically with
+    // the insert below, so teardown can always find and abort it (no leaked
+    // timers across restart/stop).
+    let expire_handle = if timeout_idle_sec > 0 {
+        let reg_clone = registry.clone();
+        let unit_name_clone = unit_name.to_string();
+        let expire_interval = std::cmp::max(timeout_idle_sec / 3, 1);
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(expire_interval as u64)).await;
+                let should_expire = {
+                    let reg = reg_clone.lock();
+                    match reg.get(&unit_name_clone) {
+                        // Instance gone (torn down): stop the timer.
+                        None => break,
+                        Some(inst) => inst.state == AutomountState::Running,
+                    }
+                };
+                if should_expire {
+                    if let Err(e) = do_expire(reg_clone.clone(), &unit_name_clone) {
+                        warn!("Automount expire failed for {}: {}", unit_name_clone, e);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Register the instance.
     {
         let mut reg = registry.lock();
-        let mut inst = AutomountInstance::new(
-            unit_name.to_string(),
-            where_.clone(),
-        );
+        let mut inst = AutomountInstance::new(unit_name.to_string(), where_.clone());
         inst.state = AutomountState::Waiting;
         inst.timeout_idle_usec = (timeout_idle_sec as u64) * 1_000_000;
         inst.directory_mode = config.directory_mode.clone();
@@ -361,6 +423,8 @@ pub async fn automount_enter_waiting(
         inst.pipe_fd = Some(pipe_fds[0]);
         inst.dev_id = dev_id;
         inst.ioctl_fd = Some(ioctl_fd);
+        inst.mount_config = mount_config.cloned();
+        inst.expire_handle = expire_handle;
         reg.insert(unit_name.to_string(), inst);
     }
 
@@ -373,38 +437,12 @@ pub async fn automount_enter_waiting(
         automount_pipe_reader(read_fd, reg_clone, unit_name_clone, trigger_tx).await;
     });
 
-    // Spawn expire timer if timeout_idle is set.
-    if timeout_idle_sec > 0 {
-        let reg_clone = registry.clone();
-        let unit_name_clone = unit_name.to_string();
-        let expire_interval = std::cmp::max(timeout_idle_sec / 3, 1);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(expire_interval as u64)).await;
-                let should_expire = {
-                    let reg = reg_clone.lock();
-                    reg.get(&unit_name_clone)
-                        .map(|inst| inst.state == AutomountState::Running)
-                        .unwrap_or(false)
-                };
-                if should_expire {
-                    if let Err(e) = do_expire(reg_clone.clone(), &unit_name_clone) {
-                        warn!("Automount expire failed for {}: {}", unit_name_clone, e);
-                    }
-                }
-            }
-        });
-    }
-
     info!("Automount waiting for {} on {}", unit_name, where_);
     Ok(())
 }
 
-pub async fn automount_enter_dead(
-    registry: AutomountRegistry,
-    unit_name: &str,
-) -> Result<()> {
-    let (where_, pipe_fd, ioctl_fd) = {
+pub async fn automount_enter_dead(registry: AutomountRegistry, unit_name: &str) -> Result<()> {
+    let (where_, pipe_fd, ioctl_fd, expire_handle) = {
         let mut reg = registry.lock();
         let inst = match reg.get_mut(unit_name) {
             Some(i) => i,
@@ -413,19 +451,29 @@ pub async fn automount_enter_dead(
         let w = inst.where_.clone();
         let pfd = inst.pipe_fd.take();
         let ifd = inst.ioctl_fd.take();
+        let eh = inst.expire_handle.take();
         inst.state = AutomountState::Dead;
-        (w, pfd, ifd)
+        (w, pfd, ifd, eh)
     };
+
+    // Stop the idle-expire timer before tearing down the fds.
+    if let Some(handle) = expire_handle {
+        handle.abort();
+    }
 
     // Unmount autofs.
     let _ = unmount_autofs(&where_);
 
     // Close fds.
     if let Some(fd) = pipe_fd {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
     if let Some(fd) = ioctl_fd {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     info!("Automount dead for {}", unit_name);
@@ -439,6 +487,14 @@ pub async fn automount_enter_dead(
 #[derive(Debug, Clone)]
 pub struct AutomountTrigger {
     pub unit_name: String,
+    /// Companion `.mount` unit name (the real filesystem to mount/umount).
+    pub mount_unit: String,
+    /// Mount point path (identical for the automount and its companion).
+    pub where_: String,
+    /// Preloaded config for the companion mount, snapshotted at packet time.
+    pub mount_config: Option<MountConfig>,
+    /// Ioctl fd of the autofs instance, snapshotted at packet time.
+    pub ioctl_fd: i32,
     pub event: TriggerEvent,
 }
 
@@ -446,6 +502,14 @@ pub struct AutomountTrigger {
 pub enum TriggerEvent {
     MountRequest { token: u32 },
     ExpireRequest { token: u32 },
+}
+
+/// Derive the companion mount unit name from an automount unit name.
+pub fn companion_mount_unit(unit_name: &str) -> String {
+    match unit_name.strip_suffix(".automount") {
+        Some(base) => format!("{}.mount", base),
+        None => format!("{}.mount", unit_name),
+    }
 }
 
 async fn automount_pipe_reader(
@@ -499,11 +563,9 @@ async fn automount_pipe_reader(
                     "Automount mount request for {} (token={})",
                     unit_name, packet.wait_queue_token
                 );
-                // Record token.
                 {
                     let mut reg = registry.lock();
                     if let Some(inst) = reg.get_mut(&unit_name) {
-                        inst.tokens.push(packet.wait_queue_token);
                         inst.state = AutomountState::Running;
                     }
                 }
@@ -516,12 +578,6 @@ async fn automount_pipe_reader(
                     "Automount expire request for {} (token={})",
                     unit_name, packet.wait_queue_token
                 );
-                {
-                    let mut reg = registry.lock();
-                    if let Some(inst) = reg.get_mut(&unit_name) {
-                        inst.expire_tokens.push(packet.wait_queue_token);
-                    }
-                }
                 TriggerEvent::ExpireRequest {
                     token: packet.wait_queue_token,
                 }
@@ -532,19 +588,49 @@ async fn automount_pipe_reader(
             }
         };
 
+        // Snapshot the data the trigger handler needs.  The ioctl fd is
+        // taken under the lock and may be gone if the instance is being
+        // torn down concurrently — in that case drop the trigger entirely.
+        let (mount_config, ioctl_fd, where_) = {
+            let reg = registry.lock();
+            match reg.get(&unit_name) {
+                Some(inst) => {
+                    let fd = match inst.ioctl_fd {
+                        Some(fd) => fd,
+                        None => {
+                            warn!(
+                                "Dropping {} trigger: no ioctl fd (teardown in progress?)",
+                                unit_name
+                            );
+                            continue;
+                        }
+                    };
+                    (inst.mount_config.clone(), fd, inst.where_.clone())
+                }
+                None => continue,
+            }
+        };
+
         let _ = trigger_tx.send(AutomountTrigger {
             unit_name: unit_name.clone(),
+            mount_unit: companion_mount_unit(&unit_name),
+            where_,
+            mount_config,
+            ioctl_fd,
             event,
         });
     }
 
-    // Pipe closed — mark as dead.
+    // Pipe closed — mark as dead, but only if this reader's fd is still the
+    // instance's current pipe (a restart may have replaced it already).
     let mut reg = registry.lock();
     if let Some(inst) = reg.get_mut(&unit_name) {
-        inst.state = AutomountState::Dead;
-        inst.pipe_fd = None;
+        if inst.pipe_fd == Some(read_fd) {
+            inst.state = AutomountState::Dead;
+            inst.pipe_fd = None;
+            info!("Automount pipe closed for {}", unit_name);
+        }
     }
-    info!("Automount pipe closed for {}", unit_name);
 }
 
 // ---------------------------------------------------------------------------
@@ -552,23 +638,26 @@ async fn automount_pipe_reader(
 // ---------------------------------------------------------------------------
 
 fn do_expire(registry: AutomountRegistry, unit_name: &str) -> Result<()> {
-    let (where_, dev_id) = {
+    let ioctl_fd = {
         let reg = registry.lock();
-        let inst = match reg.get(unit_name) {
-            Some(i) => i,
-            None => return Ok(()),
-        };
-        (inst.where_.clone(), inst.dev_id)
+        match reg.get(unit_name).and_then(|inst| inst.ioctl_fd) {
+            Some(fd) => fd,
+            None => {
+                warn!("Cannot expire {}: ioctl fd gone", unit_name);
+                return Ok(());
+            }
+        }
     };
 
     let dev_autofs_fd = ensure_dev_autofs()?;
-    let ioctl_fd = open_ioctl_fd(dev_autofs_fd, &where_, dev_id)?;
 
     unsafe {
         let mut params: AutofsDevIoctl = Default::default();
         params.ioctlfd = ioctl_fd;
 
-        // Try expire in a loop until EAGAIN.
+        // Try expire in a loop until EAGAIN.  When the kernel selects an
+        // object to expire it sends an expire_direct packet on the pipe and
+        // BLOCKS here until the trigger handler acknowledges it.
         loop {
             let rc = libc::ioctl(
                 dev_autofs_fd,
@@ -583,11 +672,7 @@ fn do_expire(registry: AutomountRegistry, unit_name: &str) -> Result<()> {
                 warn!("AUTOFS_DEV_IOCTL_EXPIRE failed for {}: {}", unit_name, err);
                 break;
             }
-            // If expire returned a non-zero token, the kernel will send
-            // an expire_direct packet on the pipe, which we handle above.
         }
-
-        libc::close(ioctl_fd);
     }
 
     Ok(())

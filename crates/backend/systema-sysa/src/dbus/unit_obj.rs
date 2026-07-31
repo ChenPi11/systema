@@ -136,10 +136,10 @@ impl UnitObject {
     #[zbus(property)]
     fn job(&self) -> (u32, OwnedObjectPath) {
         let state = self.allocator.read();
-        let job = state.jobs.values().find(|j| {
-            j.unit_name == self.unit_name
-                && matches!(j.status, JobStatus::Running)
-        });
+        let job = state
+            .jobs
+            .values()
+            .find(|j| j.unit_name == self.unit_name && matches!(j.status, JobStatus::Running));
         match job {
             Some(j) => (j.id as u32, job_object_path(j.id)),
             None => (0, OwnedObjectPath::try_from("/").unwrap()),

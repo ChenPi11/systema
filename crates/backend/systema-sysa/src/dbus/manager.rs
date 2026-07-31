@@ -4,9 +4,9 @@
 //! `systemd` so that tools like `systemctl` can talk to us.
 
 use anyhow::Result;
-use sysa::l10n;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
+use sysa::l10n;
 use tracing::{debug, info, warn};
 use zbus::interface;
 use zvariant::OwnedObjectPath;
@@ -257,9 +257,10 @@ impl ManagerInterface {
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
-        let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload, JobMode::Replace)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let job_id =
+            scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload, JobMode::Replace)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         Ok(job_object_path(job_id))
     }
@@ -380,7 +381,10 @@ impl ManagerInterface {
                     warn!("Failed to load unit '{}' in ListUnitsByNames: {}", name, e);
                 }
                 Err(e) => {
-                    warn!("Task panicked loading unit '{}' in ListUnitsByNames: {}", name, e);
+                    warn!(
+                        "Task panicked loading unit '{}' in ListUnitsByNames: {}",
+                        name, e
+                    );
                 }
             }
         }
@@ -524,9 +528,12 @@ impl ManagerInterface {
         debug!("D-Bus Reload: triggering full unit file rescan");
         let alloc = self.allocator.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::unit::loader::load_default_units(alloc).await {
+            if let Err(e) = crate::unit::loader::load_default_units(alloc.clone()).await {
                 tracing::error!("Reload failed: {}", e);
             }
+            // Ask every worker for a fresh full snapshot so the runtime
+            // state cache reflects the reloaded unit set.
+            crate::scheduler::request_all_worker_syncs(alloc).await;
         });
         Ok(())
     }
@@ -583,7 +590,10 @@ impl ManagerInterface {
 
     /// Look up a unit by its invocation ID (UUID string).
     /// Returns the unit's D-Bus object path.
-    async fn get_unit_by_invocation_id(&self, invocation_id: &str) -> zbus::fdo::Result<OwnedObjectPath> {
+    async fn get_unit_by_invocation_id(
+        &self,
+        invocation_id: &str,
+    ) -> zbus::fdo::Result<OwnedObjectPath> {
         debug!("D-Bus GetUnitByInvocationID: id={}", invocation_id);
         let state = self.allocator.read();
         for (name, stored_id) in &state.invocation_ids {
@@ -752,7 +762,8 @@ impl ManagerInterface {
 
     #[zbus(property)]
     fn unit_path(&self) -> Vec<String> {
-        sysa::paths::instance().unit_search_paths
+        sysa::paths::instance()
+            .unit_search_paths
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -916,9 +927,7 @@ fn unit_info_entry(
     let (job_id, job_type) = state
         .jobs
         .values()
-        .find(|j| {
-            j.unit_name == name && matches!(j.status, JobStatus::Running)
-        })
+        .find(|j| j.unit_name == name && matches!(j.status, JobStatus::Running))
         .map(|j| (j.id as u32, j.kind.as_str().to_string()))
         .unwrap_or((0, String::new()));
 
@@ -933,8 +942,14 @@ fn unit_info_entry(
         name.to_string(),
         unit.unit.description.clone(),
         "loaded".to_string(),
-        cached.map(|s| s.active_state.as_str()).unwrap_or("inactive").to_string(),
-        cached.map(|s| s.sub_state.as_str()).unwrap_or("dead").to_string(),
+        cached
+            .map(|s| s.active_state.as_str())
+            .unwrap_or("inactive")
+            .to_string(),
+        cached
+            .map(|s| s.sub_state.as_str())
+            .unwrap_or("dead")
+            .to_string(),
         String::new(), // following
         unit_object_path(name),
         job_id,
@@ -1029,4 +1044,3 @@ fn glob_match(pattern: &[char], name: &[char]) -> bool {
         _ => false,
     }
 }
-

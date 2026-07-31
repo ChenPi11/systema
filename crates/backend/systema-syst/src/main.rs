@@ -21,7 +21,11 @@ struct Args {
     #[arg(long, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
 
-    #[arg(long, default_value = "info", help = "Log level (trace, debug, info, warn, error)")]
+    #[arg(
+        long,
+        default_value = "info",
+        help = "Log level (trace, debug, info, warn, error)"
+    )]
     log_level: String,
 }
 
@@ -34,10 +38,15 @@ async fn main() -> Result<()> {
         use clap::{CommandFactory, FromArgMatches};
         let cmd = Args::command()
             .about(sysa::l10n::t_("System T — System Target Worker"))
-            .mut_arg("debug", |a| a.help(sysa::l10n::t_("Enable debug-level logging.")))
-            .mut_arg("log_level", |a| a.help(sysa::l10n::t_("Log level (trace, debug, info, warn, error).")));
-        Args::from_arg_matches(&cmd.get_matches())
-            .unwrap_or_else(|e| e.exit())
+            .mut_arg("debug", |a| {
+                a.help(sysa::l10n::t_("Enable debug-level logging."))
+            })
+            .mut_arg("log_level", |a| {
+                a.help(sysa::l10n::t_(
+                    "Log level (trace, debug, info, warn, error).",
+                ))
+            });
+        Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()

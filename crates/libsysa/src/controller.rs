@@ -102,7 +102,7 @@ pub trait UnitController: Send + Sync {
     /// Return the runtime state of all managed units for state synchronization.
     ///
     /// The default implementation returns an empty list.
-    async fn sync_state(&self) -> Vec<crate::proto::SyncUnitState> {
+    async fn sync_state(&self) -> Vec<UnitStatus> {
         Vec::new()
     }
 }

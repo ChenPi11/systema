@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use sysa::controller::UnitStatus;
 use sysa::worker_ipc::EventPublisher;
 
-use crate::state::{MountRegistry, MountState};
+use crate::state::{MountInstance, MountRegistry, MountState};
 
 /// A parsed entry from `/proc/self/mountinfo`.
 #[derive(Debug, Clone)]
@@ -56,7 +56,18 @@ impl MountInfoSnapshot {
     }
 
     pub fn is_mounted(&self, mount_point: &str) -> bool {
-        self.by_mount_point.contains_key(mount_point)
+        match self.by_mount_point.get(mount_point) {
+            Some(&idx) => {
+                // The last entry for a path is the topmost mount.  An autofs
+                // sentinel occupying the path does not count as "mounted":
+                // the mount registry tracks the real filesystem on top of it.
+                self.entries
+                    .get(idx)
+                    .map(|e| e.filesystem_type != "autofs")
+                    .unwrap_or(false)
+            }
+            None => false,
+        }
     }
 }
 
@@ -66,6 +77,80 @@ pub fn mount_point_is_mounted(mount_point: &str) -> bool {
         .ok()
         .map(|s| s.is_mounted(mount_point))
         .unwrap_or(false)
+}
+
+/// Derive the mount unit name for a mount point, following systemd's
+/// path escaping: the leading `/` is dropped, `/` separators become `-`,
+/// printable ASCII passes through, and a literal `-` right after a `/` is
+/// escaped (`/mnt/-x` → `mnt-\x2dx.mount`).  The root path `/` → `-.mount`.
+pub fn mount_unit_name_from_path(path: &str) -> String {
+    let mut name = String::new();
+    // After a '/', a literal '-' must be escaped (systemd rule).
+    let mut dash_needs_escape = true;
+    for (i, &b) in path.as_bytes().iter().enumerate() {
+        if b == b'/' {
+            if i == 0 {
+                continue;
+            }
+            name.push('-');
+            dash_needs_escape = true;
+        } else if b == b'-' {
+            if dash_needs_escape {
+                name.push_str("\\x2d");
+            } else {
+                name.push('-');
+            }
+            dash_needs_escape = false;
+        } else if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
+            name.push(b as char);
+            dash_needs_escape = false;
+        } else {
+            name.push_str(&format!("\\x{:02x}", b));
+            dash_needs_escape = false;
+        }
+    }
+    if name.is_empty() {
+        name.push('-');
+    }
+    name.push_str(".mount");
+    name
+}
+
+/// Create registry entries for every real (non-autofs) filesystem currently
+/// in the kernel's mount table that has no registry entry yet.  This is how
+/// already-mounted units (e.g. `tmp.mount` at boot) are discovered without
+/// needing a start job from SysA.  Returns the names of the created units.
+pub fn reconcile_mount_registry(
+    registry: &MountRegistry,
+    snapshot: &MountInfoSnapshot,
+) -> Vec<String> {
+    let mut created = Vec::new();
+    for entry in &snapshot.entries {
+        // autofs entries are automount sentinels, not real filesystems; the
+        // real fs on top is a separate entry.
+        if entry.filesystem_type == "autofs" {
+            continue;
+        }
+        // Mounts marked "ignore" in mountinfo are managed elsewhere.
+        if entry.optional_fields.iter().any(|f| f == "ignore") {
+            continue;
+        }
+        let unit_name = mount_unit_name_from_path(&entry.mount_point);
+        if registry.lock().contains_key(&unit_name) {
+            continue;
+        }
+        let mut inst = MountInstance::new(
+            unit_name.clone(),
+            entry.mount_point.clone(),
+            entry.mount_source.clone(),
+        );
+        inst.state = MountState::Mounted;
+        inst.from_mountinfo = true;
+        inst.fstype = entry.filesystem_type.clone();
+        registry.lock().insert(unit_name.clone(), inst);
+        created.push(unit_name);
+    }
+    created
 }
 
 fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry> {
@@ -112,26 +197,6 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry> {
     })
 }
 
-/// Build a JSON string containing the full current mount table.
-/// Each entry contains mount_point, what, fstype, and options.
-fn mount_table_to_json() -> String {
-    let snapshot = match MountInfoSnapshot::refresh() {
-        Ok(s) => s,
-        Err(_) => return "[]".to_string(),
-    };
-    let mut mounts = Vec::new();
-    for entry in &snapshot.entries {
-        let map = serde_json::json!({
-            "mount_point": entry.mount_point,
-            "what": entry.mount_source,
-            "fstype": entry.filesystem_type,
-            "options": entry.mount_options,
-        });
-        mounts.push(map);
-    }
-    serde_json::json!({"mounts": mounts}).to_string()
-}
-
 /// MountInfo monitor: watches /proc/self/mountinfo via inotify and triggers
 /// state transitions when the mount table changes.
 pub struct MountInfoMonitor {
@@ -150,8 +215,9 @@ impl MountInfoMonitor {
     }
 
     pub async fn run(&mut self) {
-        // Initial poll: full reconciliation on startup.
-        self.poll().await;
+        // Initial reconcile: capture the current mount table on startup
+        // (inotify only reports changes, not the present state).
+        self.reconcile().await;
 
         let mut inotify = match Inotify::init() {
             Ok(inot) => inot,
@@ -184,30 +250,23 @@ impl MountInfoMonitor {
 
         loop {
             notify.notified().await;
-            self.poll().await;
+            self.reconcile().await;
         }
     }
 
+    /// Publish the current runtime state of a mount unit as a unified
+    /// `unit.state_update` (single event per state change).
     fn publish_state_change(&self, unit_name: &str) {
         let entry = {
             let reg = self.registry.lock();
-            reg.get(unit_name).map(|inst| {
-                (inst.state, inst.mount_point.clone())
-            })
+            reg.get(unit_name)
+                .map(|inst| (inst.state, inst.mount_point.clone()))
         };
         let (state, _mount_point) = match entry {
             Some(pair) => pair,
             None => return,
         };
 
-        // 1. Legacy mount.state_change event (backward compatible).
-        let _ = self.event_pub.publish(
-            "mount.state_change",
-            unit_name,
-            serde_json::json!({"state": state.as_str()}).to_string().as_bytes(),
-        );
-
-        // 2. Push the new UnitStatus proactively (so sysa doesn't need to query back).
         let (active_state, sub_state) = match state {
             MountState::Dead => ("inactive", "dead"),
             MountState::Mounted => ("active", "mounted"),
@@ -221,26 +280,13 @@ impl MountInfoMonitor {
             invocation_id: String::new(),
             extensions: HashMap::new(),
         };
-        let encoded = status.encode_to_vec();
-        if encoded.is_empty() {
-            return;
-        }
-        let _ = self.event_pub.publish(
-            "mount.status_update",
-            unit_name,
-            &encoded,
-        );
-
-        // 3. Push the full mount table snapshot.
-        let table_json = mount_table_to_json();
-        let _ = self.event_pub.publish(
-            "mount.table_update",
-            unit_name,
-            table_json.as_bytes(),
-        );
+        self.event_pub
+            .publish_unit_state_update(vec![status], false);
     }
 
-    async fn poll(&mut self) {
+    /// Reconcile the registry against the current mount table.  Runs on
+    /// startup and on every inotify change to /proc/self/mountinfo.
+    async fn reconcile(&mut self) {
         let snapshot = match MountInfoSnapshot::refresh() {
             Ok(s) => s,
             Err(e) => {
@@ -252,25 +298,40 @@ impl MountInfoMonitor {
         let prev = match &self.last_snapshot {
             Some(p) => p,
             None => {
-                // First poll: initial reconciliation.
-                // Log the current mount table.
+                // First reconcile: initial reconciliation.
                 info!("Mount table ({} entries):", snapshot.entries.len());
                 for entry in &snapshot.entries {
                     info!(
                         "  {} → {} type={} opts={}",
-                        entry.mount_source, entry.mount_point,
-                        entry.filesystem_type, entry.mount_options,
+                        entry.mount_source,
+                        entry.mount_point,
+                        entry.filesystem_type,
+                        entry.mount_options,
                     );
                 }
 
-                // Always send the full mount table to sysa on startup,
-                // so it can correlate mount points with loaded unit files.
-                let table_json = mount_table_to_json();
-                let _ = self.event_pub.publish(
-                    "mount.table_update",
-                    "",
-                    table_json.as_bytes(),
-                );
+                // Discover already-mounted filesystems (e.g. tmp.mount for
+                // the kernel-mounted tmpfs on /tmp) and report them.
+                let created = reconcile_mount_registry(&self.registry, &snapshot);
+                if !created.is_empty() {
+                    info!(
+                        "Initial reconciliation: discovered {} already-mounted unit(s): {:?}",
+                        created.len(),
+                        created
+                    );
+                    let statuses: Vec<UnitStatus> = created
+                        .iter()
+                        .map(|name| UnitStatus {
+                            unit_name: name.clone(),
+                            active_state: "active".to_string(),
+                            sub_state: "mounted".to_string(),
+                            main_pid: 0,
+                            invocation_id: String::new(),
+                            extensions: HashMap::new(),
+                        })
+                        .collect();
+                    self.event_pub.publish_unit_state_update(statuses, false);
+                }
 
                 // Check every registry entry against the snapshot.
                 // Any Dead entry whose mount point already exists → set Mounted.
@@ -287,10 +348,7 @@ impl MountInfoMonitor {
                         let mut reg = self.registry.lock();
                         if let Some(inst) = reg.get_mut(unit_name) {
                             if inst.state == MountState::Dead {
-                                info!(
-                                    "Initial reconciliation: {} ({}) → Mounted",
-                                    unit_name, mp,
-                                );
+                                info!("Initial reconciliation: {} ({}) → Mounted", unit_name, mp,);
                                 inst.from_mountinfo = true;
                                 inst.state = MountState::Mounted;
                             }
@@ -309,13 +367,7 @@ impl MountInfoMonitor {
         let mount_points: Vec<(String, String, String)> = {
             let reg = self.registry.lock();
             reg.iter()
-                .map(|(name, inst)| {
-                    (
-                        name.clone(),
-                        inst.mount_point.clone(),
-                        inst.what.clone(),
-                    )
-                })
+                .map(|(name, inst)| (name.clone(), inst.mount_point.clone(), inst.what.clone()))
                 .collect()
         };
 
@@ -364,5 +416,80 @@ impl MountInfoMonitor {
         }
 
         self.last_snapshot = Some(snapshot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn mount_unit_name_escaping() {
+        assert_eq!(mount_unit_name_from_path("/"), "-.mount");
+        assert_eq!(mount_unit_name_from_path("/tmp"), "tmp.mount");
+        assert_eq!(mount_unit_name_from_path("/mnt/data"), "mnt-data.mount");
+        assert_eq!(mount_unit_name_from_path("/var/run"), "var-run.mount");
+        assert_eq!(mount_unit_name_from_path("/mnt/-x"), "mnt-\\x2dx.mount");
+        assert_eq!(mount_unit_name_from_path("/mnt/a_b.c"), "mnt-a_b.c.mount");
+    }
+
+    fn entry(mount_point: &str, fstype: &str) -> MountInfoEntry {
+        MountInfoEntry {
+            mount_id: 1,
+            parent_id: 0,
+            major_minor: "0:0".to_string(),
+            root: "/".to_string(),
+            mount_point: mount_point.to_string(),
+            mount_options: String::new(),
+            optional_fields: Vec::new(),
+            filesystem_type: fstype.to_string(),
+            mount_source: "test".to_string(),
+            super_options: String::new(),
+        }
+    }
+
+    #[test]
+    fn reconcile_creates_entries_for_real_mounts() {
+        let mut snapshot = MountInfoSnapshot::default();
+        snapshot.entries = vec![
+            entry("/", "ext4"),
+            entry("/tmp", "tmpfs"),
+            entry("/mnt", "autofs"),
+        ];
+        let registry: MountRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let created = reconcile_mount_registry(&registry, &snapshot);
+
+        // autofs sentinels are skipped.
+        assert_eq!(
+            created,
+            vec!["-.mount".to_string(), "tmp.mount".to_string()]
+        );
+        let guard = registry.lock();
+        assert!(!guard.contains_key("mnt.mount"));
+        let tmp = guard.get("tmp.mount").unwrap();
+        assert_eq!(tmp.state, MountState::Mounted);
+        assert_eq!(tmp.mount_point, "/tmp");
+        assert!(tmp.from_mountinfo);
+        assert_eq!(tmp.fstype, "tmpfs");
+    }
+
+    #[test]
+    fn reconcile_is_idempotent() {
+        let mut snapshot = MountInfoSnapshot::default();
+        snapshot.entries = vec![entry("/tmp", "tmpfs")];
+        let registry: MountRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let first = reconcile_mount_registry(&registry, &snapshot);
+        let second = reconcile_mount_registry(&registry, &snapshot);
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        assert_eq!(registry.lock().len(), 1);
     }
 }

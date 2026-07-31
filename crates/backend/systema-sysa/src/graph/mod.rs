@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use sysa::l10n;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use sysa::l10n;
 use tracing::{debug, warn};
 
 #[allow(dead_code)]
@@ -136,10 +136,13 @@ impl DependencyGraph {
             }
         }
 
-        bail!("{}", l10n::fmt(
-            l10n::t_("Unable to resolve dependency cycles after removing {count} edges."),
-            &[("count", &max_attempts.to_string())],
-        ))
+        bail!(
+            "{}",
+            l10n::fmt(
+                l10n::t_("Unable to resolve dependency cycles after removing {count} edges."),
+                &[("count", &max_attempts.to_string())],
+            )
+        )
     }
 
     pub fn start_order_for(&self, unit_name: &str) -> Result<Vec<String>> {

@@ -6,8 +6,8 @@ use async_trait::async_trait;
 
 use super::loader;
 use super::types::{
-    ExecCommand as SdExecCommand, RestartPolicy as SdRestartPolicy, ServiceSection,
-    UnitFile, UnitKind,
+    ExecCommand as SdExecCommand, RestartPolicy as SdRestartPolicy, ServiceSection, UnitFile,
+    UnitKind,
 };
 use crate::ir::{
     self, AutomountConfig, Condition, DependencySet, ExecCommand, MountConfig, ServiceConfig,

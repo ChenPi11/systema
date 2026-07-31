@@ -1,8 +1,7 @@
-use std::collections::HashMap;
-use anyhow::{Context, Result};
-use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
-use sysa::proto::SyncUnitState;
 use crate::socket::{self, SocketManager};
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
 
 pub struct SocketController {
     manager: SocketManager,
@@ -22,30 +21,43 @@ impl UnitController for SocketController {
         drop(guard);
         Ok(UnitStatus {
             unit_name: unit_name.to_string(),
-            active_state: if is_active { "active".to_string() } else { "inactive".to_string() },
-            sub_state: if is_active { "listening".to_string() } else { "dead".to_string() },
+            active_state: if is_active {
+                "active".to_string()
+            } else {
+                "inactive".to_string()
+            },
+            sub_state: if is_active {
+                "listening".to_string()
+            } else {
+                "dead".to_string()
+            },
             main_pid: 0,
             invocation_id: String::new(),
             extensions: HashMap::new(),
         })
     }
 
-    async fn sync_state(&self) -> Vec<SyncUnitState> {
+    async fn sync_state(&self) -> Vec<UnitStatus> {
         let guard = self.manager.lock();
         guard
             .keys()
-            .map(|name| SyncUnitState {
+            .map(|name| UnitStatus {
                 unit_name: name.clone(),
+                active_state: "active".to_string(),
+                sub_state: "listening".to_string(),
                 main_pid: 0,
-                state: "listening".to_string(),
-                last_exit_code: 0,
+                invocation_id: String::new(),
+                extensions: HashMap::new(),
             })
             .collect()
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], _invocation_id: &str) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let sc = cfg.socket.as_ref().context("no SocketConfig in UnitConfig")?;
+        let sc = cfg
+            .socket
+            .as_ref()
+            .context("no SocketConfig in UnitConfig")?;
         socket::start_socket(&self.manager, unit_name, sc)?;
         if sc.accept {
             socket::spawn_accept_loops(&self.manager, unit_name);

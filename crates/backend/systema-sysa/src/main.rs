@@ -15,8 +15,6 @@ mod scheduler;
 mod state;
 mod unit;
 
-use std::time::Duration;
-
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
@@ -28,7 +26,11 @@ struct Args {
     #[arg(long, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
 
-    #[arg(long, default_value = "info", help = "Log level (trace, debug, info, warn, error)")]
+    #[arg(
+        long,
+        default_value = "info",
+        help = "Log level (trace, debug, info, warn, error)"
+    )]
     log_level: String,
 }
 
@@ -41,10 +43,15 @@ async fn main() -> Result<()> {
         use clap::{CommandFactory, FromArgMatches};
         let cmd = Args::command()
             .about(sysa::l10n::t_("System A — System Allocator"))
-            .mut_arg("debug", |a| a.help(sysa::l10n::t_("Enable debug-level logging.")))
-            .mut_arg("log_level", |a| a.help(sysa::l10n::t_("Log level (trace, debug, info, warn, error).")));
-        Args::from_arg_matches(&cmd.get_matches())
-            .unwrap_or_else(|e| e.exit())
+            .mut_arg("debug", |a| {
+                a.help(sysa::l10n::t_("Enable debug-level logging."))
+            })
+            .mut_arg("log_level", |a| {
+                a.help(sysa::l10n::t_(
+                    "Log level (trace, debug, info, warn, error).",
+                ))
+            });
+        Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
@@ -61,9 +68,7 @@ async fn main() -> Result<()> {
         use std::sync::Arc;
         let bus = allocator.read().event_bus.clone();
         let mut bus_w = bus.write().await;
-        bus_w.subscribe(Arc::new(
-            event::RestartHandler::new(allocator.clone()),
-        ));
+        bus_w.subscribe(Arc::new(event::RestartHandler::new(allocator.clone())));
     }
 
     // Start the IPC server (accepts System Worker & Finder connections).
@@ -75,11 +80,6 @@ async fn main() -> Result<()> {
     // If the system D-Bus bus is not yet available (early boot, containers,
     // or after a transient outage), it retries with exponential backoff.
     tokio::spawn(dbus::run(allocator.clone()));
-
-    // Start the reconciliation loop (background task).
-    // Periodically checks desired vs actual state and enqueues jobs to
-    // resolve discrepancies.  Uses a 5-second interval.
-    scheduler::start_reconciliation_loop(allocator.clone(), Duration::from_secs(5));
 
     // Wait for the IPC server (runs until killed).
     ipc_handle.await??;

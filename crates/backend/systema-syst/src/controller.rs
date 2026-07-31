@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use anyhow::Result;
-use sysa::controller::{UnitController, UnitStatus};
 use crate::state::{TargetRegistry, TargetState};
+use anyhow::Result;
+use std::collections::HashMap;
+use sysa::controller::{UnitController, UnitStatus};
 
 #[derive(Clone)]
 pub struct TargetController {

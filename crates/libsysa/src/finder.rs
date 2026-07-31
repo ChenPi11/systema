@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use prost::Message;
 
 use crate::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
-use crate::proto::{CommitUnits, RegisterUnits, StagingQuery, StagingQueryResult, UnitRegistrationAck};
+use crate::proto::{
+    CommitUnits, RegisterUnits, StagingQuery, StagingQueryResult, UnitRegistrationAck,
+};
 
 pub struct UnitFinder {
     socket_path: String,
@@ -15,7 +17,11 @@ impl UnitFinder {
         }
     }
 
-    pub async fn register_units(&self, debug_label: &str, units_json: Vec<u8>) -> Result<UnitRegistrationAck> {
+    pub async fn register_units(
+        &self,
+        debug_label: &str,
+        units_json: Vec<u8>,
+    ) -> Result<UnitRegistrationAck> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
@@ -50,7 +56,8 @@ impl UnitFinder {
         let commit_msg = CommitUnits {
             debug_label: String::new(),
         };
-        let commit_env = make_envelope(1, "system-f", "system-a", "finder.commit_units", commit_msg)?;
+        let commit_env =
+            make_envelope(1, "system-f", "system-a", "finder.commit_units", commit_msg)?;
         send_envelope(&mut framed, &commit_env).await?;
 
         let ack_env = recv_envelope(&mut framed)
@@ -81,7 +88,10 @@ impl UnitFinder {
             .ok_or_else(|| anyhow::anyhow!("System A disconnected before sending query result."))?;
 
         if result_env.method != "staging.query_result" {
-            anyhow::bail!("Expected 'staging.query_result', got '{}'", result_env.method);
+            anyhow::bail!(
+                "Expected 'staging.query_result', got '{}'",
+                result_env.method
+            );
         }
 
         let result = StagingQueryResult::decode(result_env.payload.as_slice())

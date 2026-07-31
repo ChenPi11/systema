@@ -10,9 +10,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::AbortHandle;
 
-use parking_lot::Mutex;
-use sysa::event_bus::EventBus;
 use parking_lot::RwLock;
+use sysa::event_bus::EventBus;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock as TokioRwLock;
 use tracing::info;
@@ -23,12 +22,15 @@ use systema_sysf::ir::UnitIR;
 use crate::unit::types::UnitFile;
 
 /// Snapshot of a unit's runtime state, kept up-to-date via `method.result`
-/// responses.  Read synchronously by D-Bus property getters.
+/// responses and `unit.state_update` push events.  Read synchronously by
+/// D-Bus property getters.
 #[derive(Debug, Clone, Default)]
 pub struct CachedUnitState {
     pub active_state: String,
     pub sub_state: String,
     pub main_pid: u32,
+    /// Worker-specific extensions (e.g. `last_exit_code`, `last_error`).
+    pub extensions: HashMap<String, String>,
 }
 
 // --------------------------------------------------------------------------
@@ -159,7 +161,8 @@ impl StartLimitState {
     /// has been exceeded.
     pub fn check_rate_limit(&mut self, interval: std::time::Duration, burst: u32) -> bool {
         let now = Instant::now();
-        self.timestamps.retain(|t| now.duration_since(*t) < interval);
+        self.timestamps
+            .retain(|t| now.duration_since(*t) < interval);
         if self.timestamps.len() >= burst as usize {
             return false;
         }
@@ -191,22 +194,17 @@ impl JobResultKind {
     }
 }
 
-
 // --------------------------------------------------------------------------
 // Worker registry
 // --------------------------------------------------------------------------
 
 /// A registered System Worker connection.
 pub struct WorkerEntry {
-    #[allow(dead_code)]
     pub worker_id: String,
     /// Unit types this worker handles, e.g. ["service"].
     pub unit_types: Vec<String>,
     /// Channel to send pre-encoded envelopes (method calls, etc.).
     pub envelope_tx: mpsc::Sender<bytes::Bytes>,
-    /// Pending method calls awaiting responses from this worker.
-    /// Maps request_id -> oneshot sender for the raw response payload.
-    pub pending_calls: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
 }
 
 /// A staging area bound to a single worker UID.
@@ -277,9 +275,20 @@ pub struct AllocatorState {
     /// Used by GetUnitByInvocationID.
     pub invocation_ids: HashMap<String, String>,
 
-    /// Runtime state cache populated from `method.result` IPC responses.
+    /// Runtime state cache populated from `method.result` IPC responses
+    /// and `unit.state_update` push events.
     /// D-Bus property getters read from this cache synchronously.
     pub unit_states: HashMap<String, CachedUnitState>,
+
+    /// Unit ownership table: unit_name → worker_id.
+    ///
+    /// An owner is assigned when a job for the unit is dispatched to a
+    /// worker (and implicitly when a `.automount` unit is started, since its
+    /// companion `.mount` unit is managed by the same worker).  Ownership is
+    /// cleared when the unit's reported state becomes `inactive`/`dead`.
+    /// Incremental `unit.state_update` pushes are only accepted from the
+    /// current owner; unknown or unowned units are ignored with a warning.
+    pub unit_owners: HashMap<String, String>,
 }
 
 impl AllocatorState {
@@ -301,6 +310,7 @@ impl AllocatorState {
             n_refs: HashMap::new(),
             invocation_ids: HashMap::new(),
             unit_states: HashMap::new(),
+            unit_owners: HashMap::new(),
         }
     }
 
@@ -309,15 +319,20 @@ impl AllocatorState {
     /// Every `UnitIR` in the area is converted into a `UnitFile` and merged
     /// into `self.units`.  The staging area is removed after commit.
     pub fn commit_staging(&mut self, uid: u32) -> Result<u32, String> {
-        let area = self.staging_areas.remove(&uid)
+        let area = self
+            .staging_areas
+            .remove(&uid)
             .ok_or_else(|| format!("no staging area for UID {uid}"))?;
 
         let unit_count = area.units.len() as u32;
         let label = &area.debug_label;
         info!("commit_staging(UID={uid}, label={label}): loading {unit_count} units");
 
-        let new_units: HashMap<String, UnitFile> =
-            area.units.values().map(|ir| unit_file_from_ir(ir)).collect();
+        let new_units: HashMap<String, UnitFile> = area
+            .units
+            .values()
+            .map(|ir| unit_file_from_ir(ir))
+            .collect();
         self.units.extend(new_units);
         self.rebuild_ref_counts();
 
@@ -326,16 +341,24 @@ impl AllocatorState {
 
     /// Create a staging area for a given UID.
     /// Returns an error if the UID already owns an area.
-    pub fn init_staging_area(&mut self, uid: u32, label: &str, units: HashMap<String, UnitIR>) -> Result<u32, String> {
+    pub fn init_staging_area(
+        &mut self,
+        uid: u32,
+        label: &str,
+        units: HashMap<String, UnitIR>,
+    ) -> Result<u32, String> {
         if self.staging_areas.contains_key(&uid) {
             return Err(format!("staging area for UID {uid} already exists"));
         }
         let count = units.len() as u32;
-        self.staging_areas.insert(uid, StagingArea {
-            debug_label: label.to_string(),
+        self.staging_areas.insert(
             uid,
-            units,
-        });
+            StagingArea {
+                debug_label: label.to_string(),
+                uid,
+                units,
+            },
+        );
         info!("init_staging_area(UID={uid}, label={label}): {count} units");
         Ok(count)
     }
@@ -347,12 +370,18 @@ impl AllocatorState {
 
     /// Find staging areas whose debug label matches.
     pub fn get_staging_areas_by_name(&self, name: &str) -> Vec<&StagingArea> {
-        self.staging_areas.values().filter(|a| a.debug_label == name).collect()
+        self.staging_areas
+            .values()
+            .filter(|a| a.debug_label == name)
+            .collect()
     }
 
     /// List every staging area (uid + label, no units).
     pub fn list_staging_areas(&self) -> Vec<(u32, &str)> {
-        self.staging_areas.iter().map(|(uid, a)| (*uid, a.debug_label.as_str())).collect()
+        self.staging_areas
+            .iter()
+            .map(|(uid, a)| (*uid, a.debug_label.as_str()))
+            .collect()
     }
 
     /// Return all staging areas (full data).
@@ -463,7 +492,9 @@ fn unit_file_from_ir(ir: &UnitIR) -> (String, UnitFile) {
     (uf.name.clone(), uf)
 }
 
-fn service_config_to_section(cfg: &systema_sysf::ir::ServiceConfig) -> crate::unit::types::ServiceSection {
+fn service_config_to_section(
+    cfg: &systema_sysf::ir::ServiceConfig,
+) -> crate::unit::types::ServiceSection {
     use crate::unit::types::ServiceType;
     let svc_type = match cfg.exec_start.first() {
         Some(_) => ServiceType::Simple,
@@ -507,7 +538,9 @@ fn exec_cmd_from_ir(cmd: &systema_sysf::ir::ExecCommand) -> crate::unit::types::
     }
 }
 
-fn restart_policy_from_ir(policy: &systema_sysf::ir::RestartPolicy) -> crate::unit::types::RestartPolicy {
+fn restart_policy_from_ir(
+    policy: &systema_sysf::ir::RestartPolicy,
+) -> crate::unit::types::RestartPolicy {
     use crate::unit::types::RestartPolicy as SdRp;
     match policy {
         systema_sysf::ir::RestartPolicy::No => SdRp::No,
@@ -520,7 +553,9 @@ fn restart_policy_from_ir(policy: &systema_sysf::ir::RestartPolicy) -> crate::un
     }
 }
 
-fn mount_config_to_section(cfg: &systema_sysf::ir::MountConfig) -> crate::unit::types::MountSection {
+fn mount_config_to_section(
+    cfg: &systema_sysf::ir::MountConfig,
+) -> crate::unit::types::MountSection {
     crate::unit::types::MountSection {
         what: cfg.what.clone(),
         where_: cfg.where_.clone(),
@@ -531,7 +566,9 @@ fn mount_config_to_section(cfg: &systema_sysf::ir::MountConfig) -> crate::unit::
     }
 }
 
-fn timer_config_to_section(cfg: &systema_sysf::ir::TimerConfig) -> crate::unit::types::TimerSection {
+fn timer_config_to_section(
+    cfg: &systema_sysf::ir::TimerConfig,
+) -> crate::unit::types::TimerSection {
     crate::unit::types::TimerSection {
         on_active_sec: cfg.on_active_sec,
         on_boot_sec: cfg.on_boot_sec,
@@ -547,7 +584,9 @@ fn timer_config_to_section(cfg: &systema_sysf::ir::TimerConfig) -> crate::unit::
     }
 }
 
-fn socket_config_to_section(cfg: &systema_sysf::ir::SocketConfig) -> crate::unit::types::SocketSection {
+fn socket_config_to_section(
+    cfg: &systema_sysf::ir::SocketConfig,
+) -> crate::unit::types::SocketSection {
     crate::unit::types::SocketSection {
         listen_stream: cfg.listen_stream.clone(),
         listen_datagram: cfg.listen_datagram.clone(),
@@ -591,7 +630,8 @@ pub fn next_job_id() -> u64 {
         if next == 0 {
             // Wrap from u64::MAX to 1 (skip 0).  On CAS failure another thread
             // already advanced past MAX; just retry.
-            let _ = NEXT_JOB_ID.compare_exchange_weak(current, 1, Ordering::Relaxed, Ordering::Relaxed);
+            let _ =
+                NEXT_JOB_ID.compare_exchange_weak(current, 1, Ordering::Relaxed, Ordering::Relaxed);
             continue;
         }
         if NEXT_JOB_ID
@@ -608,7 +648,12 @@ pub fn next_task_id() -> u64 {
         let current = NEXT_TASK_ID.load(Ordering::Relaxed);
         let next = current.wrapping_add(1);
         if next == 0 {
-            let _ = NEXT_TASK_ID.compare_exchange_weak(current, 1, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = NEXT_TASK_ID.compare_exchange_weak(
+                current,
+                1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             continue;
         }
         if NEXT_TASK_ID
@@ -625,7 +670,12 @@ pub fn next_request_id() -> u64 {
         let current = NEXT_REQUEST_ID.load(Ordering::Relaxed);
         let next = current.wrapping_add(1);
         if next == 0 {
-            let _ = NEXT_REQUEST_ID.compare_exchange_weak(current, 1, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = NEXT_REQUEST_ID.compare_exchange_weak(
+                current,
+                1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             continue;
         }
         if NEXT_REQUEST_ID

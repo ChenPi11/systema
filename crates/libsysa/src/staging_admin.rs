@@ -26,7 +26,11 @@ impl StagingAdmin {
         if !result.success {
             anyhow::bail!("{}", result.message);
         }
-        Ok(result.entries.into_iter().map(|e| (e.uid, e.debug_label)).collect())
+        Ok(result
+            .entries
+            .into_iter()
+            .map(|e| (e.uid, e.debug_label))
+            .collect())
     }
 
     /// Query a staging area by UID (returns raw JSON bytes).
@@ -63,7 +67,10 @@ impl StagingAdmin {
             .ok_or_else(|| anyhow::anyhow!("System A disconnected before admin result."))?;
 
         if result_env.method != "admin.staging.result" {
-            anyhow::bail!("Expected 'admin.staging.result', got '{}'", result_env.method);
+            anyhow::bail!(
+                "Expected 'admin.staging.result', got '{}'",
+                result_env.method
+            );
         }
 
         let result = AdminStagingResult::decode(result_env.payload.as_slice())

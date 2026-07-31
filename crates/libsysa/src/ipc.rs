@@ -39,8 +39,11 @@ pub async fn recv_envelope(framed: &mut EnvelopeFramed) -> Result<Option<Envelop
     match framed.next().await {
         None => Ok(None),
         Some(result) => {
-            let bytes: Bytes = result.context(crate::l10n::t_("Frame receive error."))?.freeze();
-            let envelope = Envelope::decode(bytes).context(crate::l10n::t_("Failed to decode Envelope."))?;
+            let bytes: Bytes = result
+                .context(crate::l10n::t_("Frame receive error."))?
+                .freeze();
+            let envelope =
+                Envelope::decode(bytes).context(crate::l10n::t_("Failed to decode Envelope."))?;
             Ok(Some(envelope))
         }
     }
@@ -75,22 +78,18 @@ pub fn make_envelope(
 /// The stream must be a dedicated raw connection (not wrapped in `Framed`).
 pub async fn send_fd(stream: &UnixStream, fd: std::os::unix::io::RawFd) -> Result<()> {
     let raw = stream.as_raw_fd();
-    tokio::task::spawn_blocking(move || {
-        send_fd_sync(raw, fd)
-    })
-    .await
-    .context(crate::l10n::t_("SCM_RIGHTS send task panicked."))?
+    tokio::task::spawn_blocking(move || send_fd_sync(raw, fd))
+        .await
+        .context(crate::l10n::t_("SCM_RIGHTS send task panicked."))?
 }
 
 /// Receive a single file descriptor from a Unix stream via SCM_RIGHTS.
 /// The stream must be a dedicated raw connection (not wrapped in `Framed`).
 pub async fn recv_fd(stream: &UnixStream) -> Result<std::os::unix::io::RawFd> {
     let raw = stream.as_raw_fd();
-    tokio::task::spawn_blocking(move || {
-        recv_fd_sync(raw)
-    })
-    .await
-    .context(crate::l10n::t_("SCM_RIGHTS recv task panicked."))?
+    tokio::task::spawn_blocking(move || recv_fd_sync(raw))
+        .await
+        .context(crate::l10n::t_("SCM_RIGHTS recv task panicked."))?
 }
 
 /// Synchronous SCM_RIGHTS send using libc::sendmsg.
@@ -122,7 +121,10 @@ fn send_fd_sync(sock_fd: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd)
         let ret = libc::sendmsg(sock_fd, &msghdr, 0);
         if ret < 0 {
             let e = std::io::Error::last_os_error();
-            anyhow::bail!(crate::l10n::fmt(crate::l10n::t_("sendmsg (SCM_RIGHTS) failed: {e}."), &[("e", &e.to_string())]));
+            anyhow::bail!(crate::l10n::fmt(
+                crate::l10n::t_("sendmsg (SCM_RIGHTS) failed: {e}."),
+                &[("e", &e.to_string())]
+            ));
         }
     }
     Ok(())
@@ -147,7 +149,10 @@ fn recv_fd_sync(sock_fd: std::os::unix::io::RawFd) -> Result<std::os::unix::io::
         let ret = libc::recvmsg(sock_fd, &mut msghdr, 0);
         if ret < 0 {
             let e = std::io::Error::last_os_error();
-            anyhow::bail!(crate::l10n::fmt(crate::l10n::t_("recvmsg (SCM_RIGHTS) failed: {e}."), &[("e", &e.to_string())]));
+            anyhow::bail!(crate::l10n::fmt(
+                crate::l10n::t_("recvmsg (SCM_RIGHTS) failed: {e}."),
+                &[("e", &e.to_string())]
+            ));
         }
 
         let mut received_fd: Option<std::os::unix::io::RawFd> = None;

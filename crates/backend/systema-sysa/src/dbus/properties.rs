@@ -12,20 +12,20 @@ use std::fmt::Write;
 
 use async_trait::async_trait;
 use sysa::l10n;
-use zbus::object_server::{DispatchResult, Interface, SignalContext};
 use zbus::names::InterfaceName;
-use zbus::{Connection, ObjectServer, fdo};
+use zbus::object_server::{DispatchResult, Interface, SignalContext};
+use zbus::{fdo, Connection, ObjectServer};
 use zvariant::OwnedValue;
 
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
-use crate::state::AllocatorHandle;
-use crate::unit::types::UnitKind;
 use super::manager::ManagerInterface;
 use super::service_obj::ServiceObject;
 use super::socket_obj::SocketObject;
 use super::unit_obj::UnitObject;
+use crate::state::AllocatorHandle;
+use crate::unit::types::UnitKind;
 
 /// Replacement for `zbus::fdo::Properties` that accepts an empty interface
 /// name in `GetAll`, mirroring systemd's behaviour.
@@ -162,7 +162,10 @@ impl Properties {
         let (iface_name,): (String,) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(
+                    l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -201,7 +204,10 @@ impl Properties {
         let (iface_name, prop_name): (String, String) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(
+                    l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -329,7 +335,9 @@ impl Interface for Properties {
     ) -> DispatchResult<'call> {
         match name.as_str() {
             "GetAll" => DispatchResult::Async(Box::pin(async move {
-                self.handle_get_all(connection, msg).await.map_err(Into::into)
+                self.handle_get_all(connection, msg)
+                    .await
+                    .map_err(Into::into)
             })),
             "Get" => DispatchResult::Async(Box::pin(async move {
                 self.handle_get(connection, msg).await.map_err(Into::into)
@@ -362,26 +370,98 @@ impl Interface for Properties {
         let l = level + 2;
         // Get
         writeln!(writer, "{:indent$}<method name=\"Get\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"v\" name=\"value\" direction=\"out\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"v\" name=\"value\" direction=\"out\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</method>", "", indent = l).unwrap();
         // GetAll
         writeln!(writer, "{:indent$}<method name=\"GetAll\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"a{{sv}}\" name=\"properties\" direction=\"out\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"a{{sv}}\" name=\"properties\" direction=\"out\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</method>", "", indent = l).unwrap();
         // Set
         writeln!(writer, "{:indent$}<method name=\"Set\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"v\" name=\"value\" direction=\"in\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"v\" name=\"value\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</method>", "", indent = l).unwrap();
         // PropertiesChanged signal
-        writeln!(writer, "{:indent$}<signal name=\"PropertiesChanged\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"a{{sv}}\" name=\"changed_properties\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"as\" name=\"invalidated_properties\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<signal name=\"PropertiesChanged\">",
+            "",
+            indent = l
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"a{{sv}}\" name=\"changed_properties\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"as\" name=\"invalidated_properties\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</signal>", "", indent = l).unwrap();
         writeln!(writer, "{:indent$}</interface>", "", indent = level).unwrap();
     }
@@ -404,10 +484,7 @@ pub struct ManagerProperties {
 impl ManagerProperties {
     /// Collect all properties exposed by `org.freedesktop.systemd1.Manager`.
     async fn manager_iface_props(&self) -> fdo::Result<HashMap<String, OwnedValue>> {
-        let obj = ManagerInterface::new(
-            self.allocator.clone(),
-            Arc::new(OnceCell::new()),
-        );
+        let obj = ManagerInterface::new(self.allocator.clone(), Arc::new(OnceCell::new()));
         obj.get_all().await
     }
 
@@ -420,7 +497,10 @@ impl ManagerProperties {
         let (iface_name,): (String,) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(
+                    l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -428,16 +508,14 @@ impl ManagerProperties {
 
         match iface_name.as_str() {
             // systemd extension: empty interface name → return all Manager properties.
-            "" | "org.freedesktop.systemd1.Manager" => {
-                match self.manager_iface_props().await {
-                    Ok(props) => {
-                        connection.reply(msg, &props).await?;
-                    }
-                    Err(e) => {
-                        connection.reply_dbus_error(&msg.header(), e).await?;
-                    }
+            "" | "org.freedesktop.systemd1.Manager" => match self.manager_iface_props().await {
+                Ok(props) => {
+                    connection.reply(msg, &props).await?;
                 }
-            }
+                Err(e) => {
+                    connection.reply_dbus_error(&msg.header(), e).await?;
+                }
+            },
             // Standard built-in interfaces carry no user-visible properties.
             "org.freedesktop.DBus.Properties"
             | "org.freedesktop.DBus.Peer"
@@ -466,7 +544,10 @@ impl ManagerProperties {
         let (iface_name, prop_name): (String, String) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(l10n::fmt(l10n::t_("Bad arguments: {e}."), &[("e", &e.to_string())]));
+                let err = fdo::Error::InvalidArgs(l10n::fmt(
+                    l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -481,10 +562,7 @@ impl ManagerProperties {
             return Ok(());
         }
 
-        let obj = ManagerInterface::new(
-            self.allocator.clone(),
-            Arc::new(OnceCell::new()),
-        );
+        let obj = ManagerInterface::new(self.allocator.clone(), Arc::new(OnceCell::new()));
         match obj.get(&prop_name).await {
             Some(Ok(v)) => {
                 let v: zvariant::Value<'_> = v.into();
@@ -584,23 +662,95 @@ impl Interface for ManagerProperties {
         .unwrap();
         let l = level + 2;
         writeln!(writer, "{:indent$}<method name=\"Get\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"v\" name=\"value\" direction=\"out\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"v\" name=\"value\" direction=\"out\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</method>", "", indent = l).unwrap();
         writeln!(writer, "{:indent$}<method name=\"GetAll\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"a{{sv}}\" name=\"properties\" direction=\"out\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"a{{sv}}\" name=\"properties\" direction=\"out\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</method>", "", indent = l).unwrap();
         writeln!(writer, "{:indent$}<method name=\"Set\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"v\" name=\"value\" direction=\"in\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"property_name\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"v\" name=\"value\" direction=\"in\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</method>", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<signal name=\"PropertiesChanged\">", "", indent = l).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"s\" name=\"interface_name\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"a{{sv}}\" name=\"changed_properties\"/>", "", indent = l + 2).unwrap();
-        writeln!(writer, "{:indent$}<arg type=\"as\" name=\"invalidated_properties\"/>", "", indent = l + 2).unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<signal name=\"PropertiesChanged\">",
+            "",
+            indent = l
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"s\" name=\"interface_name\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"a{{sv}}\" name=\"changed_properties\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{:indent$}<arg type=\"as\" name=\"invalidated_properties\"/>",
+            "",
+            indent = l + 2
+        )
+        .unwrap();
         writeln!(writer, "{:indent$}</signal>", "", indent = l).unwrap();
         writeln!(writer, "{:indent$}</interface>", "", indent = level).unwrap();
     }

@@ -8,8 +8,8 @@
 pub mod controller;
 pub mod event_bus;
 pub mod finder;
-pub mod l10n;
 pub mod ipc;
+pub mod l10n;
 pub mod paths;
 pub mod staging_admin;
 pub mod worker_ipc;

@@ -19,11 +19,7 @@ pub async fn run() -> Result<()> {
 
     // Connect to fdpass socket (non-fatal if unavailable).
     {
-        match tokio::net::UnixStream::connect(
-            sysa::paths::instance().systema_fdpass_sock,
-        )
-        .await
-        {
+        match tokio::net::UnixStream::connect(sysa::paths::instance().systema_fdpass_sock).await {
             Ok(mut s) => {
                 use tokio::io::AsyncWriteExt;
                 let ident = format!("{WORKER_ID}\n");
@@ -47,25 +43,19 @@ pub async fn run() -> Result<()> {
         let socket_manager = socket_manager.clone();
         move |env: &Envelope, _ep: &EventPublisher| -> Result<bool> {
             if env.method.as_str() == "socket.request_fd" {
-                let unit_name =
-                    String::from_utf8(env.payload.clone()).unwrap_or_default();
+                let unit_name = String::from_utf8(env.payload.clone()).unwrap_or_default();
                 let fdpass = fdpass.clone();
                 let socket_manager = socket_manager.clone();
                 tokio::spawn(async move {
                     let guard = fdpass.lock().await;
                     if let Some(ref fdpass) = *guard {
-                        if let Some(fd) =
-                            socket::get_listener_fd(&socket_manager, &unit_name)
-                        {
+                        if let Some(fd) = socket::get_listener_fd(&socket_manager, &unit_name) {
                             info!("Sending fd for '{}' via SCM_RIGHTS", unit_name);
                             if let Err(e) = sysa::ipc::send_fd(fdpass, fd).await {
                                 tracing::warn!("Failed to send fd: {}", e);
                             }
                         } else {
-                            tracing::warn!(
-                                "No listener fd found for '{}'",
-                                unit_name
-                            );
+                            tracing::warn!("No listener fd found for '{}'", unit_name);
                         }
                     } else {
                         tracing::warn!("No fdpass channel available");

@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=../../proto/ipc.proto");
     prost_build::compile_protos(&["../../proto/ipc.proto"], &["../../proto/"])
         .expect("Failed to compile proto files");
 
@@ -13,8 +14,10 @@ fn compile_mo_files() {
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let po_dir = std::path::Path::new(&manifest_dir)
-        .parent().unwrap()
-        .parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("po");
     if !po_dir.exists() {
         return;

@@ -5,20 +5,23 @@
 //! 2. Creates Job records for each operation.
 //! 3. Dispatches WorkerTask messages to the appropriate workers.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use sysa::l10n;
 use prost::Message;
+use sysa::l10n;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::state::{
     generate_invocation_id, next_job_id, next_task_id, AllocatorHandle, AllocatorState,
-    DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo,
-    JobResultKind, JobStatus, StartLimitState,
+    DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo, JobResultKind, JobStatus,
+    StartLimitState,
 };
-use crate::unit::types::{ExitKind, RestartPolicy, StartLimitAction, UnitFile, UnitSection};
+use crate::unit::types::{
+    ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitSection,
+};
 use sysa::proto::{
     AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, UnitConfig,
 };
@@ -58,7 +61,10 @@ pub async fn enqueue_job(
         let unit_type = unit
             .map(|u| u.kind.worker_type().to_string())
             .unwrap_or_else(|| "service".to_string());
-        let has_worker = state.workers.values().any(|w| w.unit_types.contains(&unit_type));
+        let has_worker = state
+            .workers
+            .values()
+            .any(|w| w.unit_types.contains(&unit_type));
         if !has_worker {
             bail!("{}", l10n::fmt(l10n::t_("No worker available for unit type '{unit_type}' (unit: {unit_name}). Cannot execute {kind:?} operation. Is the corresponding System Worker running?"), &[
                 ("unit_type", &unit_type),
@@ -180,7 +186,13 @@ pub async fn enqueue_job(
                 "Stopping conflicting unit {} before starting {}",
                 conflict, unit_name
             );
-            Box::pin(enqueue_job(allocator.clone(), &conflict, JobKind::Stop, JobMode::Replace)).await?;
+            Box::pin(enqueue_job(
+                allocator.clone(),
+                &conflict,
+                JobKind::Stop,
+                JobMode::Replace,
+            ))
+            .await?;
         }
     }
 
@@ -191,9 +203,7 @@ pub async fn enqueue_job(
             .jobs
             .values()
             .find(|j| {
-                j.unit_name == unit_name
-                    && j.kind == kind
-                    && matches!(j.status, JobStatus::Running)
+                j.unit_name == unit_name && j.kind == kind && matches!(j.status, JobStatus::Running)
             })
             .map(|j| (j.id, j.unit_name.clone()));
         drop(read_state);
@@ -231,12 +241,8 @@ pub async fn enqueue_job(
                 vec![unit_name.to_string()]
             }
             JobKind::Start | JobKind::Restart => compute_start_order(&state.units, unit_name),
-            JobKind::Stop => {
-                compute_stop_order(&state.units, unit_name)
-            }
-            JobKind::Reload => {
-                compute_reload_order(&state.units, unit_name)
-            }
+            JobKind::Stop => compute_stop_order(&state.units, unit_name),
+            JobKind::Reload => compute_reload_order(&state.units, unit_name),
         }
     };
 
@@ -252,9 +258,7 @@ pub async fn enqueue_job(
     {
         let state = allocator.read();
         if let Some(existing) = state.jobs.values().find(|j| {
-            j.unit_name == unit_name
-                && j.kind == kind
-                && matches!(j.status, JobStatus::Running)
+            j.unit_name == unit_name && j.kind == kind && matches!(j.status, JobStatus::Running)
         }) {
             debug!(
                 "Root unit {} already has a {:?} job (id={}) — returning existing ID",
@@ -291,9 +295,7 @@ pub async fn enqueue_job(
                 .jobs
                 .values()
                 .find(|j| {
-                    j.unit_name == *name
-                        && j.kind == kind
-                        && matches!(j.status, JobStatus::Running)
+                    j.unit_name == *name && j.kind == kind && matches!(j.status, JobStatus::Running)
                 })
                 .map(|j| j.id);
 
@@ -309,7 +311,7 @@ pub async fn enqueue_job(
         // Find the appropriate worker.
         // NOTE: read lock is dropped before match so the error path can
         // acquire the write lock without deadlocking.
-        let (worker_chan, task_id, unit_type) = {
+        let (worker_chan, worker_id, task_id, unit_type) = {
             let state = allocator.read();
             let unit = state.units.get(name.as_str());
             let unit_type = unit
@@ -322,7 +324,12 @@ pub async fn enqueue_job(
                 .find(|w| w.unit_types.contains(&unit_type));
 
             let tid = next_task_id();
-            (worker.map(|w| w.envelope_tx.clone()), tid, unit_type)
+            (
+                worker.map(|w| w.envelope_tx.clone()),
+                worker.map(|w| w.worker_id.clone()),
+                tid,
+                unit_type,
+            )
         };
 
         let (worker_envelope_tx, task_id) = match (worker_chan, task_id) {
@@ -391,6 +398,18 @@ pub async fn enqueue_job(
                 },
             );
             state.task_kinds.insert(task_id, kind);
+            // Assign unit ownership to the dispatching worker.  Starting an
+            // automount implicitly assigns ownership of its companion mount
+            // unit (same worker handles both).
+            if let Some(wid) = &worker_id {
+                state.unit_owners.insert(name.clone(), wid.clone());
+                if kind == JobKind::Start && name.ends_with(".automount") {
+                    let mount_name = format!("{}.mount", name.trim_end_matches(".automount"));
+                    if state.units.contains_key(&mount_name) {
+                        state.unit_owners.insert(mount_name, wid.clone());
+                    }
+                }
+            }
             if serial_mode {
                 state.serial_completion_txs.insert(task_id, next_serial_tx);
             }
@@ -415,7 +434,12 @@ pub async fn enqueue_job(
             JobKind::Restart => "restart",
             JobKind::Reload => "reload",
         };
-        let unit_config = unit_file.as_ref().map(build_unit_config);
+        let unit_config = {
+            let state = allocator.read();
+            unit_file
+                .as_ref()
+                .map(|uf| build_unit_config(uf, &state.units))
+        };
         let mut args = Vec::new();
         if let Some(ref config) = unit_config {
             config.encode(&mut args).unwrap_or_default();
@@ -426,13 +450,8 @@ pub async fn enqueue_job(
             args,
             invocation_id: invocation_id.clone().unwrap_or_default(),
         };
-        let call_env = sysa::ipc::make_envelope(
-            task_id,
-            "system-a",
-            &unit_type,
-            "method.call",
-            call,
-        )?;
+        let call_env =
+            sysa::ipc::make_envelope(task_id, "system-a", &unit_type, "method.call", call)?;
         let mut buf = bytes::BytesMut::new();
         call_env.encode(&mut buf)?;
 
@@ -484,17 +503,63 @@ async fn handle_isolate(allocator: AllocatorHandle, keep_units: &[String]) {
         state
             .desired
             .iter()
-            .filter(|(name, ds)| {
-                matches!(ds, DesiredState::Active) && !keep_units.contains(name)
-            })
+            .filter(|(name, ds)| matches!(ds, DesiredState::Active) && !keep_units.contains(name))
             .map(|(name, _)| name.clone())
             .collect()
     };
     for name in to_stop {
         info!("Isolate mode: stopping unit {}", name);
-        if let Err(e) = Box::pin(enqueue_job(allocator.clone(), &name, JobKind::Stop, JobMode::Replace)).await
+        if let Err(e) = Box::pin(enqueue_job(
+            allocator.clone(),
+            &name,
+            JobKind::Stop,
+            JobMode::Replace,
+        ))
+        .await
         {
             warn!("Failed to stop {} during isolate: {}", name, e);
+        }
+    }
+}
+
+/// Ask every registered worker for a full state snapshot (`unit.sync_request`).
+///
+/// Workers reply asynchronously with `unit.sync_report` full-snapshot
+/// updates which the IPC server feeds into the `unit_states` cache through
+/// the same path as push events.  Used on daemon-reload.
+pub async fn request_all_worker_syncs(allocator: AllocatorHandle) {
+    let targets: Vec<String> = {
+        let state = allocator.read();
+        state.workers.keys().cloned().collect()
+    };
+    for worker_id in targets {
+        let req = sysa::proto::UnitSyncRequest {};
+        let env = match sysa::ipc::make_envelope(
+            next_task_id(),
+            "system-a",
+            &worker_id,
+            "unit.sync_request",
+            req,
+        ) {
+            Ok(env) => env,
+            Err(e) => {
+                warn!("Failed to build unit.sync_request for '{worker_id}': {e}");
+                continue;
+            }
+        };
+        let mut buf = bytes::BytesMut::new();
+        if env.encode(&mut buf).is_err() {
+            warn!("Failed to encode unit.sync_request for '{worker_id}'");
+            continue;
+        }
+        let worker = {
+            let state = allocator.read();
+            state.workers.get(&worker_id).map(|w| w.envelope_tx.clone())
+        };
+        if let Some(tx) = worker {
+            if tx.send(buf.freeze()).await.is_err() {
+                warn!("Worker channel closed while sending unit.sync_request to '{worker_id}'");
+            }
         }
     }
 }
@@ -510,7 +575,12 @@ fn emit_job_new(state: &mut AllocatorState, job_id: u64, unit_name: &str, _kind:
 }
 
 /// Emit JobNew without holding the write lock (acquires it briefly).
-fn emit_job_new_after_lock(allocator: AllocatorHandle, job_id: u64, unit_name: &str, _kind: JobKind) {
+fn emit_job_new_after_lock(
+    allocator: AllocatorHandle,
+    job_id: u64,
+    unit_name: &str,
+    _kind: JobKind,
+) {
     let state = allocator.read();
     if let Some(ref tx) = state.job_new_tx {
         let _ = tx.send(JobNewInfo {
@@ -821,7 +891,8 @@ pub fn handle_task_result(
                     PostAction::Start(name) => {
                         info!("Triggering start for {}", name);
                         if let Err(e) =
-                            enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace).await
+                            enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace)
+                                .await
                         {
                             warn!("Failed to trigger start for {}: {}", name, e);
                         }
@@ -845,13 +916,25 @@ enum PostAction {
     Start(String),
 }
 
-fn build_unit_config(uf: &UnitFile) -> UnitConfig {
+fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> UnitConfig {
     let service = uf.service.as_ref().map(|svc| ServiceConfig {
         // Only the first ExecStart command is sent to the worker.
         // Multiple ExecStart directives (Type=oneshot) will be supported in Phase 2.
-        exec_start: svc.exec_start.first().map(|c| c.raw.clone()).unwrap_or_default(),
-        exec_stop: svc.exec_stop.first().map(|c| c.raw.clone()).unwrap_or_default(),
-        exec_reload: svc.exec_reload.first().map(|c| c.raw.clone()).unwrap_or_default(),
+        exec_start: svc
+            .exec_start
+            .first()
+            .map(|c| c.raw.clone())
+            .unwrap_or_default(),
+        exec_stop: svc
+            .exec_stop
+            .first()
+            .map(|c| c.raw.clone())
+            .unwrap_or_default(),
+        exec_reload: svc
+            .exec_reload
+            .first()
+            .map(|c| c.raw.clone())
+            .unwrap_or_default(),
         working_directory: svc.working_directory.clone(),
         user: svc.user.clone(),
         group: svc.group.clone(),
@@ -905,17 +988,19 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
         }
     });
 
-    let mount = uf.mount.as_ref().map(|m| MountConfig {
-        what: m.what.clone(),
-        r#where: m.where_.clone(),
-        r#type: m.type_.clone(),
-        options: m.options.clone(),
-        timeout_sec: m.timeout_sec,
-        lazy_unmount: m.lazy_unmount,
-        force_unmount: m.force_unmount,
-        directory_mode: m.directory_mode.clone(),
-        sloppy_options: m.sloppy_options,
-    });
+    // For automount units, preload the companion `.mount` unit's config so
+    // the worker can satisfy kernel trigger requests locally (scheme A).
+    // The companion's [Mount] section wins if the automount unit itself
+    // carries one (it normally does not).
+    let mount = if uf.automount.is_some() && uf.mount.is_none() {
+        let mount_name = format!("{}.mount", uf.name.trim_end_matches(".automount"));
+        all_units
+            .get(&mount_name)
+            .and_then(|muf| muf.mount.as_ref())
+            .map(mount_config_from_section)
+    } else {
+        uf.mount.as_ref().map(mount_config_from_section)
+    };
 
     let automount = uf.automount.as_ref().map(|a| AutomountConfig {
         r#where: a.where_.clone(),
@@ -931,6 +1016,20 @@ fn build_unit_config(uf: &UnitFile) -> UnitConfig {
         socket,
         mount,
         automount,
+    }
+}
+
+fn mount_config_from_section(m: &MountSection) -> MountConfig {
+    MountConfig {
+        what: m.what.clone(),
+        r#where: m.where_.clone(),
+        r#type: m.type_.clone(),
+        options: m.options.clone(),
+        timeout_sec: m.timeout_sec,
+        lazy_unmount: m.lazy_unmount,
+        force_unmount: m.force_unmount,
+        directory_mode: m.directory_mode.clone(),
+        sloppy_options: m.sloppy_options,
     }
 }
 
@@ -957,7 +1056,11 @@ fn spawn_job_timeout(
         JobKind::Start | JobKind::Restart => {
             let start_timeout = svc.and_then(|s| {
                 let t = s.timeout_start_sec;
-                if t > 0 { Some(t as u64) } else { None }
+                if t > 0 {
+                    Some(t as u64)
+                } else {
+                    None
+                }
             });
             if start_timeout.is_none() {
                 // No start timeout configured; no watchdog either.
@@ -990,7 +1093,11 @@ fn spawn_job_timeout(
             let stop_secs = svc
                 .and_then(|s| {
                     let t = s.timeout_stop_sec;
-                    if t > 0 { Some(t as u64) } else { None }
+                    if t > 0 {
+                        Some(t as u64)
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or(30);
             let alloc = allocator.clone();
@@ -1064,8 +1171,7 @@ pub fn should_restart_service(policy: &RestartPolicy, exit_kind: &ExitKind) -> b
         RestartPolicy::Always => true,
         RestartPolicy::OnSuccess => matches!(exit_kind, ExitCode(0)),
         RestartPolicy::OnFailure => {
-            matches!(exit_kind, ExitCode(c) if *c != 0)
-                || matches!(exit_kind, Signal(_) | Timeout)
+            matches!(exit_kind, ExitCode(c) if *c != 0) || matches!(exit_kind, Signal(_) | Timeout)
         }
         RestartPolicy::OnAbnormal => matches!(exit_kind, Signal(_) | Timeout),
         RestartPolicy::OnWatchdog => matches!(exit_kind, Watchdog),
@@ -1080,10 +1186,7 @@ pub fn should_restart_service(policy: &RestartPolicy, exit_kind: &ExitKind) -> b
 /// (`StartLimitIntervalSec` / `StartLimitBurst`), falling back to 10 s / 5.
 ///
 /// Returns `true` if the restart was scheduled, `false` if rate-limited.
-pub fn schedule_automatic_restart(
-    allocator: AllocatorHandle,
-    unit_name: &str,
-) -> bool {
+pub fn schedule_automatic_restart(allocator: AllocatorHandle, unit_name: &str) -> bool {
     let (interval_sec, burst, restart_sec) = {
         let state = allocator.read();
         let svc = state.units.get(unit_name).and_then(|u| u.service.as_ref());
@@ -1148,8 +1251,7 @@ pub fn schedule_automatic_restart(
             tokio::time::sleep(Duration::from_secs(restart_sec)).await;
         }
         info!("Auto-restarting {} after exit/failure", name);
-        if let Err(e) = enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace).await
-        {
+        if let Err(e) = enqueue_job(alloc.clone(), &name, JobKind::Start, JobMode::Replace).await {
             warn!("Failed to auto-restart {}: {}", name, e);
         }
     });
@@ -1180,9 +1282,7 @@ fn check_conditions(unit: &UnitSection) -> bool {
     }
     for path in &unit.condition_file_not_empty {
         if !eval_condition_bool(path, |p| {
-            std::fs::metadata(p)
-                .map(|m| m.len() != 0)
-                .unwrap_or(false)
+            std::fs::metadata(p).map(|m| m.len() != 0).unwrap_or(false)
         }) {
             return false;
         }
@@ -1233,9 +1333,7 @@ fn check_asserts(unit: &UnitSection) -> bool {
     }
     for path in &unit.assert_file_not_empty {
         if !eval_condition_bool(path, |p| {
-            std::fs::metadata(p)
-                .map(|m| m.len() != 0)
-                .unwrap_or(false)
+            std::fs::metadata(p).map(|m| m.len() != 0).unwrap_or(false)
         }) {
             return false;
         }
@@ -1275,7 +1373,11 @@ fn strip_negate(spec: &str) -> (bool, &str) {
 fn eval_condition_bool<F: Fn(&str) -> bool>(spec: &str, pred: F) -> bool {
     let (negate, path) = strip_negate(spec);
     let result = pred(path);
-    if negate { !result } else { result }
+    if negate {
+        !result
+    } else {
+        result
+    }
 }
 
 /// Check if any filesystem path matches a simple glob pattern.
@@ -1342,91 +1444,6 @@ fn is_first_boot() -> bool {
     std::path::Path::new(sysa::paths::instance().systemd_first_boot_file).exists()
 }
 
-// ---------------------------------------------------------------------------
-// Reconciliation loop
-// ---------------------------------------------------------------------------
-
-/// Run the reconciliation loop as a background task.
-///
-/// Safety-net reconciliation that runs periodically against the cached
-/// `unit_states` (populated by worker push events).  This loop does NOT
-/// query workers via IPC — the primary reconciliation is event-driven,
-/// triggered by `mount.status_update` / `mount.state_change` /
-/// `mount.table_update` in the IPC server.
-///
-/// The loop skips units that already have an in-flight job of the relevant kind
-/// to avoid fighting with the scheduler, and also skips units that have no
-/// cached state yet (worker hasn't pushed initial events).
-///
-/// The `interval` controls how often the safety-net check runs (default: 5s).
-pub fn start_reconciliation_loop(allocator: AllocatorHandle, interval: Duration) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(interval).await;
-
-            let units_to_check: Vec<(String, DesiredState)> = {
-                let state = allocator.read();
-                state.desired.iter().map(|(k, v)| (k.clone(), *v)).collect()
-            };
-
-            for (unit_name, desired) in &units_to_check {
-                let has_matching_job = {
-                    let state = allocator.read();
-                    state.jobs.values().any(|j| {
-                        j.unit_name == *unit_name
-                            && matches!(j.status, JobStatus::Running)
-                    })
-                };
-
-                if has_matching_job {
-                    continue;
-                }
-
-                // Read from cached state — no IPC to workers.
-                let current_state = match allocator.read().unit_states.get(unit_name) {
-                    Some(cs) => cs.active_state.clone(),
-                    None => continue,   // no cache yet — skip
-                };
-
-                match desired {
-                    DesiredState::Active => {
-                        if current_state != "active" && current_state != "activating" {
-                            debug!(
-                                "Safety-net reconcile: starting {} (desired=Active, current={})",
-                                unit_name, current_state
-                            );
-                            if let Err(e) =
-                                enqueue_job(allocator.clone(), unit_name, JobKind::Start, JobMode::Replace).await
-                            {
-                                warn!(
-                                    "Safety-net reconcile: failed to start {}: {}",
-                                    unit_name, e
-                                );
-                            }
-                        }
-                    }
-                    DesiredState::Inactive => {
-                        if current_state == "active" || current_state == "activating" {
-                            debug!(
-                                "Safety-net reconcile: stopping {} (desired=Inactive, current={})",
-                                unit_name, current_state
-                            );
-                            if let Err(e) =
-                                enqueue_job(allocator.clone(), unit_name, JobKind::Stop, JobMode::Replace).await
-                            {
-                                warn!(
-                                    "Safety-net reconcile: failed to stop {}: {}",
-                                    unit_name, e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,8 +1468,14 @@ mod tests {
         assert_eq!(JobMode::from_str("queue"), JobMode::Queue);
         assert_eq!(JobMode::from_str("isolate"), JobMode::Isolate);
         assert_eq!(JobMode::from_str("flush"), JobMode::Flush);
-        assert_eq!(JobMode::from_str("ignore-dependencies"), JobMode::IgnoreDependencies);
-        assert_eq!(JobMode::from_str("ignore-requirements"), JobMode::IgnoreRequirements);
+        assert_eq!(
+            JobMode::from_str("ignore-dependencies"),
+            JobMode::IgnoreDependencies
+        );
+        assert_eq!(
+            JobMode::from_str("ignore-requirements"),
+            JobMode::IgnoreRequirements
+        );
     }
 
     #[test]
@@ -1466,7 +1489,16 @@ mod tests {
             JobMode::IgnoreDependencies,
             JobMode::IgnoreRequirements,
         ] {
-            assert!(matches!(mode, JobMode::Replace | JobMode::Fail | JobMode::Queue | JobMode::Isolate | JobMode::Flush | JobMode::IgnoreDependencies | JobMode::IgnoreRequirements));
+            assert!(matches!(
+                mode,
+                JobMode::Replace
+                    | JobMode::Fail
+                    | JobMode::Queue
+                    | JobMode::Isolate
+                    | JobMode::Flush
+                    | JobMode::IgnoreDependencies
+                    | JobMode::IgnoreRequirements
+            ));
         }
     }
 
@@ -1509,8 +1541,12 @@ mod tests {
     fn test_start_limit_state_prunes_old_timestamps() {
         let mut state = StartLimitState::new();
         // Add some timestamps far in the past
-        state.timestamps.push(std::time::Instant::now() - Duration::from_secs(100));
-        state.timestamps.push(std::time::Instant::now() - Duration::from_secs(100));
+        state
+            .timestamps
+            .push(std::time::Instant::now() - Duration::from_secs(100));
+        state
+            .timestamps
+            .push(std::time::Instant::now() - Duration::from_secs(100));
         // With short interval, they should be pruned
         assert!(state.check_rate_limit(Duration::from_secs(1), 5));
         assert_eq!(state.timestamps.len(), 1); // only the new one remains
@@ -1544,8 +1580,14 @@ mod tests {
     fn test_compute_start_order_with_after() {
         let mut units = HashMap::new();
         units.insert("a.service".to_string(), make_unit("a.service"));
-        units.insert("b.service".to_string(), make_unit_after("b.service", &["a.service"]));
-        units.insert("c.service".to_string(), make_unit_after("c.service", &["b.service"]));
+        units.insert(
+            "b.service".to_string(),
+            make_unit_after("b.service", &["a.service"]),
+        );
+        units.insert(
+            "c.service".to_string(),
+            make_unit_after("c.service", &["b.service"]),
+        );
         let order = compute_start_order(&units, "c.service");
         // a must come before b, b before c
         let pos_a = order.iter().position(|x| x == "a.service").unwrap();
@@ -1577,7 +1619,10 @@ mod tests {
     fn test_compute_start_order_root_last() {
         let mut units = HashMap::new();
         units.insert("dep.service".to_string(), make_unit("dep.service"));
-        units.insert("root.service".to_string(), make_unit_after("root.service", &["dep.service"]));
+        units.insert(
+            "root.service".to_string(),
+            make_unit_after("root.service", &["dep.service"]),
+        );
         let order = compute_start_order(&units, "root.service");
         assert_eq!(order.last().unwrap(), "root.service");
     }
@@ -1736,8 +1781,33 @@ mod tests {
         let uf = make_unit("test.service");
         let mut uf = uf;
         uf.service = Some(crate::unit::types::ServiceSection::default());
-        let config = build_unit_config(&uf);
+        let config = build_unit_config(&uf, &HashMap::new());
         assert!(config.service.is_some());
+    }
+
+    #[test]
+    fn test_build_unit_config_automount_preloads_companion_mount() {
+        let mut auto = make_unit("mnt-data.automount");
+        auto.automount = Some(crate::unit::types::AutomountSection {
+            where_: "/mnt/data".to_string(),
+            timeout_idle_sec: 60,
+            ..Default::default()
+        });
+        let mut mount = make_unit("mnt-data.mount");
+        mount.mount = Some(crate::unit::types::MountSection {
+            what: "/dev/sdb1".to_string(),
+            where_: "/mnt/data".to_string(),
+            type_: "ext4".to_string(),
+            options: "defaults".to_string(),
+            ..Default::default()
+        });
+        let mut units = HashMap::new();
+        units.insert(mount.name.clone(), mount);
+        let config = build_unit_config(&auto, &units);
+        let mount_cfg = config.mount.expect("companion mount config preloaded");
+        assert_eq!(mount_cfg.what, "/dev/sdb1");
+        assert_eq!(mount_cfg.r#where, "/mnt/data");
+        assert_eq!(mount_cfg.r#type, "ext4");
     }
 
     // =========================================================================
@@ -1746,7 +1816,15 @@ mod tests {
 
     #[test]
     fn test_job_mode_from_str_is_idempotent() {
-        for s in &["replace", "fail", "queue", "isolate", "flush", "ignore-dependencies", "ignore-requirements"] {
+        for s in &[
+            "replace",
+            "fail",
+            "queue",
+            "isolate",
+            "flush",
+            "ignore-dependencies",
+            "ignore-requirements",
+        ] {
             let mode = JobMode::from_str(s);
             let mode2 = JobMode::from_str(s);
             assert_eq!(mode, mode2);

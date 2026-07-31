@@ -128,7 +128,10 @@ mod tests {
     fn test_compute_paths_defaults() {
         let paths = compute_paths();
         assert_eq!(paths.ipc_socket_path, "/run/system-alphabet/allocator.sock");
-        assert_eq!(paths.systema_fdpass_sock, "/run/system-alphabet/fdpass.sock");
+        assert_eq!(
+            paths.systema_fdpass_sock,
+            "/run/system-alphabet/fdpass.sock"
+        );
         assert_eq!(paths.systema_shell_path, "/bin/sh");
         assert_eq!(
             paths.systema_socket_handler_path,

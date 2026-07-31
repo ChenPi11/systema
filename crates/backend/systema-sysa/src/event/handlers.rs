@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use sysa::controller::UnitStatus;
 use sysa::event_bus::{Event, EventSubscriber, EventTopic};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::scheduler::{schedule_automatic_restart, should_restart_service};
 use crate::state::AllocatorHandle;
@@ -10,8 +11,13 @@ use crate::unit::types::ExitKind;
 // RestartHandler
 // ---------------------------------------------------------------------------
 
-/// Listens for process exit and service failure events, evaluates the
-/// unit's `RestartPolicy`, and schedules an automatic restart if needed.
+/// Listens for unit state changes, evaluates the unit's `RestartPolicy`
+/// on failure, and schedules an automatic restart if needed.
+///
+/// Workers report failures through the unified `unit.state_update` protocol
+/// (`active_state == "failed"`), carrying the process exit status in the
+/// `last_exit_code` extension; the per-unit restart policy is only ever
+/// consulted for units that have a `[Service]` section.
 pub struct RestartHandler {
     allocator: AllocatorHandle,
 }
@@ -25,29 +31,26 @@ impl RestartHandler {
 #[async_trait]
 impl EventSubscriber for RestartHandler {
     fn topics(&self) -> Vec<EventTopic> {
-        vec![EventTopic::ProcessExit, EventTopic::ServiceFailed]
+        vec![EventTopic::UnitStateChange]
     }
 
     async fn on_event(&self, event: &Event) {
+        if event.topic != EventTopic::UnitStateChange {
+            return;
+        }
         let unit_name = &event.unit_name;
 
-        let exit_kind = match event.topic {
-            EventTopic::ProcessExit => {
-                // Try to extract exit_code from event data.
-                serde_json::from_slice::<serde_json::Value>(&event.data)
-                    .ok()
-                    .and_then(|v| v["exit_code"].as_i64())
-                    .map(|code| {
-                        if code == 0 {
-                            ExitKind::ExitCode(0)
-                        } else {
-                            ExitKind::ExitCode(code as i32)
-                        }
-                    })
-                    .unwrap_or(ExitKind::ExitCode(-1))
+        // The event payload is the protobuf-encoded UnitStatus that the
+        // worker published in its `unit.state_update`.
+        let status = match UnitStatus::decode_from(&event.data) {
+            Some(status) => status,
+            None => {
+                warn!("EventBus: failed to decode UnitStatus for {}", unit_name);
+                return;
             }
-            EventTopic::ServiceFailed => ExitKind::ExitCode(-1),
-            _ => return,
+        };
+        let Some(exit_kind) = restart_decision(&status) else {
+            return;
         };
 
         let should = {
@@ -62,10 +65,74 @@ impl EventSubscriber for RestartHandler {
 
         if should {
             info!(
-                "EventBus: restart triggered for {} (topic={:?}, exit_kind={:?})",
-                unit_name, event.topic, exit_kind
+                "EventBus: restart triggered for {} (sub_state={:?}, exit_kind={:?})",
+                unit_name, status.sub_state, exit_kind
             );
             schedule_automatic_restart(self.allocator.clone(), unit_name);
         }
+    }
+}
+
+/// Map a worker-reported unit status to a restart-relevant exit kind.
+///
+/// Only `active_state == "failed"` counts as a failure; the `last_exit_code`
+/// extension is otherwise ignored so that a stale code carried over into
+/// later (e.g. `activating`) status updates cannot retrigger a restart.
+fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
+    if status.active_state != "failed" {
+        return None;
+    }
+    Some(
+        status
+            .extensions
+            .get("last_exit_code")
+            .and_then(|code| code.parse::<i32>().ok())
+            .map(ExitKind::ExitCode)
+            .unwrap_or(ExitKind::ExitCode(-1)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn status(active: &str, last_exit_code: Option<i32>) -> UnitStatus {
+        let mut extensions = HashMap::new();
+        if let Some(code) = last_exit_code {
+            extensions.insert("last_exit_code".to_string(), code.to_string());
+        }
+        UnitStatus {
+            unit_name: "test.service".to_string(),
+            active_state: active.to_string(),
+            sub_state: String::new(),
+            main_pid: 0,
+            invocation_id: String::new(),
+            extensions,
+        }
+    }
+
+    #[test]
+    fn failed_with_exit_code_triggers_restart_eval() {
+        assert_eq!(
+            restart_decision(&status("failed", Some(7))),
+            Some(ExitKind::ExitCode(7))
+        );
+    }
+
+    #[test]
+    fn failed_without_exit_code_falls_back_to_unknown() {
+        assert_eq!(
+            restart_decision(&status("failed", None)),
+            Some(ExitKind::ExitCode(-1))
+        );
+    }
+
+    #[test]
+    fn stale_exit_code_on_active_state_does_not_trigger() {
+        assert_eq!(restart_decision(&status("active", Some(7))), None);
+        assert_eq!(restart_decision(&status("activating", Some(7))), None);
+        assert_eq!(restart_decision(&status("inactive", Some(7))), None);
     }
 }
