@@ -186,20 +186,30 @@ pub struct SocketConfig {
 ///
 /// Every Finder (systemd, SysV, OpenRC, Runit, etc.) produces this type.
 /// System Allocator works exclusively with `UnitIR`, never with raw config files.
+///
+/// Only `id` is mandatory.  Every other field is optional so a commit can be
+/// a *partial* update: when the unit already exists in System A's runtime
+/// cache, only the fields provided here are overwritten and everything else
+/// is left untouched (e.g. a mount-table commit carrying only `mount`
+/// config never clobbers the unit's `description`).  When the unit does not
+/// exist yet, a new one is created from the provided fields; missing
+/// required fields (`unit_type`) then cause an error returned to the worker
+/// that submitted the commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitIR {
     /// Canonical unit identifier, e.g. "nginx.service", "network", "sshd".
     pub id: String,
-    pub unit_type: UnitType,
+    pub unit_type: Option<UnitType>,
     /// Human-readable description.
-    pub description: String,
+    pub description: Option<String>,
     /// Source format, e.g. "systemd", "sysv", "openrc", "runit".
-    pub source_format: String,
+    pub source_format: Option<String>,
     /// The file path this unit was loaded from, if applicable.
     pub source_path: Option<String>,
 
-    /// Dependencies on other units.
-    pub dependencies: DependencySet,
+    /// Dependencies on other units.  When provided, the whole dependency
+    /// set replaces the previous one.
+    pub dependencies: Option<DependencySet>,
 
     // Optional section-specific configs.
     pub service: Option<ServiceConfig>,
@@ -209,13 +219,13 @@ pub struct UnitIR {
     pub socket: Option<SocketConfig>,
 
     /// Conditions that must be met for the unit to start.
-    pub conditions: Vec<Condition>,
+    pub conditions: Option<Vec<Condition>>,
     /// Asserts that cause hard failure if not met.
-    pub asserts: Vec<Condition>,
+    pub asserts: Option<Vec<Condition>>,
 
     /// Install section: which targets want this unit.
-    pub wanted_by: Vec<String>,
-    pub required_by: Vec<String>,
+    pub wanted_by: Option<Vec<String>>,
+    pub required_by: Option<Vec<String>>,
 }
 
 /// A condition or assert directive.

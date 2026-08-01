@@ -15,6 +15,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use sysa::controller::UnitStatus;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
     AdminStagingOp, AdminStagingResult, Envelope, MethodResult, RegisterAck, RegisterUnits,
@@ -22,7 +23,7 @@ use sysa::proto::{
     UnitSyncReport, WorkerRegistration,
 };
 
-use crate::state::{next_request_id, AllocatorHandle, WorkerEntry};
+use crate::state::{next_request_id, AllocatorHandle, CachedUnitState, WorkerEntry};
 use sysa::event_bus::Event;
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
@@ -292,7 +293,6 @@ async fn handle_worker_session(
                                 }
                             };
                             use crate::scheduler::handle_task_result;
-                            use sysa::controller::UnitStatus;
                             let kind = alloc_for_recv
                                 .read()
                                 .task_kinds
@@ -310,16 +310,11 @@ async fn handle_worker_session(
                             if !result.result.is_empty() {
                                 if let Some(unit_status) = UnitStatus::decode_from(&result.result) {
                                     let mut state = alloc_for_recv.write();
-                                    state.unit_states.insert(
-                                        result.unit_name.clone(),
-                                        crate::state::CachedUnitState {
-                                            active_state: unit_status.active_state,
-                                            sub_state: unit_status.sub_state,
-                                            main_pid: unit_status.main_pid,
-                                            invocation_id: unit_status.invocation_id.clone(),
-                                            extensions: unit_status.extensions.clone(),
-                                        },
-                                    );
+                                    let entry = state
+                                        .unit_states
+                                        .entry(result.unit_name.clone())
+                                        .or_default();
+                                    apply_state_to_cache(entry, &unit_status);
                                 }
                             } else {
                                 update_cache_on_task_result(
@@ -779,6 +774,44 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
     }
 }
 
+/// Current time in microseconds since the Unix epoch (D-Bus type `t`).
+fn now_usec() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Merge a worker-reported `UnitStatus` into the runtime cache, tracking
+/// state-transition timestamps (systemd `ActiveEnterTimestamp` /
+/// `InactiveEnterTimestamp`) and never regressing a known invocation ID.
+fn apply_state_to_cache(entry: &mut CachedUnitState, status: &UnitStatus) {
+    let prev_active = entry.active_state == "active";
+    let prev_inactive = matches!(entry.active_state.as_str(), "inactive" | "failed");
+    let now_active = status.active_state == "active";
+    let now_inactive = matches!(status.active_state.as_str(), "inactive" | "failed");
+
+    let now = now_usec();
+    if now_active && !prev_active {
+        entry.active_enter_timestamp = now;
+        entry.inactive_enter_timestamp = 0;
+    }
+    if now_inactive && !prev_inactive {
+        entry.inactive_enter_timestamp = now;
+        entry.active_enter_timestamp = 0;
+    }
+
+    entry.active_state = status.active_state.clone();
+    entry.sub_state = status.sub_state.clone();
+    entry.main_pid = status.main_pid;
+    entry.extensions = status.extensions.clone();
+    if !status.invocation_id.is_empty() {
+        entry.invocation_id = status.invocation_id.clone();
+    } else if now_inactive {
+        entry.invocation_id.clear();
+    }
+}
+
 /// Optimistically update the runtime cache when a task completes, based on
 /// what we know the new state should be.
 fn update_cache_on_task_result(
@@ -799,11 +832,19 @@ fn update_cache_on_task_result(
                 crate::state::JobKind::Start => "start".to_string(),
                 _ => entry.sub_state.clone(),
             };
+            if entry.active_enter_timestamp == 0 {
+                entry.active_enter_timestamp = now_usec();
+            }
+            entry.inactive_enter_timestamp = 0;
         }
         crate::state::JobKind::Stop => {
             entry.active_state = "inactive".to_string();
             entry.sub_state = "dead".to_string();
             entry.invocation_id.clear();
+            entry.active_enter_timestamp = 0;
+            if entry.inactive_enter_timestamp == 0 {
+                entry.inactive_enter_timestamp = now_usec();
+            }
         }
         crate::state::JobKind::Reload => {}
     }
@@ -866,24 +907,21 @@ async fn handle_state_update(
         {
             let mut state = allocator.write();
             let dead = status.active_state == "inactive" && status.sub_state == "dead";
-            let invocation_id = if dead {
-                String::new()
-            } else {
-                status.invocation_id.clone()
-            };
-            state.unit_states.insert(
-                status.unit_name.clone(),
-                crate::state::CachedUnitState {
-                    active_state: status.active_state.clone(),
-                    sub_state: status.sub_state.clone(),
-                    main_pid: status.main_pid,
-                    invocation_id,
-                    extensions: status.extensions.clone(),
-                },
-            );
-            // Ownership ends when the unit reaches its dead state.
+            let status_c = UnitStatus::from_proto(status.clone());
+            let dispatched_id = state.invocation_ids.get(&status_c.unit_name).cloned();
+            let entry = state.unit_states.entry(status_c.unit_name.clone()).or_default();
+            apply_state_to_cache(entry, &status_c);
             if dead {
-                state.unit_owners.remove(&status.unit_name);
+                // Ownership and the invocation ID end with the unit's life.
+                state.unit_owners.remove(&status_c.unit_name);
+                state.invocation_ids.remove(&status_c.unit_name);
+            } else if entry.active_state == "active" && entry.invocation_id.is_empty() {
+                // Units that report no invocation ID (e.g. mounts discovered
+                // from mountinfo) get one from System A, mirroring systemd's
+                // assignment of an ID to every activation.
+                let id = dispatched_id.unwrap_or_else(crate::state::generate_invocation_id);
+                entry.invocation_id = id.clone();
+                state.invocation_ids.insert(status_c.unit_name.clone(), id);
             }
         }
         debug!(

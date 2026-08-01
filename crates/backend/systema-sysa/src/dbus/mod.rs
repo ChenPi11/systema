@@ -5,6 +5,7 @@
 //! - `org.freedesktop.systemd1.Unit` on each unit's object path
 
 pub mod manager;
+pub mod mount_obj;
 pub mod properties;
 pub mod service_obj;
 pub mod slice_obj;
@@ -65,7 +66,7 @@ pub(super) async fn register_unit_object(
         }
     }
 
-    // Register type-specific interface (Service / Socket / Slice).
+    // Register type-specific interface (Service / Socket / Slice / Mount).
     match unit_kind {
         Some(UnitKind::Service) => {
             let service = service_obj::ServiceObject {
@@ -77,6 +78,21 @@ pub(super) async fn register_unit_object(
                 Err(e) => {
                     warn!(
                         "Failed to register D-Bus service interface for {}: {}",
+                        unit_name, e
+                    );
+                }
+            }
+        }
+        Some(UnitKind::Mount) => {
+            let mount = mount_obj::MountObject {
+                allocator: allocator.clone(),
+                unit_name: unit_name.to_string(),
+            };
+            match conn.object_server().at(path.clone(), mount).await {
+                Ok(true) | Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to register D-Bus mount interface for {}: {}",
                         unit_name, e
                     );
                 }

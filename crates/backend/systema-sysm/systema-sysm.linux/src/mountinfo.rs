@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use sysa::controller::UnitStatus;
 use sysa::finder::UnitFinder;
 use sysa::worker_ipc::EventPublisher;
-use systema_sysf::ir::{DependencySet, MountConfig as IrMountConfig, UnitIR, UnitType};
+use systema_sysf::ir::{MountConfig as IrMountConfig, UnitIR, UnitType};
 
 use crate::state::{MountInstance, MountRegistry, MountState};
 
@@ -198,6 +198,9 @@ pub struct MountInfoMonitor {
 
 /// Build a dynamic mount `UnitIR` from mount-table facts, mirroring what a
 /// `.mount` unit file derived from the same mount point would look like.
+///
+/// Only facts the mount table actually knows are provided (`unit_type`,
+/// the mount point as description, and the `[Mount]` config).
 fn build_mount_unit_ir(
     unit_name: &str,
     mount_point: &str,
@@ -207,11 +210,11 @@ fn build_mount_unit_ir(
 ) -> UnitIR {
     UnitIR {
         id: unit_name.to_string(),
-        unit_type: UnitType::Mount,
-        description: format!("Mounted at {}", mount_point),
-        source_format: "dynamic".to_string(),
+        unit_type: Some(UnitType::Mount),
+        description: Some(mount_point.to_string()),
+        source_format: Some("dynamic".to_string()),
         source_path: None,
-        dependencies: DependencySet::default(),
+        dependencies: None,
         service: None,
         mount: Some(IrMountConfig {
             what: what.to_string(),
@@ -223,10 +226,10 @@ fn build_mount_unit_ir(
         automount: None,
         timer: None,
         socket: None,
-        conditions: vec![],
-        asserts: vec![],
-        wanted_by: vec![],
-        required_by: vec![],
+        conditions: None,
+        asserts: None,
+        wanted_by: None,
+        required_by: None,
     }
 }
 
@@ -641,8 +644,11 @@ mod tests {
     fn build_mount_unit_ir_maps_mount_facts() {
         let ir = build_mount_unit_ir("tmp.mount", "/tmp", "tmpfs", "tmpfs", "rw,nosuid");
         assert_eq!(ir.id, "tmp.mount");
-        assert_eq!(ir.unit_type, UnitType::Mount);
-        assert_eq!(ir.source_format, "dynamic");
+        assert_eq!(ir.unit_type, Some(UnitType::Mount));
+        assert_eq!(ir.source_format.as_deref(), Some("dynamic"));
+        // The description is the mount point path itself (e.g. "/tmp"),
+        // not a prose label.
+        assert_eq!(ir.description.as_deref(), Some("/tmp"));
         let mnt = ir.mount.unwrap();
         assert_eq!(mnt.what, "tmpfs");
         assert_eq!(mnt.where_, "/tmp");

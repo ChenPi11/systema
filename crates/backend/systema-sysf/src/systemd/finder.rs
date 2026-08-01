@@ -47,20 +47,20 @@ impl Finder for SystemdFinder {
 fn convert_unit_file(uf: &UnitFile) -> UnitIR {
     UnitIR {
         id: uf.name.clone(),
-        unit_type: convert_unit_kind(&uf.kind),
-        description: uf.unit.description.clone(),
-        source_format: "systemd".to_string(),
+        unit_type: Some(convert_unit_kind(&uf.kind)),
+        description: Some(uf.unit.description.clone()),
+        source_format: Some("systemd".to_string()),
         source_path: None,
-        dependencies: convert_dependencies(uf),
+        dependencies: Some(convert_dependencies(uf)),
         service: uf.service.as_ref().map(convert_service),
         mount: uf.mount.as_ref().map(convert_mount),
         automount: uf.automount.as_ref().map(convert_automount),
         timer: uf.timer.as_ref().map(convert_timer),
         socket: uf.socket.as_ref().map(convert_socket),
-        conditions: convert_conditions(uf),
-        asserts: convert_asserts(uf),
-        wanted_by: uf.install.wanted_by.iter().cloned().collect(),
-        required_by: uf.install.required_by.iter().cloned().collect(),
+        conditions: Some(convert_conditions(uf)),
+        asserts: Some(convert_asserts(uf)),
+        wanted_by: Some(uf.install.wanted_by.iter().cloned().collect()),
+        required_by: Some(uf.install.required_by.iter().cloned().collect()),
     }
 }
 

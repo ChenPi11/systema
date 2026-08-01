@@ -45,7 +45,12 @@ impl UnitObject {
 
     #[zbus(property)]
     fn documentation(&self) -> Vec<String> {
-        Vec::new()
+        self.allocator
+            .read()
+            .units
+            .get(&self.unit_name)
+            .map(|u| u.unit.documentation.clone())
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
@@ -295,19 +300,44 @@ impl UnitObject {
     }
 
     #[zbus(property)]
-    fn invocation_id(&self) -> String {
+    fn active_enter_timestamp(&self) -> u64 {
+        self.allocator
+            .read()
+            .unit_states
+            .get(&self.unit_name)
+            .map(|s| s.active_enter_timestamp)
+            .unwrap_or(0)
+    }
+
+    #[zbus(property)]
+    fn inactive_enter_timestamp(&self) -> u64 {
+        self.allocator
+            .read()
+            .unit_states
+            .get(&self.unit_name)
+            .map(|s| s.inactive_enter_timestamp)
+            .unwrap_or(0)
+    }
+
+    #[zbus(property)]
+    fn invocation_id(&self) -> Vec<u8> {
         let state = self.allocator.read();
         // The worker-reported ID is authoritative (it is what the running
         // activation was actually started with).  Until the worker reports
         // (or once it has cleared it), fall back to the ID System A
-        // generated when dispatching the Start/Restart job.
-        state
+        // generated when dispatching the Start/Restart job (or when the
+        // unit first became active).
+        let id = state
             .unit_states
             .get(&self.unit_name)
             .map(|s| s.invocation_id.clone())
             .filter(|id| !id.is_empty())
             .or_else(|| state.invocation_ids.get(&self.unit_name).cloned())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // systemd exposes InvocationID as `ay` (16 bytes, 128-bit UUID).
+        uuid::Uuid::parse_str(&id)
+            .map(|u| u.as_bytes().to_vec())
+            .unwrap_or_else(|_| vec![0u8; 16])
     }
 
     // ------------------------------------------------------------------
@@ -348,19 +378,27 @@ mod tests {
         {
             let mut s = alloc.write();
             s.invocation_ids
-                .insert("demo.service".to_string(), "dispatched-id".to_string());
+                .insert("demo.service".to_string(), "11111111111111111111111111111111".to_string());
             s.unit_states.insert(
                 "demo.service".to_string(),
                 CachedUnitState {
                     active_state: "active".to_string(),
                     sub_state: "running".to_string(),
                     main_pid: 42,
-                    invocation_id: "reported-id".to_string(),
+                    invocation_id: "22222222222222222222222222222222".to_string(),
+                    active_enter_timestamp: 0,
+                    inactive_enter_timestamp: 0,
                     extensions: Default::default(),
                 },
             );
         }
-        assert_eq!(obj(alloc).invocation_id(), "reported-id");
+        assert_eq!(
+            obj(alloc).invocation_id(),
+            uuid::Uuid::parse_str("22222222222222222222222222222222")
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        );
     }
 
     #[test]
@@ -369,8 +407,14 @@ mod tests {
         alloc
             .write()
             .invocation_ids
-            .insert("demo.service".to_string(), "dispatched-id".to_string());
-        assert_eq!(obj(alloc).invocation_id(), "dispatched-id");
+            .insert("demo.service".to_string(), "11111111111111111111111111111111".to_string());
+        assert_eq!(
+            obj(alloc).invocation_id(),
+            uuid::Uuid::parse_str("11111111111111111111111111111111")
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        );
     }
 
     #[test]
@@ -383,9 +427,31 @@ mod tests {
                 sub_state: "running".to_string(),
                 main_pid: 42,
                 invocation_id: String::new(),
+                active_enter_timestamp: 0,
+                inactive_enter_timestamp: 0,
                 extensions: Default::default(),
             },
         );
-        assert_eq!(obj(alloc).invocation_id(), "");
+        assert_eq!(obj(alloc).invocation_id(), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn state_timestamps_are_exposed() {
+        let alloc = handle();
+        alloc.write().unit_states.insert(
+            "demo.service".to_string(),
+            CachedUnitState {
+                active_state: "active".to_string(),
+                sub_state: "running".to_string(),
+                main_pid: 42,
+                invocation_id: String::new(),
+                active_enter_timestamp: 1234,
+                inactive_enter_timestamp: 0,
+                extensions: Default::default(),
+            },
+        );
+        let obj = obj(alloc);
+        assert_eq!(obj.active_enter_timestamp(), 1234);
+        assert_eq!(obj.inactive_enter_timestamp(), 0);
     }
 }

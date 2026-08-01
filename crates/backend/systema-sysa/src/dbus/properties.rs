@@ -21,6 +21,7 @@ use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
 use super::manager::ManagerInterface;
+use super::mount_obj::MountObject;
 use super::service_obj::ServiceObject;
 use super::socket_obj::SocketObject;
 use super::unit_obj::UnitObject;
@@ -76,6 +77,23 @@ impl Properties {
                     .map(|u| u.kind.clone());
                 if matches!(kind, Some(UnitKind::Socket)) {
                     let obj = SocketObject {
+                        allocator: self.allocator.clone(),
+                        unit_name: self.unit_name.clone(),
+                    };
+                    Some(obj.get_all().await)
+                } else {
+                    None
+                }
+            }
+            "org.freedesktop.systemd1.Mount" => {
+                let kind = self
+                    .allocator
+                    .read()
+                    .units
+                    .get(&self.unit_name)
+                    .map(|u| u.kind.clone());
+                if matches!(kind, Some(UnitKind::Mount)) {
+                    let obj = MountObject {
                         allocator: self.allocator.clone(),
                         unit_name: self.unit_name.clone(),
                     };
@@ -140,6 +158,15 @@ impl Properties {
             }
             Some(UnitKind::Socket) => {
                 let obj = SocketObject {
+                    allocator: self.allocator.clone(),
+                    unit_name: self.unit_name.clone(),
+                };
+                if let Ok(props) = obj.get_all().await {
+                    result.extend(props);
+                }
+            }
+            Some(UnitKind::Mount) => {
+                let obj = MountObject {
                     allocator: self.allocator.clone(),
                     unit_name: self.unit_name.clone(),
                 };
