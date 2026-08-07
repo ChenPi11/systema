@@ -275,6 +275,19 @@ message TimerConfig {
     bool persistent = 10;
 }
 
+// Configuration for a .device unit, sent inside UnitConfig.
+message DeviceConfig {
+    // Rule: the basename of the device node as seen in /dev,
+    // e.g. "sda"; DeviceName=.
+    string device_name = 1;
+    // Rule: a path in /dev, e.g. "/dev/sda"; DevicePath=.
+    string device_path = 2;
+    // Rule: a sysfs path of the device, e.g. "/sys/devices/.../sda"; SysfsPath=.
+    string sysfs_path = 3;
+    // Rule: sysfs attribute matches in "attr=value" form; Property=.
+    repeated string property = 4;
+}
+
 // Sent by System C (the timer worker) to System A when a timer fires,
 // asking System A to activate the timer's target unit.
 message TimerFired {
@@ -300,6 +313,8 @@ message UnitConfig {
     AutomountConfig automount = 6;
     // For timer units.
     TimerConfig timer = 7;
+    // For device units.
+    DeviceConfig device = 8;
 }
 
 message ServiceConfig {

@@ -23,7 +23,7 @@ use crate::unit::types::{
     ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitSection,
 };
 use sysa::proto::{
-    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig,
+    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig, DeviceConfig,
     UnitConfig,
 };
 
@@ -1023,6 +1023,13 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         persistent: t.persistent,
     });
 
+    let device = uf.device.as_ref().map(|d| DeviceConfig {
+        device_name: d.device_name.clone(),
+        device_path: d.device_path.clone(),
+        sysfs_path: d.sysfs_path.clone(),
+        property: d.property.clone(),
+    });
+
     UnitConfig {
         unit_name: uf.name.clone(),
         description: uf.unit.description.clone(),
@@ -1031,6 +1038,7 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         mount,
         automount,
         timer,
+        device,
     }
 }
 
