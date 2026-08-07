@@ -2,9 +2,8 @@
 //!
 //! The service execution worker for System Alphabet. Responsibilities:
 //! - Connect to System A's IPC socket and register as the "service" worker.
-//! - Receive `TaskDispatch` messages from System A.
 //! - Execute service processes (fork/exec), track their lifecycle.
-//! - Report `TaskResult` and publish `EventPublish` messages back to System A.
+//! - Report `method.result` and `unit.state_update` messages back to System A.
 
 mod controller;
 mod ipc;

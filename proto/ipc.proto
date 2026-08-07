@@ -11,7 +11,7 @@ message Envelope {
     string source = 2;
     // Recipient identifier, e.g. "system-s" or "system-a".
     string target = 3;
-    // Method/event name, e.g. "task.dispatch", "event.publish", "worker.register".
+    // Method/event name, e.g. "worker.register", "method.call".
     string method = 4;
     // Serialized payload (nested protobuf message).
     bytes payload = 5;
@@ -25,14 +25,8 @@ message WorkerRegistration {
     repeated string unit_types = 2;
 }
 
-// Sent by System A to a System Worker to request a state transition.
-// (Retired: TaskDispatch / TaskKind / TaskResult / TaskResultKind /
-// EventPublish / StateQuery / StateQueryAll have been replaced by the
-// generic MethodCall / MethodResult protocol below.)
-
 // ──────────────────────────────────────────────────────────────────
-// Generic method call / result (replaces TaskDispatch, StateQuery,
-// StateQueryAll, StateSyncRequest, and their responses).
+// Generic method call / result
 // ──────────────────────────────────────────────────────────────────
 
 // Sent by System A to invoke a method on a unit managed by the worker.
@@ -91,10 +85,7 @@ message RegisterAck {
 }
 
 // Sent by a Worker to System A to report runtime state changes for one or
-// more units.  This is the unified state-update channel (replaces the
-// retired event.publish messages such as mount.status_update,
-// mount.table_update, mount.state_change, mount.done, automount.done,
-// service.started, process.exit and service.failed).
+// more units.  This is the unified state-update channel.
 message UnitStateUpdate {
     // States of the affected units (may be empty for a pure ACK probe).
     repeated UnitStatus units = 1;

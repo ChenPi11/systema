@@ -2,9 +2,8 @@
 //!
 //! The target-activation worker for System Alphabet. Responsibilities:
 //! - Connect to System A's IPC socket and register as the "target" worker.
-//! - Receive `TaskDispatch` messages for target units.
 //! - Activate/deactivate targets (no external processes, just state tracking).
-//! - Report `TaskResult` messages back to System A.
+//! - Report `method.call` results back to System A.
 
 mod controller;
 mod ipc;

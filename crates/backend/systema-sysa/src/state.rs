@@ -241,7 +241,7 @@ pub struct AllocatorState {
     /// Registered workers keyed by worker_id.
     pub workers: HashMap<String, WorkerEntry>,
     /// Maps task_id (IPC level) → JobKind so we can correctly update state
-    /// when a TaskResult arrives.
+    /// when a method.result arrives.
     pub task_kinds: HashMap<u64, JobKind>,
     /// Channel to notify the D-Bus layer when a job completes so it can emit
     /// the `JobRemoved` signal.  Set by the D-Bus server at startup.
