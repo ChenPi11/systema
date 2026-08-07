@@ -105,7 +105,7 @@ fn send_fd_sync(sock_fd: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd)
         msghdr.msg_iov = &mut iov;
         msghdr.msg_iovlen = 1;
         msghdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msghdr.msg_controllen = cmsg_buf.len();
+        msghdr.msg_controllen = cmsg_buf.len() as _;
 
         let cmsg = libc::CMSG_FIRSTHDR(&msghdr);
         if cmsg.is_null() {
@@ -114,9 +114,9 @@ fn send_fd_sync(sock_fd: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd)
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         let fd_size = std::mem::size_of::<libc::c_int>();
-        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as u32) as libc::size_t;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as u32) as _;
         std::ptr::write(libc::CMSG_DATA(cmsg) as *mut libc::c_int, fd);
-        msghdr.msg_controllen = libc::CMSG_SPACE(fd_size as u32) as usize;
+        msghdr.msg_controllen = libc::CMSG_SPACE(fd_size as u32) as _;
 
         let ret = libc::sendmsg(sock_fd, &msghdr, 0);
         if ret < 0 {
@@ -144,7 +144,7 @@ fn recv_fd_sync(sock_fd: std::os::unix::io::RawFd) -> Result<std::os::unix::io::
         msghdr.msg_iov = &mut iov;
         msghdr.msg_iovlen = 1;
         msghdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msghdr.msg_controllen = cmsg_buf.len();
+        msghdr.msg_controllen = cmsg_buf.len() as _;
 
         let ret = libc::recvmsg(sock_fd, &mut msghdr, 0);
         if ret < 0 {
