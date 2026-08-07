@@ -61,6 +61,18 @@ pub async fn do_mount(
             .context("set_permissions for mount point failed")?;
     }
 
+    // Idempotency: skip if already mounted (matches systemd behavior).
+    if crate::mounttable::mount_point_is_mounted(&mount_point) {
+        info!("Already mounted, skipping: {}", mount_point);
+        {
+            let mut reg = registry.lock();
+            if let Some(inst) = reg.get_mut(unit_name) {
+                inst.state = MountState::Mounted;
+            }
+        }
+        return Ok(());
+    }
+
     // Build mount command.
     let mut cmd = Command::new("mount");
 
@@ -120,7 +132,11 @@ pub async fn do_mount(
         } else {
             reg.insert(
                 unit_name.to_string(),
-                MountInstance::new(mount_point.clone()),
+                MountInstance::new(
+                    unit_name.to_string(),
+                    mount_point.clone(),
+                    config.what.clone(),
+                ),
             );
             if let Some(inst) = reg.get_mut(unit_name) {
                 inst.state = MountState::Mounted;

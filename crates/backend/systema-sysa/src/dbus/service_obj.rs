@@ -113,4 +113,24 @@ impl ServiceObject {
             .map(|s| s.notify_access.clone())
             .unwrap_or_else(|| "none".to_string())
     }
+
+    #[zbus(property)]
+    fn restart_randomized_delay_u_sec(&self) -> u64 {
+        0
+    }
+
+    #[zbus(property)]
+    fn l_u_o_session(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    #[zbus(property)]
+    fn c_p_u_set_partition(&self) -> String {
+        "member".to_string()
+    }
+
+    #[zbus(property)]
+    fn o_o_m_rules(&self) -> Vec<String> {
+        Vec::new()
+    }
 }

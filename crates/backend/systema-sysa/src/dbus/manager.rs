@@ -293,6 +293,102 @@ impl ManagerInterface {
         }
     }
 
+    /// Enqueue jobs for several units in a single call, mirroring systemd's
+    /// `EnqueueUnitJobMany`.  Every requested unit receives the same job type
+    /// and mode.  `flags` is reserved for future use and must be 0.
+    ///
+    /// Returns one `(job id, job path, unit id, unit path, job type)` entry
+    /// per requested unit.  systemd enqueues all units in one transaction so
+    /// `After=`/`Before=` ordering between them is honoured; System A enqueues
+    /// sequentially, which preserves the ordering for the single-unit case.
+    async fn enqueue_unit_job_many(
+        &self,
+        units: Vec<String>,
+        job_type: &str,
+        job_mode: &str,
+        flags: u64,
+    ) -> zbus::fdo::Result<Vec<(u32, OwnedObjectPath, String, OwnedObjectPath, String)>> {
+        info!(
+            "D-Bus EnqueueUnitJobMany: {} unit(s), job_type={}, job_mode={}",
+            units.len(),
+            job_type,
+            job_mode
+        );
+        if units.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(l10n::fmt(
+                l10n::t_("At least one unit name is required."),
+                &[],
+            )));
+        }
+        if flags != 0 {
+            return Err(zbus::fdo::Error::InvalidArgs(l10n::fmt(
+                l10n::t_("Flags are not supported yet and must be 0."),
+                &[],
+            )));
+        }
+        let kind = match job_type {
+            "start" => JobKind::Start,
+            "stop" => JobKind::Stop,
+            "restart" => JobKind::Restart,
+            "reload" => JobKind::Reload,
+            _ => {
+                return Err(zbus::fdo::Error::InvalidArgs(l10n::fmt(
+                    l10n::t_("Invalid job type: {job_type}"),
+                    &[("job_type", job_type)],
+                )))
+            }
+        };
+        let mode = JobMode::from_str(job_mode);
+
+        let alloc = self.allocator.clone();
+        let mut jobs = Vec::with_capacity(units.len());
+        for name in units {
+            // Load missing units first, mirroring StartUnit.
+            let needs_load = !alloc.read().units.contains_key(&name);
+            if needs_load {
+                let alloc2 = alloc.clone();
+                let name2 = name.clone();
+                tokio::task::spawn_blocking(move || load_unit_sync(&alloc2, &name2))
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
+
+            // Ensure the per-unit D-Bus object is registered before returning.
+            self.ensure_unit_object(&name).await;
+
+            let job_id = scheduler::enqueue_job(alloc.clone(), &name, kind, mode)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+            // Track the desired state like the single-unit methods do.
+            match kind {
+                JobKind::Start | JobKind::Restart => {
+                    alloc
+                        .write()
+                        .desired
+                        .insert(name.clone(), DesiredState::Active);
+                }
+                JobKind::Stop => {
+                    alloc
+                        .write()
+                        .desired
+                        .insert(name.clone(), DesiredState::Inactive);
+                }
+                JobKind::Reload => {}
+            }
+
+            jobs.push((
+                job_id as u32,
+                job_object_path(job_id),
+                name.clone(),
+                unit_object_path(&name),
+                kind.as_str().to_string(),
+            ));
+        }
+        Ok(jobs)
+    }
+
     // ------------------------------------------------------------------
     // Listing methods
     // ------------------------------------------------------------------
@@ -882,6 +978,61 @@ impl ManagerInterface {
     #[zbus(property)]
     fn timer_slack_n_sec(&self) -> u64 {
         50_000
+    }
+
+    #[zbus(property)]
+    fn shutdown_finish_timestamp(&self) -> u64 {
+        0
+    }
+
+    #[zbus(property)]
+    fn previous_shutdown_start_timestamp(&self) -> u64 {
+        0
+    }
+
+    #[zbus(property)]
+    fn previous_shutdown_finish_timestamp(&self) -> u64 {
+        0
+    }
+
+    #[zbus(property)]
+    fn previous_shutdown_late_start_timestamp(&self) -> u64 {
+        0
+    }
+
+    #[zbus(property)]
+    fn previous_shutdown_late_finish_timestamp(&self) -> u64 {
+        0
+    }
+
+    #[zbus(property)]
+    fn k_execs_count(&self) -> u32 {
+        0
+    }
+
+    #[zbus(property)]
+    fn reload_count(&self) -> u64 {
+        0
+    }
+
+    #[zbus(property)]
+    fn event_loop_rate_limit_interval_u_sec(&self) -> u64 {
+        1_000_000 // 1 second, matching systemd's default
+    }
+
+    #[zbus(property)]
+    fn event_loop_rate_limit_burst(&self) -> u32 {
+        50_000 // matching systemd's default
+    }
+
+    #[zbus(property)]
+    fn c_p_u_set_partition(&self) -> &str {
+        "member"
+    }
+
+    #[zbus(property)]
+    fn o_o_m_rules(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 

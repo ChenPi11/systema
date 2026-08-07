@@ -1,6 +1,7 @@
 mod controller;
 mod ipc;
 mod mount;
+mod mounttable;
 mod state;
 
 use anyhow::Result;

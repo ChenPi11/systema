@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 sysa = { path = "../../../libsysa" }
+systema-sysf = { path = "../../systema-sysf" }
+systema-sysm-common = { path = "../systema-sysm-common" }
 
 tokio.workspace = true
 tokio-util.workspace = true
@@ -26,3 +28,5 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
+
+libc = "0.2"

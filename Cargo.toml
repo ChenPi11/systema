@@ -6,6 +6,7 @@ members = [
     "crates/backend/systema-syss",
     "crates/backend/systema-syst",
     "crates/backend/systema-sysk",
+    "crates/backend/systema-sysm/systema-sysm-common",
     "crates/backend/systema-sysm/systema-sysm.unix",
     "crates/backend/systema-sysm/systema-sysm.linux",
     "crates/sysa-pager",

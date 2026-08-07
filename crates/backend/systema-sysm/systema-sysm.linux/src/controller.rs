@@ -444,9 +444,7 @@ impl UnitController for MountController {
         // Discover already-mounted filesystems so the connect-time full
         // snapshot includes them even if the mountinfo monitor has not run
         // its first poll yet (e.g. tmp.mount for the kernel-mounted /tmp).
-        if let Ok(snapshot) = mountinfo::MountInfoSnapshot::refresh() {
-            mountinfo::reconcile_mount_registry(&self.mount_registry, &snapshot);
-        }
+        mountinfo::refresh_registry(&self.mount_registry);
         let mut units = Vec::new();
         {
             let guard = self.mount_registry.lock();

@@ -36,4 +36,29 @@ impl SocketObject {
     fn control_pid(&self) -> u32 {
         0
     }
+
+    #[zbus(property)]
+    fn x_attr_entry_point(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    #[zbus(property)]
+    fn x_attr_listen(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    #[zbus(property)]
+    fn x_attr_accept(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    #[zbus(property)]
+    fn c_p_u_set_partition(&self) -> String {
+        "member".to_string()
+    }
+
+    #[zbus(property)]
+    fn o_o_m_rules(&self) -> Vec<String> {
+        Vec::new()
+    }
 }

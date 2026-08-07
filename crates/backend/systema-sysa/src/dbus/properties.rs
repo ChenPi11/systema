@@ -23,6 +23,7 @@ use std::sync::Arc;
 use super::manager::ManagerInterface;
 use super::mount_obj::MountObject;
 use super::service_obj::ServiceObject;
+use super::slice_obj::SliceObject;
 use super::socket_obj::SocketObject;
 use super::unit_obj::UnitObject;
 use crate::state::AllocatorHandle;
@@ -110,8 +111,7 @@ impl Properties {
                     .get(&self.unit_name)
                     .map(|u| u.kind.clone());
                 if matches!(kind, Some(UnitKind::Slice)) {
-                    // SliceObject has no properties, but return an empty map rather than None.
-                    Some(Ok(HashMap::new()))
+                    Some(SliceObject.get_all().await)
                 } else {
                     None
                 }
@@ -246,6 +246,7 @@ impl Properties {
             iface_name.as_str(),
             "org.freedesktop.systemd1.Unit"
                 | "org.freedesktop.systemd1.Service"
+                | "org.freedesktop.systemd1.Mount"
                 | "org.freedesktop.systemd1.Socket"
                 | "org.freedesktop.systemd1.Slice"
                 | "org.freedesktop.DBus.Properties"
@@ -277,6 +278,13 @@ impl Properties {
                 };
                 obj.get(&prop_name).await
             }
+            "org.freedesktop.systemd1.Mount" => {
+                let obj = MountObject {
+                    allocator: self.allocator.clone(),
+                    unit_name: self.unit_name.clone(),
+                };
+                obj.get(&prop_name).await
+            }
             "org.freedesktop.systemd1.Socket" => {
                 let obj = SocketObject {
                     allocator: self.allocator.clone(),
@@ -284,7 +292,7 @@ impl Properties {
                 };
                 obj.get(&prop_name).await
             }
-            "org.freedesktop.systemd1.Slice" => None,
+            "org.freedesktop.systemd1.Slice" => SliceObject.get(&prop_name).await,
             // Standard built-in interfaces have no properties.
             "org.freedesktop.DBus.Properties"
             | "org.freedesktop.DBus.Peer"
