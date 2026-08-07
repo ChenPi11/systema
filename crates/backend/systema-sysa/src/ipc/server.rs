@@ -19,10 +19,11 @@ use sysa::controller::UnitStatus;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
     AdminStagingOp, AdminStagingResult, Envelope, MethodResult, RegisterAck, RegisterUnits,
-    StagingAreaEntry, StagingQueryResult, UnitRegistrationAck, UnitStateUpdate, UnitStateUpdateAck,
-    UnitSyncReport, WorkerRegistration,
+    StagingAreaEntry, StagingQueryResult, TimerFired, UnitRegistrationAck, UnitStateUpdate,
+    UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
+use crate::dbus::manager::load_unit_sync;
 use crate::state::{next_request_id, AllocatorHandle, CachedUnitState, WorkerEntry};
 use sysa::event_bus::Event;
 
@@ -381,6 +382,66 @@ async fn handle_worker_session(
                                 "Worker '{}' replied to unit.sync_request without a snapshot",
                                 worker_id_evt
                             ),
+                        }
+                        continue;
+                    }
+
+                    if env.method == "timer.fired" {
+                        let fired = match TimerFired::decode(env.payload.as_slice()) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(
+                                    "TimerFired decode from worker '{}': {} — disconnecting",
+                                    worker_id_recv, e
+                                );
+                                break;
+                            }
+                        };
+                        let target = fired.target_unit.clone();
+                        info!(
+                            "Timer '{}' fired (elapse={}) — triggering '{}'",
+                            fired.timer_unit, fired.elapse_epoch, target
+                        );
+
+                        // Ensure the target unit is loaded before enqueueing.
+                        if !alloc_for_recv.read().units.contains_key(&target) {
+                            let alloc2 = alloc_for_recv.clone();
+                            let name2 = target.clone();
+                            let loaded =
+                                tokio::task::spawn_blocking(move || load_unit_sync(&alloc2, &name2))
+                                    .await;
+                            match loaded {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        "Failed to load timer-triggered unit '{}': {}",
+                                        target, e
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to load timer-triggered unit '{}': {}",
+                                        target, e
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        match crate::scheduler::enqueue_start_with_mode(
+                            alloc_for_recv.clone(),
+                            &target,
+                            crate::state::JobMode::Replace,
+                        )
+                        .await
+                        {
+                            Ok(job_id) => {
+                                info!("Enqueued job {job_id} for timer-triggered '{target}'");
+                            }
+                            Err(e) => {
+                                warn!("Cannot start timer-triggered unit '{}': {}", target, e);
+                            }
                         }
                         continue;
                     }

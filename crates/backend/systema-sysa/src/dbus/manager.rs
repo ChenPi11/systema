@@ -1041,7 +1041,7 @@ impl ManagerInterface {
 // --------------------------------------------------------------------------
 
 /// Synchronously load a unit into the allocator state (for use from blocking tasks).
-pub(super) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<()> {
+pub(crate) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<()> {
     use crate::unit::parser::parse_unit;
 
     // Check all search paths.

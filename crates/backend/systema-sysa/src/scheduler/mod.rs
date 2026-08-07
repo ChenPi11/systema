@@ -23,7 +23,8 @@ use crate::unit::types::{
     ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitSection,
 };
 use sysa::proto::{
-    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, UnitConfig,
+    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig,
+    UnitConfig,
 };
 
 /// Enqueue a stop job for the named unit.
@@ -1009,6 +1010,19 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         directory_mode: a.directory_mode.clone(),
     });
 
+    let timer = uf.timer.as_ref().map(|t| TimerConfig {
+        on_active_sec: t.on_active_sec,
+        on_boot_sec: t.on_boot_sec,
+        on_startup_sec: t.on_startup_sec,
+        on_unit_active_sec: t.on_unit_active_sec,
+        on_unit_inactive_sec: t.on_unit_inactive_sec,
+        on_calendar: t.on_calendar.clone(),
+        accuracy_sec: t.accuracy_sec,
+        randomized_delay_sec: t.randomized_delay_sec,
+        unit: t.unit.clone(),
+        persistent: t.persistent,
+    });
+
     UnitConfig {
         unit_name: uf.name.clone(),
         description: uf.unit.description.clone(),
@@ -1016,6 +1030,7 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         socket,
         mount,
         automount,
+        timer,
     }
 }
 

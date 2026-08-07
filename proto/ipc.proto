@@ -254,6 +254,38 @@ message AutomountConfig {
     string directory_mode = 4;
 }
 
+// Configuration for a .timer unit, sent inside UnitConfig.
+message TimerConfig {
+    // Monotonic triggers (seconds relative to an anchor); unset = disabled.
+    optional uint32 on_active_sec = 1;        // after this timer unit was activated
+    optional uint32 on_boot_sec = 2;          // after the machine booted
+    optional uint32 on_startup_sec = 3;        // after the service manager started
+    optional uint32 on_unit_active_sec = 4;    // periodically, after the trigger unit became active
+    optional uint32 on_unit_inactive_sec = 5;  // periodically, after the trigger unit became inactive
+    // Wall-clock triggers in systemd OnCalendar= syntax (repeat forever).
+    repeated string on_calendar = 6;
+    // Trigger tolerance (AccuracySec=), in seconds; default 60.
+    uint32 accuracy_sec = 7;
+    // Random delay added to each elapse (RandomizedDelaySec=), in seconds.
+    uint32 randomized_delay_sec = 8;
+    // Unit to activate when the timer fires (Unit=).  Defaults to the
+    // sibling ".service" unit with the same base name.
+    string unit = 9;
+    // Catch up on missed calendar elapses after (re)start (Persistent=).
+    bool persistent = 10;
+}
+
+// Sent by System C (the timer worker) to System A when a timer fires,
+// asking System A to activate the timer's target unit.
+message TimerFired {
+    // The timer unit that fired, e.g. "backup.timer".
+    string timer_unit = 1;
+    // The unit to activate, e.g. "backup.service".
+    string target_unit = 2;
+    // When the trigger elapse occurred (unix epoch seconds).
+    uint64 elapse_epoch = 3;
+}
+
 // Minimal unit configuration sent from System A to System Workers.
 message UnitConfig {
     string unit_name = 1;
@@ -266,6 +298,8 @@ message UnitConfig {
     MountConfig mount = 5;
     // For automount units.
     AutomountConfig automount = 6;
+    // For timer units.
+    TimerConfig timer = 7;
 }
 
 message ServiceConfig {

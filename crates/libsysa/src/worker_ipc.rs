@@ -118,6 +118,40 @@ impl EventPublisher {
             error!("Giving up on unit.state_update after {MAX_ATTEMPTS} attempts");
         });
     }
+/// Send a fire-and-forget envelope with the given method name and payload
+    /// (no ACK handling).  Used for one-way notifications such as the
+    /// `timer.fired` message sent by the timer worker.
+    pub fn send_envelope<P>(&self, method: &str, payload: P)
+    where
+        P: ProstMessage + Send + 'static,
+    {
+        let publisher = self.clone();
+        let method = method.to_string();
+        tokio::spawn(async move {
+            let request_id = publisher.next_request_id.fetch_add(1, Ordering::Relaxed);
+            if request_id == 0 {
+                return;
+            }
+            let env = match make_envelope(
+                request_id,
+                &publisher.worker_id,
+                "system-a",
+                &method,
+                payload,
+            )
+            .and_then(encode_envelope)
+            {
+                Ok(env) => env,
+                Err(e) => {
+                    error!("Failed to encode {method} envelope: {}", e);
+                    return;
+                }
+            };
+            if publisher.tx.send(env).is_err() {
+                warn!("Outgoing channel closed; cannot send {method}");
+            }
+        });
+    }
 }
 
 fn encode_envelope(env: Envelope) -> Result<bytes::Bytes> {
