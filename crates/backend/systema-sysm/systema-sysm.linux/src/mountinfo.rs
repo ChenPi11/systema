@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use sysa::controller::UnitStatus;
 use sysa::worker_ipc::EventPublisher;
 
-use crate::state::{MountInstance, MountRegistry, MountState};
+use crate::linux::state::{MountInstance, MountRegistry, MountState};
 
 /// A parsed entry from `/proc/self/mountinfo`.
 #[derive(Debug, Clone)]

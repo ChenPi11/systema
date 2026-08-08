@@ -1,10 +1,10 @@
-use crate::automount::{
+use crate::linux::automount::{
     autofs_send_fail, autofs_send_ready, automount_enter_dead, automount_enter_waiting,
     companion_mount_unit, AutomountTrigger, TriggerEvent,
 };
-use crate::mount::{do_mount, do_remount, do_umount};
-use crate::mountinfo;
-use crate::state::{AutomountRegistry, AutomountState, MountRegistry, MountState};
+use crate::linux::mount::{do_mount, do_remount, do_umount};
+use crate::linux::mountinfo;
+use crate::linux::state::{AutomountRegistry, AutomountState, MountRegistry, MountState};
 use anyhow::Result;
 use std::collections::HashMap;
 use sysa::controller::{decode_unit_config, UnitController, UnitStatus};

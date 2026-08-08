@@ -6,8 +6,8 @@ use sysa::proto::MountConfig;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::mountinfo;
-use crate::state::{MountInstance, MountRegistry, MountState};
+use crate::linux::mountinfo;
+use crate::linux::state::{MountInstance, MountRegistry, MountState};
 
 pub async fn do_mount(
     registry: MountRegistry,

@@ -244,6 +244,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
 }
 
 /// Bind a Unix stream socket with an abstract address (@ → \0 prefix).
+#[cfg(target_os = "linux")]
 fn new_socket_fd() -> Result<RawFd> {
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -392,7 +393,7 @@ fn create_fifo(path: &str, mode: &str) -> Result<()> {
     } else {
         u32::from_str_radix(mode.trim_start_matches('0'), 8).unwrap_or(0o644)
     };
-    let ret = unsafe { libc::mkfifo(cpath.as_ptr(), mode_int) };
+    let ret = unsafe { libc::mkfifo(cpath.as_ptr(), mode_int as libc::mode_t) };
     if ret < 0 {
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::AlreadyExists {

@@ -1,59 +1,23 @@
-mod automount;
-mod controller;
-mod ipc;
-mod mount;
-mod mountinfo;
-mod state;
+//! System M — System Mount Worker for Linux.
+//!
+//! This worker is Linux-only.  On other platforms the whole implementation
+//! is compiled out (gated behind `cfg(target_os = "linux")`) and the binary
+//! becomes an inert stub, so building the workspace never fails and never
+//! compiles Linux-only code.  The dependencies in Cargo.toml are gated the
+//! same way, so on non-Linux platforms this crate is a dependency-free stub.
 
-use anyhow::Result;
-use clap::Parser;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+#[cfg(target_os = "linux")]
+mod linux;
 
-#[derive(Parser)]
-#[command(
-    name = "systema-sysm",
-    about = "System M — System Mount Worker (Linux)"
-)]
-struct Args {
-    #[arg(long, short = 'D', help = "Enable debug-level logging")]
-    debug: bool,
-
-    #[arg(
-        long,
-        default_value = "info",
-        help = "Log level (trace, debug, info, warn, error)"
-    )]
-    log_level: String,
+#[cfg(target_os = "linux")]
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
+    linux::run().await
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    sysa::paths::init();
-    sysa::l10n::init();
-
-    let args = {
-        use clap::{CommandFactory, FromArgMatches};
-        let cmd = Args::command()
-            .about(sysa::l10n::t_("System M — System Mount Worker (Linux)"))
-            .mut_arg("debug", |a| {
-                a.help(sysa::l10n::t_("Enable debug-level logging."))
-            })
-            .mut_arg("log_level", |a| {
-                a.help(sysa::l10n::t_(
-                    "Log level (trace, debug, info, warn, error).",
-                ))
-            });
-        Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
-    };
-    let log_level = if args.debug { "debug" } else { &args.log_level };
-    tracing_subscriber::fmt()
-        .with_env_filter(log_level.parse::<EnvFilter>()?)
-        .init();
-
-    info!("System M (System Mount Worker for Linux) starting up");
-
-    ipc::run().await?;
-
-    Ok(())
+/// Inert stub on non-Linux platforms: this worker is Linux-only.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("systema-sysm.linux is a Linux-only worker; nothing to do.");
+    std::process::exit(0);
 }

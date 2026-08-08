@@ -105,7 +105,9 @@ fn scan_devices(caps: Capabilities) -> Vec<DeviceMeta> {
             Err(_) => continue,
         };
         let mode = md.mode();
-        let is_dev_node = (mode & libc::S_IFMT) == libc::S_IFBLK || (mode & libc::S_IFMT) == libc::S_IFCHR;
+        let ifmt = libc::S_IFMT as u32;
+        let is_dev_node = (mode & ifmt) == libc::S_IFBLK as u32
+            || (mode & ifmt) == libc::S_IFCHR as u32;
         if !is_dev_node {
             continue;
         }

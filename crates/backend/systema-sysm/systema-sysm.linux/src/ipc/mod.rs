@@ -2,9 +2,9 @@ use anyhow::Result;
 
 use sysa::worker_ipc::WorkerIpc;
 
-use crate::controller::MountController;
-use crate::mountinfo::MountInfoMonitor;
-use crate::state::{new_automount_registry, new_mount_registry};
+use crate::linux::controller::MountController;
+use crate::linux::mountinfo::MountInfoMonitor;
+use crate::linux::state::{new_automount_registry, new_mount_registry};
 
 const WORKER_ID: &str = "system-m-1";
 const WORKER_UNIT_TYPES: &[&str] = &["mount", "automount"];

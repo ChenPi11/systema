@@ -7,7 +7,7 @@ use sysa::proto::{AutomountConfig, MountConfig};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
-use crate::state::{AutomountInstance, AutomountRegistry, AutomountState};
+use crate::linux::state::{AutomountInstance, AutomountRegistry, AutomountState};
 
 // ---------------------------------------------------------------------------
 // Linux ioctl / autofs constants

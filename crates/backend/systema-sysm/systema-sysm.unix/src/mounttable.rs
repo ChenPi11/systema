@@ -17,7 +17,7 @@ use std::ffi::CString;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use systema_sysm_common::mount_table::{
     build_mount_unit_ir, commit_mount_units, reconcile, MountTableEntry, MountTableSnapshot,
 };
@@ -85,15 +85,33 @@ fn read_mount_table() -> Result<Vec<MountTableEntry>> {
     target_os = "dragonfly",
     target_os = "macos"
 ))]
+/// `MNT_NOWAIT` — libc exports it on every BSD except DragonFly, which
+/// shares FreeBSD's value (2).
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "macos",
+    target_os = "netbsd"
+))]
+const MNT_NOWAIT_FLAG: libc::c_int = libc::MNT_NOWAIT;
+#[cfg(target_os = "dragonfly")]
+const MNT_NOWAIT_FLAG: libc::c_int = 2;
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos"
+))]
 fn read_getmntinfo_statfs() -> Result<Vec<MountTableEntry>> {
-    let mut count: libc::c_int = 0;
-    let mntp = unsafe { libc::getmntinfo(&mut count, libc::MNT_NOWAIT) };
-    if mntp.is_null() {
+    let mut mntbuf: *mut libc::statfs = std::ptr::null_mut();
+    let count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT_FLAG) };
+    if count < 0 {
         anyhow::bail!("getmntinfo failed");
     }
     let mut entries = Vec::new();
     for i in 0..count {
-        let m = unsafe { &*mntp.offset(i as isize) };
+        let m = unsafe { &*mntbuf.add(i as usize) };
         let mount_point = unsafe { CStr::from_ptr(m.f_mntonname.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -109,7 +127,7 @@ fn read_getmntinfo_statfs() -> Result<Vec<MountTableEntry>> {
             what,
             fstype,
             options: flags_to_options(flags, bsd_flag_table()),
-            ignored: flags & (libc::MNT_IGNORE as u64) != 0,
+            ignored: flags & m_ignore_bit() != 0,
         });
     }
     Ok(entries)
@@ -117,14 +135,15 @@ fn read_getmntinfo_statfs() -> Result<Vec<MountTableEntry>> {
 
 #[cfg(target_os = "netbsd")]
 fn read_getmntinfo_statvfs() -> Result<Vec<MountTableEntry>> {
-    let mut count: libc::c_int = 0;
-    let mntp = unsafe { libc::getmntinfo(&mut count, libc::MNT_NOWAIT) };
-    if mntp.is_null() {
+    let mut mntbuf: *mut libc::statvfs = std::ptr::null_mut();
+    let count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT_FLAG) };
+    if count < 0 {
         anyhow::bail!("getmntinfo failed");
     }
     let mut entries = Vec::new();
     for i in 0..count {
-        let m = unsafe { &*mntp.offset(i as isize) };
+        let idx = i as usize;
+        let m = unsafe { &*mntbuf.add(idx) };
         let mount_point = unsafe { CStr::from_ptr(m.f_mntonname.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -140,10 +159,35 @@ fn read_getmntinfo_statvfs() -> Result<Vec<MountTableEntry>> {
             what,
             fstype,
             options: flags_to_options(flags, bsd_flag_table()),
-            ignored: flags & (libc::MNT_IGNORE as u64) != 0,
+            ignored: flags & m_ignore_bit() != 0,
         });
     }
     Ok(entries)
+}
+
+/// Bit meaning "not really a mount we manage" — `MNT_IGNORE` where it
+/// exists, otherwise (OpenBSD) there is no such flag so nothing matches.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos",
+    target_os = "netbsd"
+))]
+fn m_ignore_bit() -> u64 {
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        libc::MNT_IGNORE as u64
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        0
+    }
 }
 
 /// Decode the common `MNT_*` flag bits into an option string.  The bit
@@ -178,13 +222,23 @@ fn bsd_flag_table() -> &'static [(u64, &'static str)] {
         (libc::MNT_ASYNC as u64, "async"),
         (libc::MNT_NOEXEC as u64, "noexec"),
         (libc::MNT_NOSUID as u64, "nosuid"),
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
         (libc::MNT_NODEV as u64, "nodev"),
         (libc::MNT_NOATIME as u64, "noatime"),
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
         (libc::MNT_NOSYMFOLLOW as u64, "nosymfollow"),
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ))]
         (libc::MNT_UNION as u64, "union"),
-        #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "netbsd"))]
-        (libc::MNT_STRICTATIME as u64, "strictatime"),
-        #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "netbsd"))]
+        #[cfg(target_os = "netbsd")]
         (libc::MNT_RELATIME as u64, "relatime"),
     ]
 }
@@ -249,7 +303,7 @@ fn read_mount_p() -> Result<Vec<MountTableEntry>> {
     let output = std::process::Command::new("mount")
         .arg("-p")
         .output()
-        .context("mount -p failed")?;
+        .map_err(|e| anyhow::anyhow!("mount -p failed: {e}"))?;
     if !output.status.success() {
         anyhow::bail!("mount -p exited with {}", output.status);
     }
@@ -258,6 +312,15 @@ fn read_mount_p() -> Result<Vec<MountTableEntry>> {
 
 /// Parse fstab-style `mount -p` output:
 /// `device mountpoint fstype options dump pass` (dump/pass ignored).
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
 fn parse_mount_p_output(output: &str) -> Vec<MountTableEntry> {
     let mut entries = Vec::new();
     for line in output.lines() {
@@ -282,6 +345,15 @@ fn parse_mount_p_output(output: &str) -> Vec<MountTableEntry> {
 
 /// Decode mount(8) escaping: `\040` space, `\011` tab, `\012` newline,
 /// `\134` backslash (any octal escape, really).
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
 fn unescape_mount_field(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -629,6 +701,15 @@ impl MountTableMonitor {
 mod tests {
     use super::*;
 
+    #[cfg(not(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    )))]
     #[test]
     fn unescape_decodes_mount_escapes() {
         assert_eq!(unescape_mount_field("a\\040b"), "a b");
@@ -638,6 +719,15 @@ mod tests {
         assert_eq!(unescape_mount_field("\\040"), " ");
     }
 
+    #[cfg(not(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    )))]
     #[test]
     fn parse_mount_p_output_builds_entries() {
         let output = concat!(

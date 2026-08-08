@@ -70,8 +70,12 @@
 ```bash
 # Requires: Rust 1.70+, protobuf-compiler
 sudo apt-get install protobuf-compiler
-cargo build
+cargo build --workspace
 ```
+
+Note: `systema-sysm.linux` (the Linux flavor of the System M mount worker)
+only does real work on Linux; on other platforms it compiles to an inert
+stub binary instead of Linux-only code.
 
 ## Running
 

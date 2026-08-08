@@ -117,25 +117,53 @@ async fn run_fdpass_acceptor(listener: UnixListener, fdpass_map: FdPassMap) -> R
     }
 }
 
-/// Extract the peer PID and UID from a Unix stream via SO_PEERCRED.
+/// Extract the peer PID and UID from a Unix stream.
+///
+/// Linux exposes the full `SO_PEERCRED` struct (PID + UID).  The BSDs share
+/// `getpeereid`, which only reports the effective UID/GID — the PID is lost,
+/// so it is reported as 0.
 fn peer_cred(stream: &UnixStream) -> Result<(u32, u32)> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
-    unsafe {
-        let mut cred: libc::ucred = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        let ret = libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        );
+
+    // Linux: struct ucred { pid, uid, gid } via SO_PEERCRED.
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let mut cred: libc::ucred = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let ret = libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            );
+            if ret < 0 {
+                let e = std::io::Error::last_os_error();
+                anyhow::bail!("SO_PEERCRED failed: {e}");
+            }
+            Ok((cred.pid as u32, cred.uid as u32))
+        }
+    }
+
+    // BSDs / macOS: getpeereid(fd, &euid, &egid).
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "macos",
+        target_os = "netbsd"
+    ))]
+    {
+        let mut euid: libc::uid_t = 0;
+        let mut egid: libc::gid_t = 0;
+        let ret = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
         if ret < 0 {
             let e = std::io::Error::last_os_error();
-            anyhow::bail!("SO_PEERCRED failed: {e}");
+            anyhow::bail!("getpeereid failed: {e}");
         }
-        Ok((cred.pid as u32, cred.uid as u32))
+        Ok((0, euid as u32))
     }
 }
 

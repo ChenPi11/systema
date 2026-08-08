@@ -7,10 +7,13 @@
 //!
 //! On non-Linux this module is a no-op (poll-only).
 
+#[cfg(target_os = "linux")]
 use std::io;
 
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 /// Spawn a background thread that pushes `()` to `tx` whenever a kernel
 /// uevent arrives.  Returns true if the watcher is running.
