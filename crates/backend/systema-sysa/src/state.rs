@@ -222,9 +222,21 @@ pub struct WorkerEntry {
 /// A staging area bound to a single worker UID.
 #[derive(Debug, Clone)]
 pub struct StagingArea {
-    pub debug_label: String,
+    pub name: String,
     pub uid: u32,
     pub units: HashMap<String, UnitIR>,
+}
+
+/// Validate a staging area name.
+///
+/// Allowed characters: upper/lowercase letters, `_`, `/`, `\`, `-`.
+/// Maximum length: 64 characters.
+pub fn is_valid_staging_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'/' | b'\\' | b'-'))
 }
 
 // --------------------------------------------------------------------------
@@ -263,13 +275,15 @@ pub struct AllocatorState {
     /// inside `tokio::spawn`-ed tasks (parking_lot guards are not `Send`).
     pub event_bus: Arc<TokioRwLock<EventBus>>,
 
-    /// Per-UID staging areas for unit registration.
+    /// Staging areas for unit registration, keyed by the (uid, name) pair.
     ///
-    /// Each entry maps a worker UID to its staging area (debug label + units).
-    /// Areas are created by `RegisterUnits`, queried by `StagingQuery`,
-    /// committed by `CommitUnits` (which removes the area), and are
-    /// inaccessible to callers whose UID does not match.
-    pub staging_areas: HashMap<u32, StagingArea>,
+    /// Each entry is the minimal unit of identity: a worker UID may own
+    /// several staging areas distinguished by name, and every UID can access
+    /// all areas it owns (regardless of name).  Areas are created by
+    /// `RegisterUnits`, queried by `StagingQuery`, committed by `CommitUnits`
+    /// (which removes the area), and are inaccessible to callers whose UID
+    /// does not match the area's owner.
+    pub staging_areas: HashMap<(u32, String), StagingArea>,
 
     /// Reference counts between units — maps target unit name to the set of
     /// source unit names that hold a reference to it.
@@ -326,46 +340,60 @@ impl AllocatorState {
         }
     }
 
-    /// Commit the staging area for a given UID into the active unit set.
+    /// Commit the staging area identified by the (uid, name) pair into the
+    /// active unit set.
     ///
-    /// Every `UnitIR` in the area is *merged* into `self.units`:
+    /// The commit is atomic:
     ///
-    /// - If the unit already exists, only the entries provided in the IR are
-    ///   overwritten; everything else is left untouched (e.g. a mount-table
-    ///   commit carrying only `[Mount]` config never clobbers the unit's
-    ///   `description`).
-    /// - If the unit does not exist, a new one is created.  This requires
-    ///   `unit_type` to be present; a missing required field yields an error
-    ///   that is returned to the worker that submitted the commit.
+    /// - Every `UnitIR` is validated (new units require `unit_type`) before
+    ///   anything is mutated; a validation failure aborts the commit, leaves
+    ///   `self.units` untouched, and preserves the staging area so the worker
+    ///   can still query or retry it.
+    /// - Existing units are *merged* (only the entries provided in the IR are
+    ///   overwritten — e.g. a mount-table commit carrying only `[Mount]`
+    ///   config never clobbers the unit's `description`); new units are
+    ///   created from the IR.
     ///
-    /// The staging area is removed after commit.
-    pub fn commit_staging(&mut self, uid: u32) -> Result<u32, String> {
-        let area = self
-            .staging_areas
-            .remove(&uid)
-            .ok_or_else(|| format!("no staging area for UID {uid}"))?;
+    /// The staging area is removed only after a fully successful merge.
+    pub fn commit_staging(&mut self, uid: u32, name: &str) -> Result<u32, String> {
+        let Some(area) = self.staging_areas.get(&(uid, name.to_string())) else {
+            return Err(format!("no staging area for UID {uid} with name '{name}'"));
+        };
 
         let unit_count = area.units.len() as u32;
-        let label = &area.debug_label;
-        info!("commit_staging(UID={uid}, label={label}): merging {unit_count} units");
+        info!("commit_staging(UID={uid}, name={name}): merging {unit_count} units");
 
+        // Phase 1 (plan): build every new UnitFile up front so a missing
+        // required field aborts the commit before anything is mutated.
+        let mut new_units: Vec<(String, UnitFile)> = Vec::with_capacity(unit_count as usize);
+        for ir in area.units.values() {
+            if !self.units.contains_key(&ir.id) {
+                new_units.push(unit_file_from_ir(ir)?);
+            }
+        }
+
+        // Phase 2 (apply): patch existing units and insert new ones.  All
+        // steps are infallible, so a failure cannot happen mid-way.
         let mut created = 0usize;
         let mut updated = 0usize;
         for ir in area.units.values() {
             if let Some(existing) = self.units.get_mut(&ir.id) {
                 apply_ir_patch(ir, existing);
                 updated += 1;
-            } else {
-                let (name, unit) = unit_file_from_ir(ir)?;
-                self.units.insert(name, unit);
-                created += 1;
             }
         }
+        for (unit_name, unit) in new_units {
+            self.units.insert(unit_name, unit);
+            created += 1;
+        }
+
+        // Phase 3 (finalize): consume the staging area.
+        self.staging_areas.remove(&(uid, name.to_string()));
         if created > 0 {
-            info!("commit_staging(UID={uid}, label={label}): created {created} new unit(s)");
+            info!("commit_staging(UID={uid}, name={name}): created {created} new unit(s)");
         }
         if updated > 0 {
-            info!("commit_staging(UID={uid}, label={label}): updated {updated} existing unit(s)");
+            info!("commit_staging(UID={uid}, name={name}): updated {updated} existing unit(s)");
         }
         self.rebuild_ref_counts();
 
@@ -373,52 +401,70 @@ impl AllocatorState {
     }
 
     /// Create a staging area for a given UID.
-    /// Returns an error if the UID already owns an area.
+    /// Returns an error if the (uid, name) area already exists or if `name`
+    /// does not conform to the staging area naming rules.
     pub fn init_staging_area(
         &mut self,
         uid: u32,
-        label: &str,
+        name: &str,
         units: HashMap<String, UnitIR>,
     ) -> Result<u32, String> {
-        if self.staging_areas.contains_key(&uid) {
-            return Err(format!("staging area for UID {uid} already exists"));
+        if self.staging_areas.contains_key(&(uid, name.to_string())) {
+            return Err(format!(
+                "staging area (uid={uid}, name={name}) already exists"
+            ));
+        }
+        if !is_valid_staging_name(name) {
+            return Err(format!(
+                "invalid staging area name '{name}': must be at most 64 characters long \
+                 and contain only letters, underscores, slashes, backslashes, or hyphens"
+            ));
         }
         let count = units.len() as u32;
         self.staging_areas.insert(
-            uid,
+            (uid, name.to_string()),
             StagingArea {
-                debug_label: label.to_string(),
+                name: name.to_string(),
                 uid,
                 units,
             },
         );
-        info!("init_staging_area(UID={uid}, label={label}): {count} units");
+        info!("init_staging_area(UID={uid}, name={name}): {count} units");
         Ok(count)
     }
 
-    /// Return the staging area for a given UID.
-    pub fn get_staging_area_by_uid(&self, uid: u32) -> Option<&StagingArea> {
-        self.staging_areas.get(&uid)
+    /// Return the staging area identified by the (uid, name) pair.
+    pub fn get_staging_area(&self, uid: u32, name: &str) -> Option<&StagingArea> {
+        self.staging_areas.get(&(uid, name.to_string()))
     }
 
-    /// Find staging areas whose debug label matches.
-    pub fn get_staging_areas_by_name(&self, name: &str) -> Vec<&StagingArea> {
+    /// Find every staging area owned by the given UID.
+    pub fn get_staging_areas_by_uid(&self, uid: u32) -> Vec<&StagingArea> {
         self.staging_areas
-            .values()
-            .filter(|a| a.debug_label == name)
+            .iter()
+            .filter(|((owner, _), _)| *owner == uid)
+            .map(|(_, a)| a)
             .collect()
     }
 
-    /// List every staging area (uid + label, no units).
-    pub fn list_staging_areas(&self) -> Vec<(u32, &str)> {
+    /// Find staging areas whose name matches (across all UIDs).
+    pub fn get_staging_areas_by_name(&self, name: &str) -> Vec<&StagingArea> {
+        self.staging_areas
+            .values()
+            .filter(|a| a.name == name)
+            .collect()
+    }
+
+    /// List every staging area as (uid, name) pairs (no units).
+    pub fn list_staging_areas(&self) -> Vec<(u32, String)> {
         self.staging_areas
             .iter()
-            .map(|(uid, a)| (*uid, a.debug_label.as_str()))
+            .map(|((uid, name), _)| (*uid, name.clone()))
             .collect()
     }
 
     /// Return all staging areas (full data).
-    pub fn all_staging_areas(&self) -> &HashMap<u32, StagingArea> {
+    pub fn all_staging_areas(&self) -> &HashMap<(u32, String), StagingArea> {
         &self.staging_areas
     }
 
@@ -841,7 +887,7 @@ mod tests {
             vec![mount_ir("tmp.mount", "/tmp"), mount_ir("boot.mount", "/boot")],
         );
 
-        let count = state.commit_staging(7).unwrap();
+        let count = state.commit_staging(7, "test").unwrap();
         assert_eq!(count, 2);
         let tmp = state.units.get("tmp.mount").unwrap();
         assert_eq!(tmp.kind, UnitKind::Mount);
@@ -863,7 +909,7 @@ mod tests {
         state.units.insert("tmp.mount".to_string(), existing);
         stage(&mut state, 7, vec![mount_ir("tmp.mount", "/mnt/tmp")]);
 
-        state.commit_staging(7).unwrap();
+        state.commit_staging(7, "test").unwrap();
 
         let merged = state.units.get("tmp.mount").unwrap();
         // Description and documentation are not part of the commit → untouched.
@@ -883,10 +929,12 @@ mod tests {
         ir.unit_type = None;
         stage(&mut state, 7, vec![ir]);
 
-        let err = state.commit_staging(7).unwrap_err();
+        let err = state.commit_staging(7, "test").unwrap_err();
         assert!(err.contains("mystery.mount"), "unexpected error: {err}");
         assert!(err.contains("unit_type"), "unexpected error: {err}");
         assert!(!state.units.contains_key("mystery.mount"));
+        // Atomicity: the staging area survives a failed commit.
+        assert!(state.get_staging_area(7, "test").is_some());
     }
 
     #[test]
@@ -900,11 +948,111 @@ mod tests {
         ir.unit_type = None;
         stage(&mut state, 7, vec![ir]);
 
-        state.commit_staging(7).unwrap();
+        state.commit_staging(7, "test").unwrap();
         // Existing unit is patched without needing unit_type.
         assert_eq!(
             state.units.get("tmp.mount").unwrap().mount.as_ref().unwrap().where_,
             "/tmp"
         );
+    }
+
+    #[test]
+    fn commit_failure_applies_no_partial_mutation() {
+        let mut state = AllocatorState::new();
+        // An existing unit that a failed commit must not touch.
+        let mut existing = UnitFile::new("tmp.mount");
+        existing.unit.description = "Temporary Directory /tmp".to_string();
+        state.units.insert("tmp.mount".to_string(), existing);
+
+        // A patch for the existing unit plus a new unit missing unit_type.
+        let units: HashMap<String, UnitIR> = vec![
+            mount_ir("tmp.mount", "/mnt/tmp"),
+            mount_ir("mystery.mount", "/x"),
+        ]
+        .into_iter()
+        .map(|mut ir| {
+            if ir.id == "mystery.mount" {
+                ir.unit_type = None;
+            }
+            (ir.id.clone(), ir)
+        })
+        .collect();
+        state.init_staging_area(7, "test", units).unwrap();
+
+        let err = state.commit_staging(7, "test").unwrap_err();
+        assert!(err.contains("unit_type"), "unexpected error: {err}");
+        // The existing unit was not patched.
+        assert_eq!(
+            state.units.get("tmp.mount").unwrap().unit.description,
+            "Temporary Directory /tmp"
+        );
+        assert!(state.units.get("tmp.mount").unwrap().mount.is_none());
+        // The staging area survives for a retry.
+        assert!(state.get_staging_area(7, "test").is_some());
+    }
+
+    #[test]
+    fn staging_name_validation() {
+        assert!(is_valid_staging_name("systema-sysd/discovery"));
+        assert!(is_valid_staging_name("systema-sysm/discovery"));
+        assert!(is_valid_staging_name("systema-sysf/discovery"));
+        assert!(is_valid_staging_name("foo_bar\\baz-qux"));
+        assert!(is_valid_staging_name("A"));
+        assert!(is_valid_staging_name(&"a".repeat(64)));
+
+        assert!(!is_valid_staging_name(""));
+        assert!(!is_valid_staging_name(&"a".repeat(65)));
+        assert!(!is_valid_staging_name("has space"));
+        assert!(!is_valid_staging_name("has.dots"));
+        assert!(!is_valid_staging_name("has-数字"));
+        assert!(!is_valid_staging_name("12345"));
+    }
+
+    #[test]
+    fn init_staging_area_rejects_invalid_name() {
+        let mut state = AllocatorState::new();
+        let err = state
+            .init_staging_area(9, "system-m mount discovery", HashMap::new())
+            .unwrap_err();
+        assert!(err.contains("invalid staging area name"), "unexpected error: {err}");
+        assert!(!state.staging_areas.contains_key(&(9, "system-m mount discovery".to_string())));
+    }
+
+    #[test]
+    fn multiple_staging_areas_per_uid_coexist() {
+        let mut state = AllocatorState::new();
+        state
+            .init_staging_area(7, "systema-sysd/discovery", HashMap::new())
+            .unwrap();
+        state
+            .init_staging_area(7, "systema-sysm/discovery", HashMap::new())
+            .unwrap();
+        assert_eq!(state.get_staging_areas_by_uid(7).len(), 2);
+
+        let dup = state
+            .init_staging_area(7, "systema-sysd/discovery", HashMap::new())
+            .unwrap_err();
+        assert!(dup.contains("already exists"), "unexpected error: {dup}");
+        assert_eq!(state.get_staging_areas_by_uid(7).len(), 2);
+    }
+
+    #[test]
+    fn staging_areas_isolated_by_uid() {
+        let mut state = AllocatorState::new();
+        state
+            .init_staging_area(7, "systema-sysd/discovery", HashMap::new())
+            .unwrap();
+        state
+            .init_staging_area(8, "systema-sysd/discovery", HashMap::new())
+            .unwrap();
+
+        assert!(state.get_staging_area(7, "systema-sysd/discovery").is_some());
+        assert!(state.get_staging_area(8, "systema-sysd/discovery").is_some());
+        assert_eq!(state.get_staging_areas_by_name("systema-sysd/discovery").len(), 2);
+
+        let err = state.commit_staging(7, "systema-sysm/discovery").unwrap_err();
+        assert!(err.contains("no staging area"), "unexpected error: {err}");
+        assert_eq!(state.commit_staging(7, "systema-sysd/discovery").unwrap(), 0);
+        assert!(state.get_staging_area(8, "systema-sysd/discovery").is_some());
     }
 }

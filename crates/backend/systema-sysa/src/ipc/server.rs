@@ -18,9 +18,9 @@ use tracing::{debug, error, info, warn};
 use sysa::controller::UnitStatus;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
-    AdminStagingOp, AdminStagingResult, Envelope, MethodResult, RegisterAck, RegisterUnits,
-    StagingAreaEntry, StagingQueryResult, TimerFired, UnitRegistrationAck, UnitStateUpdate,
-    UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    AdminStagingOp, AdminStagingResult, CommitUnits, Envelope, MethodResult, RegisterAck,
+    RegisterUnits, StagingAreaEntry, StagingQuery, StagingQueryResult, TimerFired,
+    UnitRegistrationAck, UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
@@ -555,8 +555,8 @@ async fn try_finder_register(
     uid: u32,
 ) -> Result<UnitRegistrationAck> {
     let reg_msg = RegisterUnits::decode(env.payload.as_slice())?;
-    let label = reg_msg.debug_label;
-    info!("Finder (UID={uid}) registering units (label='{label}')");
+    let name = reg_msg.name;
+    info!("Finder (UID={uid}) registering units (name='{name}')");
 
     let units: std::collections::HashMap<String, systema_sysf::ir::UnitIR> =
         serde_json::from_slice(&reg_msg.units_json).map_err(|e| {
@@ -567,7 +567,7 @@ async fn try_finder_register(
         })?;
 
     let mut state = allocator.write();
-    match state.init_staging_area(uid, &label, units) {
+    match state.init_staging_area(uid, &name, units) {
         Ok(count) => {
             drop(state);
             Ok(UnitRegistrationAck {
@@ -593,11 +593,11 @@ async fn try_finder_register(
 
 async fn handle_finder_commit(
     mut framed: sysa::ipc::EnvelopeFramed,
-    _env: Envelope,
+    env: Envelope,
     allocator: AllocatorHandle,
     client_uid: u32,
 ) -> Result<()> {
-    let result = try_finder_commit(allocator, client_uid).await;
+    let result = try_finder_commit(env, allocator, client_uid).await;
     let ack = match &result {
         Ok(ack) => ack.clone(),
         Err(e) => {
@@ -615,21 +615,41 @@ async fn handle_finder_commit(
     Ok(())
 }
 
-async fn try_finder_commit(allocator: AllocatorHandle, uid: u32) -> Result<UnitRegistrationAck> {
-    info!("Finder (UID={uid}) committing staging area");
+async fn try_finder_commit(
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<UnitRegistrationAck> {
+    let commit_msg = CommitUnits::decode(env.payload.as_slice())?;
+    let name = &commit_msg.name;
+    let target_uid = if commit_msg.uid == 0 {
+        client_uid
+    } else {
+        commit_msg.uid
+    };
+    if client_uid != 0 && target_uid != client_uid {
+        return Ok(UnitRegistrationAck {
+            success: false,
+            message: format!(
+                "permission denied (UID {client_uid}): may only commit own staging areas"
+            ),
+            unit_count: 0,
+        });
+    }
+    info!("Finder (UID={client_uid}) committing staging area (uid={target_uid}, name='{name}')");
 
     // Collect unit names before commit_staging removes the staging area.
     let unit_names: Vec<String> = {
         let state = allocator.read();
         state
-            .get_staging_area_by_uid(uid)
+            .get_staging_area(target_uid, name)
             .map(|area| area.units.keys().cloned().collect())
             .unwrap_or_default()
     };
 
     let count = {
         let mut state = allocator.write();
-        match state.commit_staging(uid) {
+        match state.commit_staging(target_uid, name) {
             Ok(count) => count,
             Err(msg) => {
                 drop(state);
@@ -655,7 +675,10 @@ async fn try_finder_commit(allocator: AllocatorHandle, uid: u32) -> Result<UnitR
         success: true,
         message: sysa::l10n::fmt(
             sysa::l10n::t_("{count} units committed for UID {uid}."),
-            &[("count", &count.to_string()), ("uid", &uid.to_string())],
+            &[
+                ("count", &count.to_string()),
+                ("uid", &target_uid.to_string()),
+            ],
         ),
         unit_count: count,
     })
@@ -663,11 +686,11 @@ async fn try_finder_commit(allocator: AllocatorHandle, uid: u32) -> Result<UnitR
 
 async fn handle_finder_query(
     mut framed: sysa::ipc::EnvelopeFramed,
-    _env: Envelope,
+    env: Envelope,
     allocator: AllocatorHandle,
     client_uid: u32,
 ) -> Result<()> {
-    let result = try_finder_query(allocator, client_uid).await;
+    let result = try_finder_query(env, allocator, client_uid).await;
     let ack = match &result {
         Ok(ack) => ack.clone(),
         Err(e) => {
@@ -691,9 +714,30 @@ async fn handle_finder_query(
     Ok(())
 }
 
-async fn try_finder_query(allocator: AllocatorHandle, uid: u32) -> Result<StagingQueryResult> {
+async fn try_finder_query(
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<StagingQueryResult> {
+    let query_msg = StagingQuery::decode(env.payload.as_slice())?;
+    let name = &query_msg.name;
+    let target_uid = if query_msg.uid == 0 {
+        client_uid
+    } else {
+        query_msg.uid
+    };
+    if client_uid != 0 && target_uid != client_uid {
+        return Ok(StagingQueryResult {
+            success: false,
+            message: format!(
+                "permission denied (UID {client_uid}): may only query own staging areas"
+            ),
+            units_json: vec![],
+            unit_count: 0,
+        });
+    }
     let state = allocator.read();
-    match state.get_staging_area_by_uid(uid) {
+    match state.get_staging_area(target_uid, name) {
         Some(area) => {
             let count = area.units.len() as u32;
             let json = serde_json::to_vec(&area.units)
@@ -706,7 +750,7 @@ async fn try_finder_query(allocator: AllocatorHandle, uid: u32) -> Result<Stagin
             })
         }
         None => {
-            let msg = format!("no staging area for UID {uid}");
+            let msg = format!("no staging area for UID {target_uid} with name '{name}'");
             warn!("{msg}");
             Ok(StagingQueryResult {
                 success: false,
@@ -767,15 +811,15 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
             let entries: Vec<StagingAreaEntry> = state
                 .list_staging_areas()
                 .into_iter()
-                .map(|(uid, label)| {
+                .map(|(uid, name)| {
                     let count = state
                         .staging_areas
-                        .get(&uid)
+                        .get(&(uid, name.clone()))
                         .map(|a| a.units.len() as u32)
                         .unwrap_or(0);
                     StagingAreaEntry {
                         uid,
-                        debug_label: label.to_string(),
+                        name,
                         unit_count: count,
                         units_json: vec![],
                     }
@@ -787,7 +831,35 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
                 entries,
             }
         }
-        "by_uid" => match state.get_staging_area_by_uid(op.uid) {
+        "by_uid" => {
+            let areas = state.get_staging_areas_by_uid(op.uid);
+            if areas.is_empty() {
+                AdminStagingResult {
+                    success: false,
+                    message: format!("no staging area for UID {}", op.uid),
+                    entries: vec![],
+                }
+            } else {
+                let entries = areas
+                    .into_iter()
+                    .map(|a| {
+                        let json = serde_json::to_vec(&a.units).unwrap_or_default();
+                        StagingAreaEntry {
+                            uid: a.uid,
+                            name: a.name.clone(),
+                            unit_count: a.units.len() as u32,
+                            units_json: json,
+                        }
+                    })
+                    .collect();
+                AdminStagingResult {
+                    success: true,
+                    message: String::new(),
+                    entries,
+                }
+            }
+        }
+        "by_id" => match state.get_staging_area(op.uid, &op.name) {
             Some(area) => {
                 let json = serde_json::to_vec(&area.units).unwrap_or_default();
                 AdminStagingResult {
@@ -795,7 +867,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
                     message: String::new(),
                     entries: vec![StagingAreaEntry {
                         uid: area.uid,
-                        debug_label: area.debug_label.clone(),
+                        name: area.name.clone(),
                         unit_count: area.units.len() as u32,
                         units_json: json,
                     }],
@@ -803,7 +875,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
             }
             None => AdminStagingResult {
                 success: false,
-                message: format!("no staging area for UID {}", op.uid),
+                message: format!("no staging area for UID {} with name '{}'", op.uid, op.name),
                 entries: vec![],
             },
         },
@@ -812,7 +884,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
             if areas.is_empty() {
                 AdminStagingResult {
                     success: false,
-                    message: format!("no staging area with label '{}'", op.name),
+                    message: format!("no staging area with name '{}'", op.name),
                     entries: vec![],
                 }
             } else {
@@ -822,7 +894,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
                         let json = serde_json::to_vec(&a.units).unwrap_or_default();
                         StagingAreaEntry {
                             uid: a.uid,
-                            debug_label: a.debug_label.clone(),
+                            name: a.name.clone(),
                             unit_count: a.units.len() as u32,
                             units_json: json,
                         }
@@ -843,7 +915,7 @@ fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Admin
                     let json = serde_json::to_vec(&a.units).unwrap_or_default();
                     StagingAreaEntry {
                         uid: a.uid,
-                        debug_label: a.debug_label.clone(),
+                        name: a.name.clone(),
                         unit_count: a.units.len() as u32,
                         units_json: json,
                     }

@@ -125,20 +125,31 @@ message UnitSyncReport {
 // Sent by a System Worker to register discovered units as JSON-serialized
 // UnitIR values bound to the caller's PID.
 message RegisterUnits {
-    // Debug label for the staging area (not used for identity).
-    string debug_label = 1;
+    // Name for the staging area (not used for identity).
+    string name = 1;
     // JSON-serialized map of unit_id → UnitIR.
     bytes units_json = 2;
 }
 
-// Sent by a System Worker to commit its PID-bound staging area.
+// Sent by a System Worker to commit its staging area.
+// The area is identified by the (uid, name) pair.
 message CommitUnits {
-    // Debug label (ignored; area is identified by caller PID).
-    string debug_label = 1;
+    // Name of the staging area to commit.
+    string name = 1;
+    // Owner UID of the staging area to commit; 0 = caller's own UID.
+    // Non-root callers may only commit areas owned by their own UID;
+    // root may commit any staging area.
+    uint32 uid = 2;
 }
 
-// Sent by a System Worker to query its own PID-bound staging area.
+// Sent by a System Worker to query a staging area.
 message StagingQuery {
+    // Name of the staging area to query.
+    string name = 1;
+    // Owner UID of the staging area to query; 0 = caller's own UID.
+    // Non-root callers may only query areas owned by their own UID;
+    // root may query any staging area.
+    uint32 uid = 2;
 }
 
 // Response to a StagingQuery (worker's own area).
@@ -164,21 +175,22 @@ message UnitRegistrationAck {
 
 // Query a staging area or list all areas.
 message AdminStagingOp {
-    // "list"         → return uid + debug_label for every area
-    // "by_uid"       → return full data for the given uid
-    // "by_name"      → return full data for area(s) matching debug_label
+    // "list"         → return (uid, name) for every area
+    // "by_uid"       → return full data for every area owned by the given uid
+    // "by_name"      → return full data for every area with the given name
+    // "by_id"        → return full data for the (uid, name) area
     // "all"          → return full data for every area
     string op = 1;
-    // UID filter for "by_uid" operation.
+    // UID filter for "by_uid" / "by_id" operations.
     uint32 uid = 2;
-    // Name filter for "by_name" operation.
+    // Name filter for "by_name" / "by_id" operations.
     string name = 3;
 }
 
 // One entry in an AdminStagingResult.
 message StagingAreaEntry {
     uint32 uid = 1;
-    string debug_label = 2;
+    string name = 2;
     uint32 unit_count = 3;
     // JSON-serialized map of unit_id → UnitIR (empty for "list").
     bytes units_json = 4;

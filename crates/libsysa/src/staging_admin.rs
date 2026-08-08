@@ -20,7 +20,7 @@ impl StagingAdmin {
         }
     }
 
-    /// List every staging area as (UID, debug_label) pairs.
+    /// List every staging area as (UID, name) pairs.
     pub async fn list(&self) -> Result<Vec<(u32, String)>> {
         let result = self.send_op("list", 0, "").await?;
         if !result.success {
@@ -29,18 +29,23 @@ impl StagingAdmin {
         Ok(result
             .entries
             .into_iter()
-            .map(|e| (e.uid, e.debug_label))
+            .map(|e| (e.uid, e.name))
             .collect())
     }
 
-    /// Query a staging area by UID (returns raw JSON bytes).
+    /// Query every staging area owned by a UID (returns raw JSON bytes).
     pub async fn query_by_uid(&self, uid: u32) -> Result<AdminStagingResult> {
         self.send_op("by_uid", uid, "").await
     }
 
-    /// Query staging areas by debug label (returns raw JSON bytes).
+    /// Query every staging area with the given name (returns raw JSON bytes).
     pub async fn query_by_name(&self, name: &str) -> Result<AdminStagingResult> {
         self.send_op("by_name", 0, name).await
+    }
+
+    /// Query the staging area identified by the (uid, name) pair.
+    pub async fn query(&self, uid: u32, name: &str) -> Result<AdminStagingResult> {
+        self.send_op("by_id", uid, name).await
     }
 
     /// Query all staging areas with full data.

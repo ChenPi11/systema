@@ -19,7 +19,7 @@ impl UnitFinder {
 
     pub async fn register_units(
         &self,
-        debug_label: &str,
+        name: &str,
         units_json: Vec<u8>,
     ) -> Result<UnitRegistrationAck> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
@@ -28,7 +28,7 @@ impl UnitFinder {
         let mut framed = frame_stream(stream);
 
         let reg_msg = RegisterUnits {
-            debug_label: debug_label.to_string(),
+            name: name.to_string(),
             units_json,
         };
         let reg_env = make_envelope(1, "system-f", "system-a", "finder.register_units", reg_msg)?;
@@ -47,14 +47,16 @@ impl UnitFinder {
         Ok(ack)
     }
 
-    pub async fn commit_units(&self) -> Result<UnitRegistrationAck> {
+    /// Commit the staging area identified by the caller's UID and `name`.
+    pub async fn commit_units(&self, name: &str) -> Result<UnitRegistrationAck> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
         let mut framed = frame_stream(stream);
 
         let commit_msg = CommitUnits {
-            debug_label: String::new(),
+            name: name.to_string(),
+            uid: 0,
         };
         let commit_env =
             make_envelope(1, "system-f", "system-a", "finder.commit_units", commit_msg)?;
@@ -73,13 +75,17 @@ impl UnitFinder {
         Ok(ack)
     }
 
-    pub async fn query_staging(&self) -> Result<StagingQueryResult> {
+    /// Query the staging area identified by the caller's UID and `name`.
+    pub async fn query_staging(&self, name: &str) -> Result<StagingQueryResult> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
         let mut framed = frame_stream(stream);
 
-        let query = StagingQuery {};
+        let query = StagingQuery {
+            name: name.to_string(),
+            uid: 0,
+        };
         let query_env = make_envelope(1, "system-f", "system-a", "staging.query", query)?;
         send_envelope(&mut framed, &query_env).await?;
 

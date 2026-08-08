@@ -24,11 +24,11 @@ struct Args {
 
     #[arg(
         long,
-        short = 'l',
-        default_value = "",
-        help = "Debug label for the staging area"
+        short = 'n',
+        default_value = "systema-sysf/discovery",
+        help = "Name for the staging area"
     )]
-    label: String,
+    name: String,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -59,8 +59,8 @@ async fn main() -> Result<()> {
                     "Log level (trace, debug, info, warn, error).",
                 ))
             })
-            .mut_arg("label", |a| {
-                a.help(sysa::l10n::t_("Debug label for the staging area."))
+            .mut_arg("name", |a| {
+                a.help(sysa::l10n::t_("Name for the staging area."))
             })
             .mut_subcommand("commit", |cmd| {
                 cmd.about(sysa::l10n::t_("Commit the UID-bound staging area."))
@@ -76,14 +76,14 @@ async fn main() -> Result<()> {
         .init();
 
     match args.command {
-        Some(Command::Commit) => run_commit().await,
-        Some(Command::Query) => run_query().await,
-        None => run_register(&args.label).await,
+        Some(Command::Commit) => run_commit(&args.name).await,
+        Some(Command::Query) => run_query(&args.name).await,
+        None => run_register(&args.name).await,
     }
 }
 
-async fn run_register(label: &str) -> Result<()> {
-    info!("System F registering units (label='{label}')");
+async fn run_register(name: &str) -> Result<()> {
+    info!("System F registering units (name='{name}')");
 
     let mut registry = FinderRegistry::new();
     registry.register(SystemdFinder::new());
@@ -92,7 +92,7 @@ async fn run_register(label: &str) -> Result<()> {
 
     let json = serde_json::to_vec(&units)?;
     let client = UnitFinder::new();
-    let ack = client.register_units(label, json).await?;
+    let ack = client.register_units(name, json).await?;
     if ack.success {
         info!("Staging successful: {} units registered", ack.unit_count);
     } else {
@@ -107,11 +107,11 @@ async fn run_register(label: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_commit() -> Result<()> {
-    info!("System F committing staging area");
+async fn run_commit(name: &str) -> Result<()> {
+    info!("System F committing staging area (name='{name}')");
 
     let client = UnitFinder::new();
-    let ack = client.commit_units().await?;
+    let ack = client.commit_units(name).await?;
     if ack.success {
         info!("Commit successful: {} units committed", ack.unit_count);
     } else {
@@ -126,11 +126,11 @@ async fn run_commit() -> Result<()> {
     Ok(())
 }
 
-async fn run_query() -> Result<()> {
-    info!("System F querying staging area");
+async fn run_query(name: &str) -> Result<()> {
+    info!("System F querying staging area (name='{name}')");
 
     let client = UnitFinder::new();
-    let result = client.query_staging().await?;
+    let result = client.query_staging(name).await?;
     if result.success {
         info!("Staging area contains {} units", result.unit_count);
         let units: HashMap<String, UnitIR> = serde_json::from_slice(&result.units_json)?;

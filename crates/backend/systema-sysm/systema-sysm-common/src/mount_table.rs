@@ -156,7 +156,7 @@ pub async fn commit_mount_units(units: &HashMap<String, UnitIR>) -> bool {
     };
     let finder = UnitFinder::new();
     match finder
-        .register_units("system-m mount discovery", json)
+        .register_units("systema-sysm/discovery", json)
         .await
     {
         Ok(ack) if !ack.success => {
@@ -169,7 +169,7 @@ pub async fn commit_mount_units(units: &HashMap<String, UnitIR>) -> bool {
         }
         Ok(_) => {}
     }
-    match finder.commit_units().await {
+    match finder.commit_units("systema-sysm/discovery").await {
         Ok(ack) if !ack.success => {
             warn!("Unit commit rejected: {}", ack.message);
             return false;

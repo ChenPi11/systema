@@ -85,7 +85,7 @@ fn print_json(entries: &[StagingAreaEntry]) -> Result<()> {
             let units = parse_units_json(&e.units_json).unwrap_or_default();
             serde_json::json!({
                 "uid": e.uid,
-                "name": e.debug_label,
+                "name": e.name,
                 "unit_count": e.unit_count,
                 "units": units,
             })
@@ -102,7 +102,7 @@ fn print_entry_friendly(entry: &StagingAreaEntry) -> Result<()> {
         "UID:".bold().cyan(),
         entry.uid.to_string().bold(),
         "Name:".bold().cyan(),
-        entry.debug_label.bold(),
+        entry.name.bold(),
     );
 
     let units = parse_units_json(&entry.units_json)?;
@@ -209,7 +209,7 @@ async fn run_list(json: bool, uids: Vec<u32>, regex_strs: Vec<String>) -> Result
         if has_regex_filter {
             results
                 .into_iter()
-                .filter(|e| regexes.iter().any(|r| r.is_match(&e.debug_label)))
+                .filter(|e| regexes.iter().any(|r| r.is_match(&e.name)))
                 .collect()
         } else {
             results
@@ -221,7 +221,7 @@ async fn run_list(json: bool, uids: Vec<u32>, regex_strs: Vec<String>) -> Result
         }
         all.entries
             .into_iter()
-            .filter(|e| regexes.iter().any(|r| r.is_match(&e.debug_label)))
+            .filter(|e| regexes.iter().any(|r| r.is_match(&e.name)))
             .collect()
     } else {
         let all = admin.query_all().await?;

@@ -229,9 +229,9 @@ async fn inject_units(shared: &Arc<EngineShared>, names: &[String]) {
     };
 
     let client = UnitFinder::new();
-    match client.register_units("system-d/discovery", json).await {
+    match client.register_units("systema-sysd/discovery", json).await {
         Ok(reg_ack) if reg_ack.success => {
-            match client.commit_units().await {
+            match client.commit_units("systema-sysd/discovery").await {
                 Ok(cm_ack) if cm_ack.success => {
                     info!(
                         "Committed {} newly discovered device units ({})",
