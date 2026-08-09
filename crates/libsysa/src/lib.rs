@@ -12,6 +12,7 @@ pub mod ipc;
 pub mod l10n;
 pub mod paths;
 pub mod staging_admin;
+pub mod unit_name;
 pub mod worker_ipc;
 pub mod proto {
     //! Generated protobuf types for the IPC protocol.

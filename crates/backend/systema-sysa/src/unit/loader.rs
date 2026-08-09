@@ -242,6 +242,45 @@ fn is_known_extension(name: &str) -> bool {
     )
 }
 
+/// Load a unit file from disk by name, transparently instantiating a
+/// template when the exact file does not exist.
+///
+/// 1. Tries to parse `<search-path>/<name>` verbatim.
+/// 2. Otherwise, if `name` is an instance unit (`foo@bar.service`), falls
+///    back to the template file (`foo@.service`) and parses it under the
+///    requested instance name, so `%i`/`%p`/`%n` specifiers are expanded
+///    with the instance.
+///
+/// Returns an error if neither the exact file nor a usable template exists.
+pub fn load_unit_flexible(name: &str) -> Result<UnitFile> {
+    load_unit_flexible_in(&sysa::paths::instance().unit_search_paths, name)
+}
+
+/// [`load_unit_flexible`] over an explicit search-path list (testable
+/// without touching the global path configuration).
+fn load_unit_flexible_in(dirs: &[String], name: &str) -> Result<UnitFile> {
+    for dir in dirs {
+        let path = std::path::Path::new(dir).join(name);
+        if path.is_file() {
+            return load_unit_file(&path);
+        }
+    }
+
+    if let Some(template) = sysa::unit_name::template_of(name) {
+        for dir in dirs {
+            let path = std::path::Path::new(dir).join(&template);
+            if path.is_file() {
+                return super::parser::parse_unit_from_path_as(&path, name);
+            }
+        }
+    }
+
+    anyhow::bail!(sysa::l10n::fmt(
+        sysa::l10n::t_("Unit not found: {name}"),
+        &[("name", name)],
+    ))
+}
+
 fn load_unit_file(path: &Path) -> Result<UnitFile> {
     super::parser::parse_unit_from_path(path)
 }
@@ -1086,5 +1125,92 @@ mod tests {
         assert_eq!(escape_unit_name_path("/foo-bar"), "foo\\x2dbar");
         assert_eq!(escape_unit_name_path("/dev/sda1"), "dev-sda1");
         assert_eq!(escape_unit_name_path("/a/b.c"), "a-b.c");
+    }
+
+    // =========================================================================
+    // Template instantiation
+    // =========================================================================
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "systema-sysa-loader-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_flexible_instantiates_template() {
+        let dir = temp_dir("tpl");
+        std::fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %i\n",
+        )
+        .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let unit = load_unit_flexible_in(&dirs, "getty@tty3.service").unwrap();
+
+        assert_eq!(unit.name, "getty@tty3.service");
+        assert_eq!(unit.unit.description, "Getty on tty3");
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.exec_start[0].program, "/sbin/agetty");
+        assert_eq!(svc.exec_start[0].args, vec!["tty3"]);
+    }
+
+    #[test]
+    fn load_flexible_exact_file_wins() {
+        let dir = temp_dir("exact");
+        std::fs::write(
+            dir.join("getty@tty3.service"),
+            "[Unit]\nDescription=Exact\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Template\n[Service]\nExecStart=/bin/false\n",
+        )
+        .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let unit = load_unit_flexible_in(&dirs, "getty@tty3.service").unwrap();
+        assert_eq!(unit.unit.description, "Exact");
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.exec_start[0].program, "/bin/true");
+    }
+
+    #[test]
+    fn load_flexible_missing_errors() {
+        let dir = temp_dir("missing");
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        assert!(load_unit_flexible_in(&dirs, "nonexistent.service").is_err());
+        assert!(load_unit_flexible_in(&dirs, "getty@tty9.service").is_err());
+    }
+
+    #[test]
+    fn load_flexible_template_dropin_applied() {
+        let dir = temp_dir("dropin");
+        std::fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Template\n[Service]\nExecStart=/sbin/agetty %i\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("getty@.service.d")).unwrap();
+        std::fs::write(
+            dir.join("getty@.service.d/override.conf"),
+            "[Service]\nEnvironment=EXTRA=1\n",
+        )
+        .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let unit = load_unit_flexible_in(&dirs, "getty@tty3.service").unwrap();
+        let svc = unit.service.unwrap();
+        assert!(svc.environment.contains(&"EXTRA=1".to_string()));
     }
 }

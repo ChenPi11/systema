@@ -1171,27 +1171,16 @@ impl ManagerInterface {
 
 /// Synchronously load a unit into the allocator state (for use from blocking tasks).
 pub(crate) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<()> {
-    use crate::unit::parser::parse_unit;
-
-    // Check all search paths.
-    for dir in sysa::paths::instance().unit_search_paths.iter() {
-        let path = std::path::Path::new(dir).join(name);
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            let unit = parse_unit(name, &content)?;
-            let mut state = allocator.write();
-            state.units.insert(name.to_string(), unit);
-            // Notify the D-Bus layer so it can register a per-unit object.
-            if let Some(ref tx) = state.unit_loaded_tx {
-                let _ = tx.send(name.to_string());
-            }
-            return Ok(());
-        }
+    // Load the unit from disk, instantiating a template (e.g. `getty@.service`
+    // → `getty@tty3.service`) when no exact file exists.
+    let unit = crate::unit::loader::load_unit_flexible(name)?;
+    let mut state = allocator.write();
+    state.units.insert(name.to_string(), unit);
+    // Notify the D-Bus layer so it can register a per-unit object.
+    if let Some(ref tx) = state.unit_loaded_tx {
+        let _ = tx.send(name.to_string());
     }
-    anyhow::bail!(sysa::l10n::fmt(
-        sysa::l10n::t_("Unit not found: {name}"),
-        &[("name", name)],
-    ))
+    Ok(())
 }
 
 // --------------------------------------------------------------------------

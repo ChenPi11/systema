@@ -35,6 +35,21 @@ pub fn parse_unit_from_path(path: &Path) -> Result<UnitFile> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
+    parse_unit_from_path_as(path, name)
+}
+
+/// Parse the unit file at `path` as if it were named `name`.
+///
+/// This is used for template instantiation: the file on disk is a template
+/// (e.g. `getty@.service`) but it is being loaded as an instance
+/// (e.g. `getty@tty3.service`), so `%i`/`%p`/`%n` specifiers are expanded
+/// with the instance name and the resulting unit is named accordingly.
+///
+/// Drop-ins are applied from both the instance drop-in directory
+/// (`<dir>/<name>.d/`) and, when `name` is an instance unit, the template
+/// drop-in directory (`<dir>/<template>.d/`), mirroring systemd's
+/// `unit_find_dropin_paths()`.
+pub fn parse_unit_from_path_as(path: &Path, name: &str) -> Result<UnitFile> {
     let content = std::fs::read_to_string(path).with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Reading unit file {path} ..."),
@@ -47,6 +62,15 @@ pub fn parse_unit_from_path(path: &Path) -> Result<UnitFile> {
     let dropin_dir = path.with_file_name(format!("{}.d", name));
     if dropin_dir.is_dir() {
         apply_dropin_dir(&dropin_dir, &mut unit)?;
+    }
+
+    // For instance units, also apply the template drop-in directory so that
+    // configuration shared by every instance of the template is picked up.
+    if let Some(template) = sysa::unit_name::template_of(name) {
+        let tpl_dropin_dir = path.with_file_name(format!("{}.d", template));
+        if tpl_dropin_dir.is_dir() {
+            apply_dropin_dir(&tpl_dropin_dir, &mut unit)?;
+        }
     }
 
     Ok(unit)
@@ -126,13 +150,27 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
             if let Some(ref mut svc) = unit.service {
                 // configparser only retains the last repeated key, so we must scan raw
                 // lines ourselves to implement systemd's "empty ExecStart= clears" semantics.
-                let exec_lines = collect_exec_lines(&processed, "service", "execstart");
+                let exec_lines = collect_key_lines(&processed, "service", "execstart");
                 for val in exec_lines {
                     if val.is_empty() {
                         svc.exec_start.clear();
                     } else {
                         svc.exec_start
                             .push(ExecCommand::parse(expand_specifiers(&val, &unit.name)));
+                    }
+                }
+
+                // Environment= / EnvironmentFile= append to the accumulated lists.
+                for val in collect_key_lines(&processed, "service", "environment") {
+                    if !val.is_empty() {
+                        svc.environment
+                            .push(expand_specifiers(&val, &unit.name));
+                    }
+                }
+                for val in collect_key_lines(&processed, "service", "environmentfile") {
+                    if !val.is_empty() {
+                        svc.environment_file
+                            .push(expand_specifiers(&val, &unit.name));
                     }
                 }
             }
@@ -216,7 +254,7 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
 
 /// Scan raw (preprocessed) INI content for all values of a key in `section`,
 /// preserving order and including empty values (which configparser drops).
-fn collect_exec_lines(content: &str, section: &str, key: &str) -> Vec<String> {
+fn collect_key_lines(content: &str, section: &str, key: &str) -> Vec<String> {
     let section_header = format!("[{}]", section.to_lowercase());
     let key_lower = key.to_lowercase();
     let mut in_section = false;
@@ -436,6 +474,7 @@ fn preprocess_content(content: &str) -> String {
 /// | `%N`      | Unit name without suffix, e.g. `sshd` |
 /// | `%p`      | Prefix name (before `@`), e.g. `sshd` for `sshd@1.service` |
 /// | `%i`      | Instance string (between `@` and `.`), e.g. `1` |
+/// | `%I`      | Unescaped instance string, e.g. `dev-sda1` → `dev/sda1` |
 /// | `%u`      | Username that runs the unit (current user) |
 /// | `%U`      | Numeric UID |
 /// | `%g`      | Primary group name |
@@ -511,6 +550,7 @@ pub fn expand_specifiers(s: &str, name: &str) -> String {
             Some('N') => out.push_str(unit_no_ext),
             Some('p') => out.push_str(prefix),
             Some('i') => out.push_str(instance),
+            Some('I') => out.push_str(&sysa::unit_name::unescape(instance)),
             Some('u') => {
                 let user = std::env::var("USER")
                     .or_else(|_| std::env::var("LOGNAME"))
@@ -1528,6 +1568,16 @@ ExecStart=/usr/bin/myapp \
     }
 
     #[test]
+    fn test_specifier_i_upper_unescaped() {
+        assert_eq!(
+            expand_specifiers("%I", "foo@dev\\x2fsda1.service"),
+            "dev/sda1"
+        );
+        assert_eq!(expand_specifiers("%I", "sshd@prod.service"), "prod");
+        assert_eq!(expand_specifiers("%I", "sshd.service"), "");
+    }
+
+    #[test]
     fn test_specifier_percent_escape() {
         assert_eq!(expand_specifiers("100%%", "any.service"), "100%");
     }
@@ -1665,6 +1715,107 @@ DeviceName=/dev/sda
         let input = "[Unit]\nDescription=foo\n";
         let out = preprocess_content(input);
         assert_eq!(out, input);
+    }
+
+    // -----------------------------------------------------------------------
+    // Template instantiation via parse_unit_from_path_as
+    // -----------------------------------------------------------------------
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "systema-sysf-parser-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_parse_template_as_instance_expands_specifiers() {
+        let dir = temp_dir("tpl");
+        let tpl = dir.join("getty@.service");
+        std::fs::write(
+            &tpl,
+            "[Unit]\nDescription=Getty for %I\n[Service]\nExecStart=/sbin/agetty %i -- %p\n",
+        )
+        .unwrap();
+
+        let unit = parse_unit_from_path_as(&tpl, "getty@tty3.service").unwrap();
+        assert_eq!(unit.name, "getty@tty3.service");
+        assert_eq!(unit.unit.description, "Getty for tty3");
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.exec_start[0].raw, "/sbin/agetty tty3 -- getty");
+    }
+
+    #[test]
+    fn test_parse_template_under_its_own_name() {
+        let dir = temp_dir("own");
+        let tpl = dir.join("getty@.service");
+        std::fs::write(
+            &tpl,
+            "[Unit]\nDescription=Getty %I\n[Service]\nExecStart=/sbin/agetty %i\n",
+        )
+        .unwrap();
+
+        // Parsing the template verbatim keeps %i empty.
+        let unit = parse_unit_from_path(&tpl).unwrap();
+        assert_eq!(unit.name, "getty@.service");
+        assert_eq!(unit.unit.description, "Getty ");
+    }
+
+    #[test]
+    fn test_parse_template_applies_template_dropin() {
+        let dir = temp_dir("tpl-dropin");
+        let tpl = dir.join("getty@.service");
+        std::fs::write(
+            &tpl,
+            "[Unit]\nDescription=Getty\n[Service]\nExecStart=/sbin/agetty %i\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("getty@.service.d")).unwrap();
+        std::fs::write(
+            dir.join("getty@.service.d/override.conf"),
+            "[Service]\nEnvironment=EXTRA=1\n",
+        )
+        .unwrap();
+
+        let unit = parse_unit_from_path_as(&tpl, "getty@tty3.service").unwrap();
+        let svc = unit.service.unwrap();
+        assert!(svc.environment.contains(&"EXTRA=1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_template_instance_dropin_wins_over_template() {
+        let dir = temp_dir("inst-dropin");
+        let tpl = dir.join("getty@.service");
+        std::fs::write(
+            &tpl,
+            "[Unit]\nDescription=Getty\n[Service]\nExecStart=/sbin/agetty %i\nEnvironment=BASE=1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("getty@.service.d")).unwrap();
+        std::fs::write(
+            dir.join("getty@.service.d/base.conf"),
+            "[Service]\nEnvironment=TPL=1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("getty@tty3.service.d")).unwrap();
+        std::fs::write(
+            dir.join("getty@tty3.service.d/instance.conf"),
+            "[Service]\nEnvironment=INST=1\n",
+        )
+        .unwrap();
+
+        let unit = parse_unit_from_path_as(&tpl, "getty@tty3.service").unwrap();
+        let svc = unit.service.unwrap();
+        assert!(svc.environment.contains(&"BASE=1".to_string()));
+        assert!(svc.environment.contains(&"TPL=1".to_string()));
+        assert!(svc.environment.contains(&"INST=1".to_string()));
     }
 
     // -----------------------------------------------------------------------

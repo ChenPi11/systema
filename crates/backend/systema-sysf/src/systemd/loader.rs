@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use super::parser::parse_unit_from_path;
+use super::parser::{parse_unit_from_path, parse_unit_from_path_as};
 use super::types::UnitFile;
 pub fn is_known_extension(name: &str) -> bool {
     matches!(
@@ -40,8 +40,43 @@ pub fn discover_all() -> Result<Vec<UnitFile>> {
 }
 
 /// Find and parse a single named unit file from standard search paths.
+///
+/// If an exact file with `name` does not exist but `name` is an instance
+/// unit (`foo@bar.service`), the corresponding template file
+/// (`foo@.service`) is loaded instead and instantiated with the requested
+/// name (so `%i`/`%p`/`%n` specifiers are expanded with the instance).
 pub fn discover_one(name: &str) -> Result<Option<UnitFile>> {
-    for dir in sysa::paths::instance().unit_search_paths.iter() {
+    discover_one_in(&sysa::paths::instance().unit_search_paths, name)
+}
+
+/// [`discover_one`] over an explicit search-path list (testable without
+/// touching the global path configuration).
+fn discover_one_in(dirs: &[String], name: &str) -> Result<Option<UnitFile>> {
+    if let Some(unit) = find_exact_in(dirs, name)? {
+        return Ok(Some(unit));
+    }
+
+    // Template fallback for instance units.
+    if let Some(template) = sysa::unit_name::template_of(name) {
+        for dir in dirs {
+            let path = Path::new(dir).join(&template);
+            if path.is_file() {
+                match parse_unit_from_path_as(&path, name) {
+                    Ok(unit) => return Ok(Some(unit)),
+                    Err(e) => {
+                        warn!("Failed to parse template {} for {}: {}", path.display(), name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Find and parse a unit file that exists verbatim under `name`.
+fn find_exact_in(dirs: &[String], name: &str) -> Result<Option<UnitFile>> {
+    for dir in dirs {
         let path = Path::new(dir).join(name);
         if path.exists() {
             match parse_unit_from_path(&path) {
@@ -106,4 +141,77 @@ fn load_units_from_dir(dir: &Path, units: &mut Vec<UnitFile>) -> Result<usize> {
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Create a unique temporary directory for one test.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "systema-sysf-loader-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn discover_one_instantiates_template() {
+        let dir = temp_dir("tpl");
+        let tpl = dir.join("getty@.service");
+        fs::write(
+            &tpl,
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty -o '-p -- \\\\u' %i\n",
+        )
+        .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let unit = discover_one_in(&dirs, "getty@tty3.service").unwrap().unwrap();
+
+        assert_eq!(unit.name, "getty@tty3.service");
+        assert_eq!(unit.unit.description, "Getty on tty3");
+        let svc = unit.service.unwrap();
+        assert!(svc.exec_start[0].raw.contains("tty3"));
+        assert!(svc.exec_start[0].args.contains(&"tty3".to_string()));
+    }
+
+    #[test]
+    fn discover_one_exact_file_takes_precedence() {
+        let dir = temp_dir("exact");
+        fs::write(
+            dir.join("getty@tty3.service"),
+            "[Unit]\nDescription=Exact instance\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let unit = discover_one_in(&dirs, "getty@tty3.service").unwrap().unwrap();
+
+        assert_eq!(unit.name, "getty@tty3.service");
+        assert_eq!(unit.unit.description, "Exact instance");
+    }
+
+    #[test]
+    fn discover_one_missing_returns_none() {
+        let dir = temp_dir("missing");
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        assert!(discover_one_in(&dirs, "nonexistent.service").unwrap().is_none());
+        assert!(discover_one_in(&dirs, "getty@tty9.service").unwrap().is_none());
+    }
+
+    #[test]
+    fn discover_one_plain_unit_no_fallback() {
+        let dir = temp_dir("plain");
+        // A plain (non-instance) name must never fall back to anything.
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        assert!(discover_one_in(&dirs, "sshd.service").unwrap().is_none());
+    }
 }
