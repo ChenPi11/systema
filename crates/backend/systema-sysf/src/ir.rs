@@ -106,6 +106,10 @@ pub struct ServiceConfig {
     pub watchdog_sec: u32,
     pub kill_signal: String,
     pub kill_mode: String,
+    pub standard_input: String,
+    pub standard_output: String,
+    pub standard_error: String,
+    pub tty_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

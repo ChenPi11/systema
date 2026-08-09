@@ -142,6 +142,10 @@ fn convert_service(svc: &ServiceSection) -> ServiceConfig {
         watchdog_sec: svc.watchdog_sec,
         kill_signal: svc.kill_signal.clone(),
         kill_mode: svc.kill_mode.clone(),
+        standard_input: svc.standard_input.clone(),
+        standard_output: svc.standard_output.clone(),
+        standard_error: svc.standard_error.clone(),
+        tty_path: svc.tty_path.clone(),
     }
 }
 

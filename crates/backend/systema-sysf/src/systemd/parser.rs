@@ -173,6 +173,23 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
                             .push(expand_specifiers(&val, &unit.name));
                     }
                 }
+
+                // Scalar keys in drop-ins override the base value. Unlike the
+                // full re-parse used for other sections, these are applied
+                // individually so keys absent from the drop-in do not reset
+                // the base values back to their defaults.
+                if let Some(v) = config.get("service", "ttypath") {
+                    svc.tty_path = expand_specifiers(&v, &unit.name);
+                }
+                if let Some(v) = config.get("service", "standardinput") {
+                    svc.standard_input = v;
+                }
+                if let Some(v) = config.get("service", "standardoutput") {
+                    svc.standard_output = v;
+                }
+                if let Some(v) = config.get("service", "standarderror") {
+                    svc.standard_error = v;
+                }
             }
         }
         UnitKind::Mount => {
@@ -915,8 +932,10 @@ fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> 
     svc.pid_file = get_str(config, "service", "pidfile");
     svc.bus_name = get_str(config, "service", "busname");
     svc.notify_access = get_str(config, "service", "notifyaccess");
+    svc.standard_input = get_str(config, "service", "standardinput");
     svc.standard_output = get_str(config, "service", "standardoutput");
     svc.standard_error = get_str(config, "service", "standarderror");
+    svc.tty_path = expand_specifiers(&get_str(config, "service", "ttypath"), name);
     svc.kill_signal = get_str(config, "service", "killsignal");
     svc.kill_mode = get_str(config, "service", "killmode");
 
@@ -1696,6 +1715,31 @@ DeviceName=/dev/sda
         assert_eq!(svc.exec_start[0].program, "/usr/bin/override");
     }
 
+    #[test]
+    fn test_dropin_tty_path_overrides() {
+        let base = "[Service]\nExecStart=/usr/bin/foo\nTTYPath=/dev/tty1\nStandardInput=tty\n";
+        let mut unit = parse_unit("test.service", base).unwrap();
+        let dropin = "[Service]\nTTYPath=/dev/tty2\n";
+        apply_dropin_content(&mut unit, dropin).unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.tty_path, "/dev/tty2");
+        // Keys absent from the drop-in are preserved (no default reset).
+        assert_eq!(svc.standard_input, "tty");
+        assert_eq!(svc.exec_start[0].program, "/usr/bin/foo");
+    }
+
+    #[test]
+    fn test_dropin_standard_input_overrides() {
+        let base = "[Service]\nExecStart=/usr/bin/foo\nStandardOutput=tty\n";
+        let mut unit = parse_unit("test.service", base).unwrap();
+        let dropin = "[Service]\nStandardInput=tty\nStandardError=tty\n";
+        apply_dropin_content(&mut unit, dropin).unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.standard_input, "tty");
+        assert_eq!(svc.standard_error, "tty");
+        assert_eq!(svc.standard_output, "tty");
+    }
+
     // -----------------------------------------------------------------------
     // Preprocessing
     // -----------------------------------------------------------------------
@@ -1749,6 +1793,40 @@ DeviceName=/dev/sda
         assert_eq!(unit.unit.description, "Getty for tty3");
         let svc = unit.service.unwrap();
         assert_eq!(svc.exec_start[0].raw, "/sbin/agetty tty3 -- getty");
+    }
+
+    #[test]
+    fn test_parse_tty_path() {
+        let content = "[Service]\nTTYPath=/dev/ttyS0\nStandardInput=tty\nExecStart=/bin/sh\n";
+        let unit = parse_unit("serial-getty@ttyS0.service", content).unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.tty_path, "/dev/ttyS0");
+        assert_eq!(svc.standard_input, "tty");
+    }
+
+    #[test]
+    fn test_parse_tty_path_defaults_to_empty() {
+        let unit = parse_unit("plain.service", "[Service]\nExecStart=/bin/sh\n").unwrap();
+        let svc = unit.service.unwrap();
+        // Unset TTYPath/Standard* default to empty; the runtime resolves the
+        // default device (/dev/console) only when tty stdio is requested.
+        assert_eq!(svc.tty_path, "");
+        assert_eq!(svc.standard_input, "");
+    }
+
+    #[test]
+    fn test_parse_template_tty_path_expands_instance() {
+        let dir = temp_dir("tty-tpl");
+        let tpl = dir.join("getty@.service");
+        std::fs::write(
+            &tpl,
+            "[Unit]\nDescription=Getty\n[Service]\nExecStart=/sbin/agetty %i\nTTYPath=/dev/%I\nStandardInput=tty\nStandardOutput=tty\n",
+        )
+        .unwrap();
+
+        let unit = parse_unit_from_path_as(&tpl, "getty@tty3.service").unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.tty_path, "/dev/tty3");
     }
 
     #[test]

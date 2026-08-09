@@ -22,10 +22,19 @@
 //! | `|`    | `VIA_SHELL`                | Run via `sh -c`                  |
 
 use std::collections::HashMap;
+use std::process::Stdio;
+
+#[cfg(unix)]
+use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
+
+#[cfg(unix)]
+use nix::libc;
 
 use sysa::proto::UnitConfig;
 
@@ -114,9 +123,15 @@ pub async fn start_service(
         cmd.env("INVOCATION_ID", inv_id);
     }
 
+    // TTY stdio: attach the configured TTY as the controlling terminal and
+    // redirect the requested standard streams to it.
+    let tty_fd = apply_tty(&mut cmd, svc, &unit_name)?;
+
     // Spawn the child process. We deliberately do NOT wait here — the child
     // is monitored asynchronously via `monitor_child`.
-    let child = cmd.spawn().with_context(|| {
+    let spawn_result = cmd.spawn();
+    close_tty_fd(tty_fd);
+    let child = spawn_result.with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Failed to spawn {program}."),
             &[("program", &parsed.program)],
@@ -227,6 +242,152 @@ pub fn is_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 pub fn is_alive(_pid: u32) -> bool {
     false
+}
+
+// ---------------------------------------------------------------------------
+// TTY stdio (systemd-compatible StandardInput/Output/Error=tty)
+// ---------------------------------------------------------------------------
+
+/// Whether a `Standard*=` value requests TTY I/O.  systemd supports the
+/// values `tty`, `tty-force`, `tty-fail` and `tty-sockets`; all of them
+/// attach the TTY to the process.
+fn is_tty_mode(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower == "tty" || lower.starts_with("tty-")
+}
+
+fn is_tty_force(value: &str) -> bool {
+    value.eq_ignore_ascii_case("tty-force")
+}
+
+/// Duplicate `fd` into a fresh, owned descriptor suitable for `Stdio`.
+#[cfg(unix)]
+fn dup_fd(fd: RawFd) -> Result<OwnedFd> {
+    let new_fd = unsafe { libc::dup(fd) };
+    if new_fd < 0 {
+        bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("Failed to duplicate TTY fd: {e}."),
+            &[("e", &std::io::Error::last_os_error().to_string())]
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(new_fd) })
+}
+
+/// Close the parent-side TTY descriptor after `spawn()` (the child already
+/// duplicated what it needs via stdio / `pre_exec`).
+#[cfg(unix)]
+fn close_tty_fd(fd: Option<RawFd>) {
+    if let Some(fd) = fd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn close_tty_fd(_fd: Option<RawFd>) {}
+
+/// Attach the unit's TTY to the child process.
+///
+/// When any of `StandardInput=/StandardOutput=/StandardError=` selects the
+/// `tty` mode, the device at `TTYPath=` (default `/dev/console`) is opened,
+/// the requested standard streams are redirected to it, and the child is
+/// made a session leader with the TTY as its controlling terminal (so the
+/// TTY delivers terminal signals and job control to the service).
+///
+/// Returns the raw fd of the opened TTY. The caller must keep it open until
+/// after `spawn()` (it is inherited by the child for `pre_exec`), then close
+/// it with [`close_tty_fd`].
+///
+/// If the TTY device cannot be opened (e.g. insufficient permissions), a
+/// warning is logged and `Ok(None)` is returned so the service still starts
+/// with its ordinary stdio.
+#[cfg(unix)]
+fn apply_tty(
+    cmd: &mut Command,
+    svc: &sysa::proto::ServiceConfig,
+    unit_name: &str,
+) -> Result<Option<RawFd>> {
+    let tty_in = is_tty_mode(&svc.standard_input);
+    let tty_out = is_tty_mode(&svc.standard_output);
+    let tty_err = is_tty_mode(&svc.standard_error);
+    if !(tty_in || tty_out || tty_err) {
+        return Ok(None);
+    }
+
+    let path = if svc.tty_path.is_empty() {
+        "/dev/console".to_string()
+    } else {
+        svc.tty_path.clone()
+    };
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(
+                "Cannot open TTY {} for {} ({}): ignoring TTYPath",
+                path, unit_name, e
+            );
+            return Ok(None);
+        }
+    };
+    let base = file.into_raw_fd();
+
+    // Redirect each requested stream to a duplicate of the TTY fd. On error,
+    // close `base` before returning so we do not leak the descriptor.
+    for (want, index) in [(tty_in, 0usize), (tty_out, 1), (tty_err, 2)] {
+        if !want {
+            continue;
+        }
+        let owned = match dup_fd(base) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe {
+                    libc::close(base);
+                }
+                return Err(e);
+            }
+        };
+        let stdio = Stdio::from(owned);
+        match index {
+            0 => cmd.stdin(stdio),
+            1 => cmd.stdout(stdio),
+            _ => cmd.stderr(stdio),
+        };
+    }
+    // In the child: become a session leader and acquire the TTY as the
+    // controlling terminal. A failed TIOCSCTTY is non-fatal (matching
+    // systemd's `StandardInput=tty`): the redirected streams still work
+    // without a controlling terminal.
+    let force = is_tty_force(&svc.standard_input)
+        || is_tty_force(&svc.standard_output)
+        || is_tty_force(&svc.standard_error);
+    unsafe {
+        cmd.as_std_mut().pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let arg = if force { 1 } else { 0 };
+            libc::ioctl(base, libc::TIOCSCTTY, arg);
+            libc::close(base);
+            Ok(())
+        });
+    }
+
+    Ok(Some(base))
+}
+
+#[cfg(not(unix))]
+fn apply_tty(
+    _cmd: &mut Command,
+    _svc: &sysa::proto::ServiceConfig,
+    _unit_name: &str,
+) -> Result<Option<RawFd>> {
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,5 +1351,24 @@ mod tests {
     #[test]
     fn parse_empty_fails() {
         assert!(parse_exec_start("", "test.service").is_err());
+    }
+
+    // --- TTY stdio mode detection ---
+
+    #[cfg(unix)]
+    #[test]
+    fn tty_mode_detection() {
+        assert!(is_tty_mode("tty"));
+        assert!(is_tty_mode("tty-force"));
+        assert!(is_tty_mode("tty-fail"));
+        assert!(is_tty_mode("tty-sockets"));
+        assert!(is_tty_mode("TTY"));
+        assert!(!is_tty_mode("journal"));
+        assert!(!is_tty_mode("inherit"));
+        assert!(!is_tty_mode(""));
+        assert!(is_tty_force("tty-force"));
+        assert!(is_tty_force("TTY-FORCE"));
+        assert!(!is_tty_force("tty"));
+        assert!(!is_tty_force(""));
     }
 }

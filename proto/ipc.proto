@@ -343,4 +343,8 @@ message ServiceConfig {
     string pid_file = 11;
     uint32 timeout_start_secs = 12;
     uint32 timeout_stop_secs = 13;
+    string standard_input = 14;
+    string standard_output = 15;
+    string standard_error = 16;
+    string tty_path = 17;
 }

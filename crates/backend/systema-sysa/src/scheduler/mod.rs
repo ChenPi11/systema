@@ -1096,6 +1096,10 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         pid_file: svc.pid_file.clone(),
         timeout_start_secs: svc.timeout_start_sec,
         timeout_stop_secs: svc.timeout_stop_sec,
+        standard_input: svc.standard_input.clone(),
+        standard_output: svc.standard_output.clone(),
+        standard_error: svc.standard_error.clone(),
+        tty_path: svc.tty_path.clone(),
     });
 
     let socket = uf.socket.as_ref().map(|sk| {

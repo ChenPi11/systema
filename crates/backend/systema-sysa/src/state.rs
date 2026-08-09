@@ -674,6 +674,10 @@ fn service_config_to_section(
         watchdog_sec: cfg.watchdog_sec,
         kill_signal: cfg.kill_signal.clone(),
         kill_mode: cfg.kill_mode.clone(),
+        standard_input: cfg.standard_input.clone(),
+        standard_output: cfg.standard_output.clone(),
+        standard_error: cfg.standard_error.clone(),
+        tty_path: cfg.tty_path.clone(),
         ..Default::default()
     }
 }
