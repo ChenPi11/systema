@@ -172,11 +172,11 @@ pub async fn commit_mount_units(units: &HashMap<String, UnitIR>) -> bool {
     match finder.commit_units("systema-sysm/discovery").await {
         Ok(ack) if !ack.success => {
             warn!("Unit commit rejected: {}", ack.message);
-            return false;
+            false
         }
         Err(e) => {
             warn!("Failed to commit discovered mount units: {e}");
-            return false;
+            false
         }
         Ok(ack) => {
             info!(

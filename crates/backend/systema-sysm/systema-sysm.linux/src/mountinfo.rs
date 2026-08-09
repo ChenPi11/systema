@@ -425,13 +425,10 @@ impl MountInfoMonitor {
             if !prev_mounted && now_mounted {
                 let mut reg = self.registry.lock();
                 if let Some(inst) = reg.get_mut(unit_name) {
-                    match inst.state {
-                        MountState::Dead => {
-                            debug!("Mount point {} appeared (external mount)", mp);
-                            inst.from_mountinfo = true;
-                            inst.state = MountState::Mounted;
-                        }
-                        _ => {}
+                    if inst.state == MountState::Dead {
+                        debug!("Mount point {} appeared (external mount)", mp);
+                        inst.from_mountinfo = true;
+                        inst.state = MountState::Mounted;
                     }
                 }
                 drop(reg);

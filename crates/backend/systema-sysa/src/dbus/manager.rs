@@ -430,8 +430,8 @@ impl ManagerInterface {
 
         let alloc = self.allocator.clone();
         let name_owned = name.to_string();
-        self.load_unit_if_needed(&name).await?;
-        self.ensure_unit_object(&name).await;
+        self.load_unit_if_needed(name).await?;
+        self.ensure_unit_object(name).await;
 
         let (job_id, collapsed) =
             scheduler::enqueue_job_type(alloc.clone(), &name_owned, kind, reload_if_possible, mode)
@@ -569,11 +569,10 @@ impl ManagerInterface {
         let state = self.allocator.read();
         let result = build_unit_list(&state, |name, _s| {
             // Pattern filter (state filter is a no-op without runtime cache).
-            if !patterns.is_empty() {
-                if !patterns.iter().any(|p| matches_glob(p, name)) {
+            if !patterns.is_empty()
+                && !patterns.iter().any(|p| matches_glob(p, name)) {
                     return false;
                 }
-            }
             true
         });
         debug!(

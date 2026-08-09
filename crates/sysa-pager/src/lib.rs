@@ -6,16 +6,12 @@ use std::sync::Mutex;
 
 /// Configuration for opening a pager.
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct PagerConfig {
     /// When true, `open()` returns a no-op guard and no pager is started.
     pub disable: bool,
 }
 
-impl Default for PagerConfig {
-    fn default() -> Self {
-        Self { disable: false }
-    }
-}
 
 static STATE: Mutex<Option<PagerState>> = Mutex::new(None);
 
@@ -77,8 +73,7 @@ pub fn open(config: PagerConfig) -> io::Result<PagerGuard> {
     }
 
     let mut child = cmd.spawn().map_err(|e| {
-        io::Error::new(
-            ErrorKind::Other,
+        io::Error::other(
             format!("failed to spawn pager '{pager}': {e}"),
         )
     })?;

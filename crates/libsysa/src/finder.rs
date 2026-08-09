@@ -105,3 +105,9 @@ impl UnitFinder {
         Ok(result)
     }
 }
+
+impl Default for UnitFinder {
+    fn default() -> Self {
+        Self::new()
+    }
+}

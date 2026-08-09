@@ -237,15 +237,14 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
                 unit.scope = Some(scope);
             }
         }
-        UnitKind::Device => {
-            if config.get("device", "property").is_some()
-                || config.get("device", "sysfspath").is_some()
-            {
+        UnitKind::Device
+            if (config.get("device", "property").is_some()
+                || config.get("device", "sysfspath").is_some())
+            => {
                 let mut device = unit.device.take().unwrap_or_default();
                 parse_device_section(&config, &mut device, &unit.name)?;
                 unit.device = Some(device);
             }
-        }
         _ => {}
     }
 

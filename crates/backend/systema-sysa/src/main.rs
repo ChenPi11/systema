@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     info!("System A (System Allocator) starting up");
 
     // Shared allocator state accessible from both the IPC server and D-Bus server.
-    let allocator = state::Allocator::new();
+    let allocator = state::Allocator::handle();
 
     // Register in-process event-bus subscribers.
     {

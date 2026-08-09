@@ -84,7 +84,7 @@ pub fn spawn_engine(shared: Arc<EngineShared>, mut refresh_rx: tokio::sync::mpsc
 async fn do_refresh(shared: &Arc<EngineShared>) -> anyhow::Result<()> {
     let devices = enumerate_devices();
 
-    let new_to_inject = reconcile(&shared, &devices);
+    let new_to_inject = reconcile(shared, &devices);
     inject_units(shared, &new_to_inject).await;
     publish_diffs(shared);
     Ok(())

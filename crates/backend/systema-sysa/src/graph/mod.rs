@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_single_unit_no_deps() {
-        let units = vec![make_unit("foo.service")];
+        let units = [make_unit("foo.service")];
         let graph = DependencyGraph::build(units.iter());
 
         assert_eq!(graph.node_count(), 1);
@@ -294,11 +294,9 @@ mod tests {
 
     #[test]
     fn test_multiple_units_no_deps() {
-        let units = vec![
-            make_unit("a.service"),
+        let units = [make_unit("a.service"),
             make_unit("b.service"),
-            make_unit("c.target"),
-        ];
+            make_unit("c.target")];
         let graph = DependencyGraph::build(units.iter());
 
         assert_eq!(graph.node_count(), 3);
@@ -314,10 +312,8 @@ mod tests {
 
     #[test]
     fn test_after_creates_weak_edge() {
-        let units = vec![
-            make_unit("network.target"),
-            make_unit_after("sshd.service", &["network.target"]),
-        ];
+        let units = [make_unit("network.target"),
+            make_unit_after("sshd.service", &["network.target"])];
         let graph = DependencyGraph::build(units.iter());
 
         // After=network.target on sshd.service means network.target → sshd.service
@@ -332,11 +328,9 @@ mod tests {
 
     #[test]
     fn test_after_multiple_deps() {
-        let units = vec![
-            make_unit("a.target"),
+        let units = [make_unit("a.target"),
             make_unit("b.target"),
-            make_unit_after("c.service", &["a.target", "b.target"]),
-        ];
+            make_unit_after("c.service", &["a.target", "b.target"])];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_edge("a.target", "c.service"));
@@ -347,7 +341,7 @@ mod tests {
     #[test]
     fn test_after_creates_implicit_node_for_unknown_dep() {
         // If After= references a unit not in the provided list, a node is created.
-        let units = vec![make_unit_after("sshd.service", &["network.target"])];
+        let units = [make_unit_after("sshd.service", &["network.target"])];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_node("network.target"));
@@ -362,10 +356,8 @@ mod tests {
 
     #[test]
     fn test_before_creates_weak_edge() {
-        let units = vec![
-            make_unit("sshd.service"),
-            make_unit_before("network.target", &["sshd.service"]),
-        ];
+        let units = [make_unit("sshd.service"),
+            make_unit_before("network.target", &["sshd.service"])];
         let graph = DependencyGraph::build(units.iter());
 
         // Before=sshd.service on network.target means network.target → sshd.service
@@ -378,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_before_creates_implicit_node() {
-        let units = vec![make_unit_before("early.service", &["late.service"])];
+        let units = [make_unit_before("early.service", &["late.service"])];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_node("late.service"));
@@ -388,14 +380,10 @@ mod tests {
     #[test]
     fn test_before_and_after_symmetry() {
         // After=X on unit B is equivalent to Before=B on unit X
-        let units_after = vec![
-            make_unit("x.service"),
-            make_unit_after("b.service", &["x.service"]),
-        ];
-        let units_before = vec![
-            make_unit_before("x.service", &["b.service"]),
-            make_unit("b.service"),
-        ];
+        let units_after = [make_unit("x.service"),
+            make_unit_after("b.service", &["x.service"])];
+        let units_before = [make_unit_before("x.service", &["b.service"]),
+            make_unit("b.service")];
 
         let graph_after = DependencyGraph::build(units_after.iter());
         let graph_before = DependencyGraph::build(units_before.iter());
@@ -414,7 +402,7 @@ mod tests {
         let mut unit = make_unit("app.service");
         unit.unit.requisite.insert("base.target".to_string());
 
-        let units = vec![make_unit("base.target"), unit];
+        let units = [make_unit("base.target"), unit];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_edge("base.target", "app.service"));
@@ -429,7 +417,7 @@ mod tests {
         let mut unit = make_unit("app.service");
         unit.unit.requisite.insert("missing.target".to_string());
 
-        let units = vec![unit];
+        let units = [unit];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_node("missing.target"));
@@ -449,7 +437,7 @@ mod tests {
         let mut unit = make_unit("webapp.service");
         unit.unit.binds_to.insert("database.service".to_string());
 
-        let units = vec![make_unit("database.service"), unit];
+        let units = [make_unit("database.service"), unit];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_edge("database.service", "webapp.service"));
@@ -464,7 +452,7 @@ mod tests {
         let mut unit = make_unit("webapp.service");
         unit.unit.binds_to.insert("unknown.service".to_string());
 
-        let units = vec![unit];
+        let units = [unit];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_node("unknown.service"));
@@ -485,7 +473,7 @@ mod tests {
         let mut dep = make_unit("dep.service");
         dep.unit.before.insert("app.service".to_string());
 
-        let units = vec![dep, unit];
+        let units = [dep, unit];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_edge("dep.service", "app.service"));
@@ -501,7 +489,7 @@ mod tests {
         unit.unit.after.insert("base.target".to_string());
         unit.unit.requisite.insert("base.target".to_string());
 
-        let units = vec![make_unit("base.target"), unit];
+        let units = [make_unit("base.target"), unit];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(graph.has_edge("base.target", "app.service"));
@@ -517,11 +505,9 @@ mod tests {
     #[test]
     fn test_topological_order_linear_chain() {
         // a → b → c (a must start first, then b, then c)
-        let units = vec![
-            make_unit_before("a.service", &["b.service"]),
+        let units = [make_unit_before("a.service", &["b.service"]),
             make_unit_before("b.service", &["c.service"]),
-            make_unit("c.service"),
-        ];
+            make_unit("c.service")];
         let graph = DependencyGraph::build(units.iter());
         let order = graph.topological_order().unwrap();
 
@@ -536,11 +522,9 @@ mod tests {
     #[test]
     fn test_topological_order_after_chain() {
         // c After b After a → a must come first
-        let units = vec![
-            make_unit("a.service"),
+        let units = [make_unit("a.service"),
             make_unit_after("b.service", &["a.service"]),
-            make_unit_after("c.service", &["b.service"]),
-        ];
+            make_unit_after("c.service", &["b.service"])];
         let graph = DependencyGraph::build(units.iter());
         let order = graph.topological_order().unwrap();
 
@@ -571,7 +555,7 @@ mod tests {
 
         let d = make_unit("d.service");
 
-        let units = vec![a, b, c, d];
+        let units = [a, b, c, d];
         let graph = DependencyGraph::build(units.iter());
         let order = graph.topological_order().unwrap();
 
@@ -599,7 +583,7 @@ mod tests {
         let mut b = make_unit("b.service");
         b.unit.after.insert("a.service".to_string());
 
-        let units = vec![a, b];
+        let units = [a, b];
         let graph = DependencyGraph::build(units.iter());
 
         // Should successfully break the cycle (weak edges)
@@ -621,7 +605,7 @@ mod tests {
         let mut b = make_unit("b.service");
         b.unit.after.insert("a.service".to_string()); // Weak edge a→b
 
-        let units = vec![a, b];
+        let units = [a, b];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.topological_order();
@@ -642,7 +626,7 @@ mod tests {
         let mut c = make_unit("c.service");
         c.unit.after.insert("a.service".to_string());
 
-        let units = vec![a, b, c];
+        let units = [a, b, c];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.topological_order();
@@ -661,7 +645,7 @@ mod tests {
         let mut b = make_unit("b.service");
         b.unit.requisite.insert("a.service".to_string()); // Strong a→b
 
-        let units = vec![a, b];
+        let units = [a, b];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.topological_order();
@@ -671,12 +655,10 @@ mod tests {
     #[test]
     fn test_no_cycle_dag() {
         // Ensure normal DAG doesn't trigger cycle breaking
-        let units = vec![
-            make_unit("a.service"),
+        let units = [make_unit("a.service"),
             make_unit_after("b.service", &["a.service"]),
             make_unit_after("c.service", &["a.service"]),
-            make_unit_after("d.service", &["b.service", "c.service"]),
-        ];
+            make_unit_after("d.service", &["b.service", "c.service"])];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.topological_order().unwrap();
@@ -697,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_start_order_for_single_unit() {
-        let units = vec![make_unit("foo.service")];
+        let units = [make_unit("foo.service")];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.start_order_for("foo.service").unwrap();
@@ -707,11 +689,9 @@ mod tests {
     #[test]
     fn test_start_order_for_with_deps() {
         // a → b → c: to start c, we need b and a first
-        let units = vec![
-            make_unit("a.service"),
+        let units = [make_unit("a.service"),
             make_unit_after("b.service", &["a.service"]),
-            make_unit_after("c.service", &["b.service"]),
-        ];
+            make_unit_after("c.service", &["b.service"])];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.start_order_for("c.service").unwrap();
@@ -730,11 +710,9 @@ mod tests {
     #[test]
     fn test_start_order_for_does_not_include_unrelated() {
         // a → b, c is unrelated. Starting b should not include c.
-        let units = vec![
-            make_unit("a.service"),
+        let units = [make_unit("a.service"),
             make_unit_after("b.service", &["a.service"]),
-            make_unit("c.service"),
-        ];
+            make_unit("c.service")];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.start_order_for("b.service").unwrap();
@@ -745,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_start_order_for_unknown_unit() {
-        let units = vec![make_unit("a.service")];
+        let units = [make_unit("a.service")];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.start_order_for("nonexistent.service").unwrap();
@@ -768,7 +746,7 @@ mod tests {
 
         let d = make_unit("d.service");
 
-        let units = vec![a, b, c, d];
+        let units = [a, b, c, d];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.start_order_for("d.service").unwrap();
@@ -792,11 +770,9 @@ mod tests {
         unit.unit.requires.insert("base.target".to_string());
         unit.unit.wants.insert("logging.service".to_string());
 
-        let units = vec![
-            make_unit("base.target"),
+        let units = [make_unit("base.target"),
             make_unit("logging.service"),
-            unit.clone(),
-        ];
+            unit.clone()];
         let graph = DependencyGraph::build(units.iter());
 
         let mut unit_map = HashMap::new();
@@ -810,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_required_deps_unknown_unit() {
-        let units = vec![make_unit("a.service")];
+        let units = [make_unit("a.service")];
         let graph = DependencyGraph::build(units.iter());
         let unit_map = HashMap::new();
 
@@ -822,7 +798,7 @@ mod tests {
     fn test_required_deps_no_deps() {
         let unit = make_unit("app.service");
 
-        let units = vec![unit.clone()];
+        let units = [unit.clone()];
         let graph = DependencyGraph::build(units.iter());
 
         let mut unit_map = HashMap::new();
@@ -857,7 +833,7 @@ mod tests {
         let mut graphical = make_unit("graphical.target");
         graphical.unit.after.insert("multi-user.target".to_string());
 
-        let units = vec![sysinit, basic, multi_user, graphical];
+        let units = [sysinit, basic, multi_user, graphical];
         let graph = DependencyGraph::build(units.iter());
 
         let order = graph.topological_order().unwrap();
@@ -877,13 +853,11 @@ mod tests {
         svc.unit.binds_to.insert("database.service".to_string());
         svc.unit.requisite.insert("base.target".to_string());
 
-        let units = vec![
-            make_unit("network.target"),
+        let units = [make_unit("network.target"),
             make_unit("dbus.service"),
             make_unit("database.service"),
             make_unit("base.target"),
-            svc,
-        ];
+            svc];
         let graph = DependencyGraph::build(units.iter());
 
         // After=network.target → weak edge
@@ -918,7 +892,7 @@ mod tests {
         let mut svc = make_unit("app.service");
         svc.unit.requires.insert("dep.service".to_string());
 
-        let units = vec![make_unit("dep.service"), svc];
+        let units = [make_unit("dep.service"), svc];
         let graph = DependencyGraph::build(units.iter());
 
         assert!(!graph.has_edge("dep.service", "app.service"));
@@ -932,7 +906,7 @@ mod tests {
         let mut svc = make_unit("app.service");
         svc.unit.wants.insert("opt.service".to_string());
 
-        let units = vec![make_unit("opt.service"), svc];
+        let units = [make_unit("opt.service"), svc];
         let graph = DependencyGraph::build(units.iter());
 
         assert_eq!(graph.edge_count(), 0);
@@ -974,12 +948,10 @@ mod tests {
         parent.unit.before.insert("child2.service".to_string());
         parent.unit.before.insert("child3.service".to_string());
 
-        let units = vec![
-            parent,
+        let units = [parent,
             make_unit("child1.service"),
             make_unit("child2.service"),
-            make_unit("child3.service"),
-        ];
+            make_unit("child3.service")];
         let graph = DependencyGraph::build(units.iter());
         let order = graph.topological_order().unwrap();
 
@@ -1000,7 +972,7 @@ mod tests {
         let mut unit = make_unit("self.service");
         unit.unit.after.insert("self.service".to_string());
 
-        let units = vec![unit];
+        let units = [unit];
         let graph = DependencyGraph::build(units.iter());
 
         // The graph builds without panic. Self-loop creates a cycle;

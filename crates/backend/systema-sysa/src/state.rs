@@ -774,7 +774,8 @@ pub type AllocatorHandle = Arc<RwLock<AllocatorState>>;
 pub struct Allocator;
 
 impl Allocator {
-    pub fn new() -> AllocatorHandle {
+    /// Create a shared handle to a fresh allocator state.
+    pub fn handle() -> AllocatorHandle {
         Arc::new(RwLock::new(AllocatorState::new()))
     }
 }

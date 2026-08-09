@@ -165,8 +165,10 @@ fn open_ioctl_fd(dev_autofs_fd: i32, where_: &str, dev_id: u64) -> Result<i32> {
 
 fn check_autofs_protocol(dev_autofs_fd: i32, ioctl_fd: i32) -> Result<()> {
     unsafe {
-        let mut params: AutofsDevIoctl = Default::default();
-        params.ioctlfd = ioctl_fd;
+        let mut params: AutofsDevIoctl = AutofsDevIoctl {
+            ioctlfd: ioctl_fd,
+            ..Default::default()
+        };
 
         let rc = libc::ioctl(
             dev_autofs_fd,
@@ -178,8 +180,10 @@ fn check_autofs_protocol(dev_autofs_fd: i32, ioctl_fd: i32) -> Result<()> {
         }
         let major = params.arg1 as u32;
 
-        let mut params2: AutofsDevIoctl = Default::default();
-        params2.ioctlfd = ioctl_fd;
+        let mut params2: AutofsDevIoctl = AutofsDevIoctl {
+            ioctlfd: ioctl_fd,
+            ..Default::default()
+        };
         let rc = libc::ioctl(
             dev_autofs_fd,
             AUTOFS_DEV_IOCTL_PROTOSUBVER,
@@ -197,9 +201,11 @@ fn check_autofs_protocol(dev_autofs_fd: i32, ioctl_fd: i32) -> Result<()> {
 
 fn set_autofs_timeout(dev_autofs_fd: i32, ioctl_fd: i32, timeout_sec: u32) -> Result<()> {
     unsafe {
-        let mut params: AutofsDevIoctl = Default::default();
-        params.ioctlfd = ioctl_fd;
-        params.arg1 = timeout_sec as u64;
+        let mut params: AutofsDevIoctl = AutofsDevIoctl {
+            ioctlfd: ioctl_fd,
+            arg1: timeout_sec as u64,
+            ..Default::default()
+        };
 
         let rc = libc::ioctl(
             dev_autofs_fd,
@@ -216,9 +222,11 @@ fn set_autofs_timeout(dev_autofs_fd: i32, ioctl_fd: i32, timeout_sec: u32) -> Re
 fn send_ack_or_fail(ioctl_fd: i32, token: u32, success: bool) -> Result<()> {
     let dev_autofs_fd = ensure_dev_autofs()?;
     unsafe {
-        let mut params: AutofsDevIoctl = Default::default();
-        params.ioctlfd = ioctl_fd;
-        params.arg1 = token as u64;
+        let mut params: AutofsDevIoctl = AutofsDevIoctl {
+            ioctlfd: ioctl_fd,
+            arg1: token as u64,
+            ..Default::default()
+        };
         let cmd = if success {
             AUTOFS_DEV_IOCTL_ACK
         } else {
@@ -652,8 +660,10 @@ fn do_expire(registry: AutomountRegistry, unit_name: &str) -> Result<()> {
     let dev_autofs_fd = ensure_dev_autofs()?;
 
     unsafe {
-        let mut params: AutofsDevIoctl = Default::default();
-        params.ioctlfd = ioctl_fd;
+        let mut params: AutofsDevIoctl = AutofsDevIoctl {
+            ioctlfd: ioctl_fd,
+            ..Default::default()
+        };
 
         // Try expire in a loop until EAGAIN.  When the kernel selects an
         // object to expire it sends an expire_direct packet on the pipe and

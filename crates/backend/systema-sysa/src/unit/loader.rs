@@ -862,7 +862,7 @@ mod tests {
     }
 
     fn run_injection(units: Vec<UnitFile>) -> std::collections::HashMap<String, UnitFile> {
-        let alloc = Allocator::new();
+        let alloc = Allocator::handle();
         {
             let mut state = alloc.write();
             for u in units {

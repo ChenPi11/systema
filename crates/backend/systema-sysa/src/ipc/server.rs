@@ -40,7 +40,10 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    if let Ok(_) = tokio::net::UnixStream::connect(sysa::paths::instance().ipc_socket_path).await {
+    if tokio::net::UnixStream::connect(sysa::paths::instance().ipc_socket_path)
+        .await
+        .is_ok()
+    {
         warn!(
             "Another allocator is already listening on {}. Exiting.",
             sysa::paths::instance().ipc_socket_path
@@ -263,15 +266,10 @@ async fn handle_worker_session(
     let sender = async move {
         use futures::SinkExt;
         let mut writer = writer_stream;
-        loop {
-            match envelope_rx.recv().await {
-                Some(bytes) => {
-                    if let Err(e) = writer.send(bytes).await {
-                        warn!("Sender error for worker '{}': {}", worker_id_send, e);
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(bytes) = envelope_rx.recv().await {
+            if let Err(e) = writer.send(bytes).await {
+                warn!("Sender error for worker '{}': {}", worker_id_send, e);
+                break;
             }
         }
         Ok::<_, anyhow::Error>(())

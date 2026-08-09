@@ -248,7 +248,8 @@ async fn run_list(json: bool, uids: Vec<u32>, regex_strs: Vec<String>) -> Result
 }
 
 fn build_localized_cli() -> clap::Command {
-    let cmd = Args::command()
+    
+    Args::command()
         .about(l10n::t_("System A — Staging Area Controller"))
         .mut_arg("json", |a| a.help(l10n::t_("Output in JSON format.")))
         .mut_arg("debug", |a| a.help(l10n::t_("Enable debug-level logging.")))
@@ -269,8 +270,7 @@ fn build_localized_cli() -> clap::Command {
                 .mut_arg("regex", |a| {
                     a.help(l10n::t_("Regex pattern(s) to match staging area name."))
                 })
-        });
-    cmd
+        })
 }
 
 #[tokio::main(flavor = "current_thread")]

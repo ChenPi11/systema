@@ -188,7 +188,7 @@ fn resolve_tcp_addr(address: &str) -> Result<std::net::SocketAddr> {
     address.parse().with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Cannot parse TCP address '{address}'."),
-            &[("address", &address.to_string())],
+            &[("address", address)],
         )
     })
 }
@@ -202,7 +202,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
         let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| {
             sysa::l10n::fmt(
                 sysa::l10n::t_("Cannot bind Unix stream at '{address}'."),
-                &[("address", &address.to_string())],
+                &[("address", address)],
             )
         })?;
         // Set listen backlog (std UnixListener doesn't expose a method for this,
@@ -213,7 +213,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
         let listener = UnixListener::from_std(listener).with_context(|| {
             sysa::l10n::fmt(
                 sysa::l10n::t_("Cannot convert Unix listener '{address}'."),
-                &[("address", &address.to_string())],
+                &[("address", address)],
             )
         })?;
         info!("Bound Unix stream at '{}'", address);
@@ -223,7 +223,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
         let std_listener = std::net::TcpListener::bind(addr).with_context(|| {
             sysa::l10n::fmt(
                 sysa::l10n::t_("Cannot bind TCP at '{address}'."),
-                &[("address", &address.to_string())],
+                &[("address", address)],
             )
         })?;
         if backlog > 0 {
@@ -235,7 +235,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
         let listener = TcpListener::from_std(std_listener).with_context(|| {
             sysa::l10n::fmt(
                 sysa::l10n::t_("Cannot convert TCP listener '{address}'."),
-                &[("address", &address.to_string())],
+                &[("address", address)],
             )
         })?;
         info!("Bound TCP stream at '{}'", address);
@@ -296,7 +296,7 @@ fn bind_abstract_unix(address: &str, backlog: u32) -> Result<BoundSocket> {
             libc::close(fd);
             anyhow::bail!(sysa::l10n::fmt(
                 sysa::l10n::t_("bind abstract '{address}' failed: {e}."),
-                &[("address", &address.to_string()), ("e", &e.to_string())]
+                &[("address", address), ("e", &e.to_string())]
             ));
         }
 
@@ -309,7 +309,7 @@ fn bind_abstract_unix(address: &str, backlog: u32) -> Result<BoundSocket> {
     let listener = UnixListener::from_std(std_listener).with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Cannot convert abstract Unix listener '{address}'."),
-            &[("address", &address.to_string())],
+            &[("address", address)],
         )
     })?;
 
@@ -362,7 +362,7 @@ fn bind_datagram(address: &str) -> Result<RawFd> {
             libc::close(fd);
             anyhow::bail!(sysa::l10n::fmt(
                 sysa::l10n::t_("bind datagram '{address}' failed: {e}."),
-                &[("address", &address.to_string()), ("e", &e.to_string())]
+                &[("address", address), ("e", &e.to_string())]
             ));
         }
         fd
@@ -385,7 +385,7 @@ fn create_fifo(path: &str, mode: &str) -> Result<()> {
     let cpath = CString::new(path).with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Invalid FIFO path '{path}'."),
-            &[("path", &path.to_string())],
+            &[("path", path)],
         )
     })?;
     let mode_int = if mode.is_empty() {
@@ -399,7 +399,7 @@ fn create_fifo(path: &str, mode: &str) -> Result<()> {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
             anyhow::bail!(sysa::l10n::fmt(
                 sysa::l10n::t_("mkfifo '{path}' failed: {e}."),
-                &[("path", &path.to_string()), ("e", &e.to_string())]
+                &[("path", path), ("e", &e.to_string())]
             ));
         }
         // File already exists — that's OK.
@@ -490,14 +490,14 @@ async fn spawn_child_with_fd(unit_name: &str, fd: RawFd) -> Result<()> {
     let mut child = cmd.spawn().with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Failed to spawn child for '{unit_name}'."),
-            &[("unit_name", &unit_name.to_string())],
+            &[("unit_name", unit_name)],
         )
     })?;
 
     let status = child.wait().await.with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Failed to wait for child for '{unit_name}'."),
-            &[("unit_name", &unit_name.to_string())],
+            &[("unit_name", unit_name)],
         )
     })?;
 

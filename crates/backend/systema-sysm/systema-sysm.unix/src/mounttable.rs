@@ -362,7 +362,7 @@ fn unescape_mount_field(field: &str) -> String {
         if bytes[i] == b'\\' && i + 4 <= bytes.len() {
             if let Ok(s) = std::str::from_utf8(&bytes[i + 1..i + 4]) {
                 if let Ok(octal) = u32::from_str_radix(s, 8) {
-                    if let Some(byte) = u8::try_from(octal).ok() {
+                    if let Ok(byte) = u8::try_from(octal) {
                         out.push(byte);
                         i += 4;
                         continue;

@@ -83,3 +83,9 @@ impl StagingAdmin {
         Ok(result)
     }
 }
+
+impl Default for StagingAdmin {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -17,6 +17,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike};
 use sysa::proto::TimerConfig;
 
+/// A parsed calendar component set: (year, month, day) for dates and
+/// (hour, minute, second) for times.  Empty set means "any".
+type CalendarPart = BTreeSet<u32>;
+
 /// Current unix epoch in seconds.
 pub fn epoch_now() -> u64 {
     SystemTime::now()
@@ -349,7 +353,7 @@ impl CalendarSpec {
                     return Some(NaiveDateTime::new(day, t));
                 }
             }
-            day = day + Duration::days(1);
+            day += Duration::days(1);
         }
         None
     }
@@ -363,7 +367,7 @@ impl CalendarSpec {
                     return Some(NaiveDateTime::new(day, t));
                 }
             }
-            day = day - Duration::days(1);
+            day -= Duration::days(1);
         }
         None
     }
@@ -500,7 +504,7 @@ fn parse_shorthand(s: &str) -> Option<CalendarSpec> {
 }
 
 /// Parse a date token (`*-*-*`, `*-12-24`, `2026-01-01`, `1..15-*-*` …).
-fn parse_date(tok: &str) -> Result<(BTreeSet<u32>, BTreeSet<u32>, BTreeSet<u32>), String> {
+fn parse_date(tok: &str) -> Result<(CalendarPart, CalendarPart, CalendarPart), String> {
     let parts: Vec<&str> = tok.split('-').collect();
     if parts.len() < 2 || parts.len() > 3 {
         return Err(format!("invalid date '{tok}'"));
@@ -520,7 +524,7 @@ fn parse_date(tok: &str) -> Result<(BTreeSet<u32>, BTreeSet<u32>, BTreeSet<u32>)
 /// default to zero only when the token has fewer than three parts and does
 /// not use a wildcard hour; otherwise the standard domain rule applies.
 /// The second return value reports whether the time was completely defaulted.
-fn parse_time(tok: &str) -> Result<(BTreeSet<u32>, BTreeSet<u32>, BTreeSet<u32>), String> {
+fn parse_time(tok: &str) -> Result<(CalendarPart, CalendarPart, CalendarPart), String> {
     let parts: Vec<&str> = tok.split(':').collect();
     if parts.len() > 3 {
         return Err(format!("invalid time '{tok}'"));

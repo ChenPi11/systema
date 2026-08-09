@@ -448,7 +448,7 @@ impl Transaction {
 
     /// `transaction_delete_unit()`: delete every job of the unit.
     fn delete_unit(&mut self, unit: &str) {
-        let list = self.jobs.get(unit).map(|l| l.clone()).unwrap_or_default();
+        let list = self.jobs.get(unit).cloned().unwrap_or_default();
         for &i in &list {
             self.delete_job(i, false);
         }
@@ -465,6 +465,10 @@ impl Transaction {
     // Build phase (`transaction_add_job_and_dependencies`)
     // ------------------------------------------------------------------
 
+    // `installed` is only threaded through the recursion to mirror
+    // systemd's `transaction_add_job_and_dependencies()`; the signature
+    // intentionally keeps the dependency graph context flat.
+    #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
     fn add_job_and_dependencies(
         &mut self,
         units: &HashMap<String, UnitFile>,
@@ -641,7 +645,7 @@ impl Transaction {
             names.sort();
             for unit in names {
                 let state = state_of(states, &unit);
-                let list = self.jobs.get(&unit).map(|l| l.clone()).unwrap_or_default();
+                let list = self.jobs.get(&unit).cloned().unwrap_or_default();
                 for &i in &list {
                     let matters = self.get(i).matters_to_anchor;
                     if matters && mode != PlannerMode::Lenient {
@@ -714,7 +718,7 @@ impl Transaction {
             let mut names: Vec<String> = self.jobs.keys().cloned().collect();
             names.sort();
             for unit in names {
-                let list = self.jobs.get(&unit).map(|l| l.clone()).unwrap_or_default();
+                let list = self.jobs.get(&unit).cloned().unwrap_or_default();
                 for &i in &list {
                     let j = self.get(i);
                     if j.anchor {
@@ -802,6 +806,7 @@ impl Transaction {
     /// `transaction_verify_order_one()`: recursive DFS over the ordering
     /// graph. Returns `Ok(true)` when a cycle was broken by deleting a job
     /// (systemd's `-EAGAIN`).
+    #[allow(clippy::too_many_arguments)]
     fn verify_order_one(
         &mut self,
         units: &HashMap<String, UnitFile>,
@@ -949,7 +954,7 @@ impl Transaction {
         let mut names: Vec<String> = self.jobs.keys().cloned().collect();
         names.sort();
         for unit in names {
-            let list = self.jobs.get(&unit).map(|l| l.clone()).unwrap_or_default();
+            let list = self.jobs.get(&unit).cloned().unwrap_or_default();
             let nop = list
                 .iter()
                 .copied()
@@ -974,7 +979,7 @@ impl Transaction {
     /// `delete_one_unmergeable_job()`: pick the job to delete from an
     /// unmergeable per-unit pair. Returns the deleted job index.
     fn delete_one_unmergeable_job(&mut self, unit: &str) -> Option<usize> {
-        let list = self.jobs.get(unit).map(|l| l.clone()).unwrap_or_default();
+        let list = self.jobs.get(unit).cloned().unwrap_or_default();
         for (i, &j) in list.iter().enumerate() {
             for &k in &list[i + 1..] {
                 if job_type_lookup_merge(self.get(j).type_, self.get(k).type_).is_some() {
@@ -987,9 +992,8 @@ impl Transaction {
                     let kc = self.conflicted_by(k);
                     if self.get(j).type_ == JobType::Stop && jc {
                         k
-                    } else if self.get(k).type_ == JobType::Stop && kc {
-                        j
-                    } else if self.get(j).type_ == JobType::Stop {
+                    } else if (self.get(k).type_ == JobType::Stop && kc) || self.get(j).type_ == JobType::Stop
+                    {
                         j
                     } else if self.get(k).type_ == JobType::Stop {
                         k
@@ -1026,7 +1030,7 @@ impl Transaction {
                 continue;
             }
             let state = state_of(states, &unit);
-            let list = self.jobs.get(&unit).map(|l| l.clone()).unwrap_or_default();
+            let list = self.jobs.get(&unit).cloned().unwrap_or_default();
             if list.len() < 2 {
                 continue;
             }
@@ -1081,7 +1085,7 @@ impl Transaction {
         let mut names: Vec<String> = self.jobs.keys().cloned().collect();
         names.sort();
         for unit in names {
-            let list = self.jobs.get(&unit).map(|l| l.clone()).unwrap_or_default();
+            let list = self.jobs.get(&unit).cloned().unwrap_or_default();
             if list.len() <= 1 {
                 continue;
             }

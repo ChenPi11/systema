@@ -196,7 +196,7 @@ fn shell_words(s: &str) -> Vec<String> {
             }
             ' ' | '\t' if !in_single && !in_double => {
                 if !current.is_empty() {
-                    words.push(current.drain(..).collect());
+                    words.push(std::mem::take(&mut current));
                 }
             }
             other => {

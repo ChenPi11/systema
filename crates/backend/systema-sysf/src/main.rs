@@ -134,7 +134,7 @@ async fn run_query(name: &str) -> Result<()> {
     if result.success {
         info!("Staging area contains {} units", result.unit_count);
         let units: HashMap<String, UnitIR> = serde_json::from_slice(&result.units_json)?;
-        for (id, _) in &units {
+        for id in units.keys() {
             info!("  {id}");
         }
     } else {

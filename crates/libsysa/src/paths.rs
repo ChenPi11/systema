@@ -50,10 +50,10 @@ fn compute_paths() -> Paths {
             builtin::SYSTEMD_FIRST_BOOT_FILE,
         ),
         locale_dir: resolve("SYSTEMA_LOCALE_DIR", builtin::LOCALE_DIR),
-        unit_search_paths: resolve_list("SYSTEMA_UNIT_PATH", &builtin::UNIT_SEARCH_PATHS),
+        unit_search_paths: resolve_list("SYSTEMA_UNIT_PATH", builtin::UNIT_SEARCH_PATHS),
         generator_search_paths: resolve_list(
             "SYSTEMA_GENERATOR_PATH",
-            &builtin::GENERATOR_SEARCH_PATHS,
+            builtin::GENERATOR_SEARCH_PATHS,
         ),
     }
 }

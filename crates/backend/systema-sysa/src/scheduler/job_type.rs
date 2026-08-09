@@ -322,7 +322,8 @@ mod tests {
             assert!(s.is_active_or_activating());
             assert!(!s.is_inactive_or_failed());
         }
-        for s in [Activating] {
+        {
+            let s = Activating;
             assert!(!s.is_active_or_reloading());
             assert!(s.is_active_or_activating());
         }

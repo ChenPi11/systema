@@ -256,7 +256,7 @@ impl WorkerIpc {
                     crate::l10n::t_("Cannot connect to {path}."),
                     &[(
                         "path",
-                        &crate::paths::instance().ipc_socket_path.to_string(),
+                        crate::paths::instance().ipc_socket_path,
                     )],
                 )
             })?;

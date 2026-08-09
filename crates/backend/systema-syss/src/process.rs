@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 
 use sysa::proto::UnitConfig;
 
-use crate::state::{ServiceInstance, ServiceRegistry, ServiceState};
+use crate::state::{ServiceRegistry, ServiceState};
 
 /// Launch the service described by `config`.
 /// Returns the PID and the Child handle of the spawned main process.
@@ -79,7 +79,7 @@ pub async fn start_service(
         let mut reg = registry.lock();
         let inst = reg
             .entry(unit_name.clone())
-            .or_insert_with(ServiceInstance::new);
+            .or_default();
         inst.state = ServiceState::Starting;
         inst.invocation_id = invocation_id.clone();
     }
@@ -410,7 +410,7 @@ fn split_words(s: &str) -> Vec<String> {
         match ch {
             ' ' | '\t' => {
                 if !current.is_empty() {
-                    words.push(current.drain(..).collect());
+                    words.push(std::mem::take(&mut current));
                 }
                 i += 1;
             }
@@ -814,8 +814,8 @@ fn expand_braced_expr(
                 name.push(ch);
             }
             Some(ch) if matches!(phase, Phase::Default) => match substitution {
-                Some((opchar, ref mut val)) => {
-                    if opchar != ch as char {}
+                Some((_opchar, ref mut val)) => {
+                    
                     val.push(ch);
                 }
                 None => {

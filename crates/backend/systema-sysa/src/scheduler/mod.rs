@@ -172,7 +172,7 @@ pub async fn enqueue_job_type(
                     result: JobResultKind::Done,
                 });
             }
-            return Ok((job_id, JobKind::Nop));
+            Ok((job_id, JobKind::Nop))
         }
         JobType::VerifyActive => {
             // Directly requested verify-active root (`EnqueueUnitJob`).
@@ -202,7 +202,7 @@ pub async fn enqueue_job_type(
                     result,
                 });
             }
-            return Ok((job_id, JobKind::Nop));
+            Ok((job_id, JobKind::Nop))
         }
         other => {
             let kind = job_kind_from_type(other).expect("collapsed job type dispatches to a worker");
@@ -916,7 +916,7 @@ pub fn handle_task_result(
 
         // --- Upholds= continuous activation (simplified: no runtime check) ---
         if !success || kind == JobKind::Stop {
-            for (_other_name, other_unit) in &state.units {
+            for other_unit in state.units.values() {
                 if other_unit.unit.upholds.contains(unit_name) {
                     post_actions.push(PostAction::Start(unit_name.to_string()));
                     break;
@@ -935,7 +935,6 @@ pub fn handle_task_result(
                     ExitKind::Signal(-1)
                 } else if let Some(code_str) = message.to_lowercase().split("exit code").nth(1) {
                     let code = code_str
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|s| s.parse::<i32>().ok())
@@ -1236,10 +1235,7 @@ fn spawn_job_timeout(
                     None
                 }
             });
-            if start_timeout.is_none() {
-                // No start timeout configured; no watchdog either.
-                return None;
-            }
+            start_timeout?;
             let start_secs = start_timeout.unwrap();
             let alloc = allocator.clone();
             let name_clone = name.to_string();
@@ -1453,7 +1449,7 @@ fn check_conditions(unit: &UnitSection) -> bool {
         }
     }
     for glob in &unit.condition_path_exists_glob {
-        if !eval_condition_bool(glob, |g| path_glob_matches(g)) {
+        if !eval_condition_bool(glob, path_glob_matches) {
             return false;
         }
     }
@@ -1504,7 +1500,7 @@ fn check_asserts(unit: &UnitSection) -> bool {
         }
     }
     for glob in &unit.assert_path_exists_glob {
-        if !eval_condition_bool(glob, |g| path_glob_matches(g)) {
+        if !eval_condition_bool(glob, path_glob_matches) {
             return false;
         }
     }

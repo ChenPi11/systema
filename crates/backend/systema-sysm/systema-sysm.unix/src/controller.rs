@@ -75,9 +75,8 @@ fn resolve_unit_type(
 ) -> &'static str {
     if mount_registry.lock().contains_key(unit_name) {
         "mount"
-    } else if automount_registry.lock().contains_key(unit_name) {
-        "automount"
-    } else if unit_name.ends_with(".automount") {
+    } else if automount_registry.lock().contains_key(unit_name) || unit_name.ends_with(".automount")
+    {
         "automount"
     } else {
         "mount"
