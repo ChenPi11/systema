@@ -648,6 +648,7 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection, name: &str) -> Resul
 
     unit.description = expand(&get_str(config, "unit", "description"));
     unit.default_dependencies = get_bool(config, "unit", "defaultdependencies", true);
+    unit.allow_isolate = get_bool(config, "unit", "allowisolate", false);
 
     let doc = get_str(config, "unit", "documentation");
     if !doc.is_empty() {
@@ -689,6 +690,18 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection, name: &str) -> Resul
 
     let propagates_reload_to = get_str(config, "unit", "propagatesreloadto");
     unit.propagates_reload_to = split_list(&expand(&propagates_reload_to));
+
+    let requires_mounts_for = get_str(config, "unit", "requiresmountsfor");
+    if !requires_mounts_for.is_empty() {
+        unit.requires_mounts_for
+            .extend(split_vec(&expand(&requires_mounts_for)));
+    }
+
+    let wants_mounts_for = get_str(config, "unit", "wantsmountsfor");
+    if !wants_mounts_for.is_empty() {
+        unit.wants_mounts_for
+            .extend(split_vec(&expand(&wants_mounts_for)));
+    }
 
     // --- Condition checks ---
     let cpe = get_str(config, "unit", "conditionpathexists");
@@ -1500,7 +1513,7 @@ ExecStart=/usr/bin/myapp \
     }
 
     #[test]
-    fn test_specifier_N_no_extension() {
+    fn test_specifier_n_no_extension() {
         assert_eq!(expand_specifiers("%N", "sshd.service"), "sshd");
     }
 
@@ -1652,5 +1665,21 @@ DeviceName=/dev/sda
         let input = "[Unit]\nDescription=foo\n";
         let out = preprocess_content(input);
         assert_eq!(out, input);
+    }
+
+    // -----------------------------------------------------------------------
+    // [Unit] section defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_allow_isolate_defaults_to_false() {
+        let unit = parse_unit("iso.service", "[Unit]\nDescription=iso\n").unwrap();
+        assert!(!unit.unit.allow_isolate);
+    }
+
+    #[test]
+    fn test_allow_isolate_parsed() {
+        let unit = parse_unit("iso.service", "[Unit]\nAllowIsolate=yes\n").unwrap();
+        assert!(unit.unit.allow_isolate);
     }
 }

@@ -67,6 +67,10 @@ pub enum JobKind {
     Stop,
     Restart,
     Reload,
+    /// A job that performs no operation (systemd `JOB_NOP`): the root
+    /// collapsed to `Nop` (e.g. try-restart of an inactive unit) and the
+    /// job completes immediately as done.
+    Nop,
 }
 
 impl JobKind {
@@ -76,6 +80,7 @@ impl JobKind {
             JobKind::Stop => "stop",
             JobKind::Restart => "restart",
             JobKind::Reload => "reload",
+            JobKind::Nop => "nop",
         }
     }
 }
@@ -86,34 +91,55 @@ impl JobKind {
 
 /// Describes how a job should behave when another job for the same unit
 /// already exists, and which dependencies to expand.
+///
+/// Mirrors systemd's `JobMode` (`src/basic/unit-def.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobMode {
-    /// Replace any existing job for the same unit (default).
-    Replace,
-    /// Fail if a job for the same unit already exists.
+    /// Fail if a conflicting job is already queued.
     Fail,
-    /// Queue behind the existing job.
-    Queue,
-    /// Start the unit and stop all other running units.
+    /// Fail if the transaction would stop a running unit or change an
+    /// existing job (`systemctl --job-mode=lenient`).
+    Lenient,
+    /// Replace an existing conflicting job (default).
+    Replace,
+    /// Like [`JobMode::Replace`] and mark the job irreversible.
+    ReplaceIrreversibly,
+    /// Start the root and stop every other active unit.
     Isolate,
     /// Flush all pending jobs first.
     Flush,
-    /// Start the unit but ignore ordering dependencies.
+    /// Ignore both requirement and ordering dependencies.
     IgnoreDependencies,
-    /// Start the unit but ignore requirement dependencies.
+    /// Ignore requirement dependencies.
     IgnoreRequirements,
+    /// Add `TRIGGERED_BY` dependencies (stop jobs only).
+    Triggering,
+    /// A start job becomes a restart for depending units.
+    RestartDependencies,
+    /// Legacy systema extension (systemd removed `queue` long ago): return
+    /// the id of an already-running job of the same kind instead of
+    /// replacing it.
+    Queue,
 }
 
 impl JobMode {
-    pub fn from_str(s: &str) -> Self {
+    /// Parse a `--job-mode=` value. Unknown strings return `None` so the
+    /// D-Bus layer can reject them with `InvalidArgs`, like systemd's
+    /// `job_mode_from_string()`.
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "fail" => JobMode::Fail,
-            "isolate" => JobMode::Isolate,
-            "flush" => JobMode::Flush,
-            "ignore-dependencies" => JobMode::IgnoreDependencies,
-            "ignore-requirements" => JobMode::IgnoreRequirements,
-            "queue" => JobMode::Queue,
-            _ => JobMode::Replace,
+            "fail" => Some(JobMode::Fail),
+            "lenient" => Some(JobMode::Lenient),
+            "replace" => Some(JobMode::Replace),
+            "replace-irreversibly" => Some(JobMode::ReplaceIrreversibly),
+            "isolate" => Some(JobMode::Isolate),
+            "flush" => Some(JobMode::Flush),
+            "ignore-dependencies" => Some(JobMode::IgnoreDependencies),
+            "ignore-requirements" => Some(JobMode::IgnoreRequirements),
+            "triggering" => Some(JobMode::Triggering),
+            "restart-dependencies" => Some(JobMode::RestartDependencies),
+            "queue" => Some(JobMode::Queue),
+            _ => None,
         }
     }
 }

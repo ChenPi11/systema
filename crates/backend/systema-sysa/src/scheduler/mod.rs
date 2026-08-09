@@ -5,6 +5,9 @@
 //! 2. Creates Job records for each operation.
 //! 3. Dispatches WorkerTask messages to the appropriate workers.
 
+pub mod job_type;
+pub mod transaction;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -15,9 +18,8 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    generate_invocation_id, next_job_id, next_task_id, AllocatorHandle, AllocatorState,
-    DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo, JobResultKind, JobStatus,
-    StartLimitState,
+    generate_invocation_id, next_job_id, next_task_id, AllocatorHandle, AllocatorState, Job,
+    JobCompletion, JobKind, JobMode, JobNewInfo, JobResultKind, JobStatus, StartLimitState,
 };
 use crate::unit::types::{
     ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitSection,
@@ -27,14 +29,46 @@ use sysa::proto::{
     UnitConfig,
 };
 
-/// Enqueue a stop job for the named unit.
-pub async fn enqueue_stop(allocator: AllocatorHandle, unit_name: &str) -> Result<u64> {
-    enqueue_job(allocator, unit_name, JobKind::Stop, JobMode::Replace).await
+use crate::scheduler::job_type::{job_type_collapse, JobType, UnitActiveState};
+use crate::scheduler::transaction::{build_plan, PlannerMode};
+
+/// Map a transaction job type onto the public job kind used for worker
+/// dispatch. `Nop` and `VerifyActive` steps need no worker interaction:
+/// they are resolved by the planner against the cached runtime state.
+fn job_kind_from_type(t: JobType) -> Option<JobKind> {
+    match t {
+        JobType::Start => Some(JobKind::Start),
+        JobType::Stop => Some(JobKind::Stop),
+        JobType::Restart => Some(JobKind::Restart),
+        JobType::Reload => Some(JobKind::Reload),
+        JobType::VerifyActive | JobType::Nop => None,
+        JobType::TryRestart | JobType::TryReload | JobType::ReloadOrStart => None,
+    }
 }
 
-/// Enqueue a restart job for the named unit.
-pub async fn enqueue_restart(allocator: AllocatorHandle, unit_name: &str) -> Result<u64> {
-    enqueue_job(allocator, unit_name, JobKind::Restart, JobMode::Replace).await
+/// Mode/type validation from systemd's `manager_add_job_full()`
+/// (`manager.c:2321-2347`):
+///
+/// - `triggering` is only valid for stop jobs;
+/// - `restart-dependencies` is only valid for start jobs;
+/// - `isolate` requires `AllowIsolate=yes` on the unit.
+fn check_mode_constraints(mode: JobMode, kind: JobKind, unit_name: &str, allow_isolate: bool) -> Result<()> {
+    if mode == JobMode::Triggering && kind != JobKind::Stop {
+        bail!("{}", l10n::fmt(l10n::t_("--job-mode=triggering is only valid for stop."), &[]));
+    }
+    if mode == JobMode::RestartDependencies && kind != JobKind::Start {
+        bail!("{}", l10n::fmt(
+            l10n::t_("--job-mode=restart-dependencies is only valid for start."),
+            &[],
+        ));
+    }
+    if mode == JobMode::Isolate && !allow_isolate {
+        bail!("{}", l10n::fmt(
+            l10n::t_("Operation refused, unit {unit_name} may not be isolated."),
+            &[("unit_name", unit_name)],
+        ));
+    }
+    Ok(())
 }
 
 /// Enqueue a start job with explicit mode.
@@ -46,6 +80,138 @@ pub async fn enqueue_start_with_mode(
     enqueue_job(allocator, unit_name, JobKind::Start, mode).await
 }
 
+/// Enqueue a job by full systemd job type, collapsing state-dependent
+/// types (`try-restart`, `try-reload`, `reload-or-start`) against the
+/// cached runtime state before planning — mirroring `manager_add_job_full()`
+/// + `job_type_collapse()` (`job.c:482`).
+///
+/// `reload_if_possible` mirrors systemd's `ReloadOrRestartUnit` /
+/// `ReloadOrTryRestartUnit` semantics (`unit_queue_job_check_and_mangle_type`,
+/// `unit.c:7160`): when the unit can reload, `restart` is mangled into
+/// `reload-or-start` and `try-restart` into `try-reload` before collapsing.
+///
+/// When the root collapses to `Nop` (e.g. try-restart of an inactive unit)
+/// systemd creates a nop job that completes immediately with `JOB_DONE`
+/// (`job.c:959-963`); a directly requested `verify-active` root completes
+/// `done` when the unit is active-like and `skipped` otherwise (systemd
+/// waits for activating units; System A completes immediately). In both
+/// cases the job record is created, `JobNew`/`JobRemoved` are emitted and
+/// no worker is touched.
+///
+/// Returns the job id and the collapsed kind so callers can track desired
+/// state exactly.
+pub async fn enqueue_job_type(
+    allocator: AllocatorHandle,
+    unit_name: &str,
+    job_type: JobType,
+    reload_if_possible: bool,
+    mode: JobMode,
+) -> Result<(u64, JobKind)> {
+    info!(
+        "Scheduling {} for {} (mode={:?})",
+        job_type.as_str(),
+        unit_name,
+        mode
+    );
+
+    // Mangle reload-if-possible, then collapse against the cached state.
+    let (mangled, collapsed, state_now, allow_isolate) = {
+        let state = allocator.read();
+        let unit = state.units.get(unit_name);
+        let can_reload = unit
+            .and_then(|u| u.service.as_ref())
+            .map(|s| !s.exec_reload.is_empty())
+            .unwrap_or(false);
+        let mangled = if reload_if_possible && can_reload {
+            match job_type {
+                JobType::Restart => JobType::ReloadOrStart,
+                JobType::TryRestart => JobType::TryReload,
+                other => other,
+            }
+        } else {
+            job_type
+        };
+        let state_now = state
+            .unit_states
+            .get(unit_name)
+            .map(|c| UnitActiveState::from_active_state_str(&c.active_state))
+            .unwrap_or(UnitActiveState::Unknown);
+        let collapsed = job_type_collapse(mangled, state_now);
+        (
+            mangled,
+            collapsed,
+            state_now,
+            unit.map(|u| u.unit.allow_isolate).unwrap_or(false),
+        )
+    };
+
+    // Validate mode/type combinations on the *requested* (mangled) type,
+    // like systemd's manager_add_job_full() does before collapsing.
+    let requested_kind = job_kind_from_type(mangled).unwrap_or(JobKind::Nop);
+    check_mode_constraints(mode, requested_kind, unit_name, allow_isolate)?;
+
+    match collapsed {
+        JobType::Nop => {
+            let job_id = next_job_id();
+            let mut st = allocator.write();
+            st.jobs.insert(
+                job_id,
+                Job {
+                    id: job_id,
+                    unit_name: unit_name.to_string(),
+                    kind: JobKind::Nop,
+                    status: JobStatus::Done,
+                    timeout_abort: None,
+                },
+            );
+            emit_job_new(&mut st, job_id, unit_name, JobKind::Nop);
+            if let Some(ref tx) = st.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id,
+                    unit_name: unit_name.to_string(),
+                    result: JobResultKind::Done,
+                });
+            }
+            return Ok((job_id, JobKind::Nop));
+        }
+        JobType::VerifyActive => {
+            // Directly requested verify-active root (`EnqueueUnitJob`).
+            // systemd: active-like → done, activating → wait, else → skipped.
+            let result = if state_now.is_active_or_reloading() {
+                JobResultKind::Done
+            } else {
+                JobResultKind::Skipped
+            };
+            let job_id = next_job_id();
+            let mut st = allocator.write();
+            st.jobs.insert(
+                job_id,
+                Job {
+                    id: job_id,
+                    unit_name: unit_name.to_string(),
+                    kind: JobKind::Nop,
+                    status: JobStatus::Done,
+                    timeout_abort: None,
+                },
+            );
+            emit_job_new(&mut st, job_id, unit_name, JobKind::Nop);
+            if let Some(ref tx) = st.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id,
+                    unit_name: unit_name.to_string(),
+                    result,
+                });
+            }
+            return Ok((job_id, JobKind::Nop));
+        }
+        other => {
+            let kind = job_kind_from_type(other).expect("collapsed job type dispatches to a worker");
+            let job_id = enqueue_job(allocator, unit_name, kind, mode).await?;
+            Ok((job_id, kind))
+        }
+    }
+}
+
 /// Core job enqueueing logic.
 pub async fn enqueue_job(
     allocator: AllocatorHandle,
@@ -54,6 +220,17 @@ pub async fn enqueue_job(
     mode: JobMode,
 ) -> Result<u64> {
     info!("Scheduling {:?} for {} (mode={:?})", kind, unit_name, mode);
+
+    // --- Mode/type validation (manager_add_job_full) ---
+    {
+        let state = allocator.read();
+        let allow_isolate = state
+            .units
+            .get(unit_name)
+            .map(|u| u.unit.allow_isolate)
+            .unwrap_or(false);
+        check_mode_constraints(mode, kind, unit_name, allow_isolate)?;
+    }
 
     // --- Early check: ensure at least one worker exists for the root unit ---
     {
@@ -165,38 +342,6 @@ pub async fn enqueue_job(
         }
     }
 
-    // --- Requisite check: all Requisite= deps must already be active ---
-    if matches!(kind, JobKind::Start | JobKind::Restart) && mode != JobMode::IgnoreRequirements {
-        // Requisite check: verification skipped — runtime state is not cached.
-        // Units must rely on After= ordering or the worker's own validation.
-        // TODO: re-add via IPC query to worker if needed.
-    }
-
-    // --- Conflicts handling: stop conflicting units when starting ---
-    if matches!(kind, JobKind::Start | JobKind::Restart) {
-        let conflicts: Vec<String> = {
-            let state = allocator.read();
-            state
-                .units
-                .get(unit_name)
-                .map(|u| u.unit.conflicts.iter().cloned().collect())
-                .unwrap_or_default()
-        };
-        for conflict in conflicts {
-            info!(
-                "Stopping conflicting unit {} before starting {}",
-                conflict, unit_name
-            );
-            Box::pin(enqueue_job(
-                allocator.clone(),
-                &conflict,
-                JobKind::Stop,
-                JobMode::Replace,
-            ))
-            .await?;
-        }
-    }
-
     // --- Job conflict detection ---
     {
         let read_state = allocator.read();
@@ -232,27 +377,91 @@ pub async fn enqueue_job(
         }
     }
 
-    // Determine which units to activate in dependency order.
-    let units_to_process = {
+    // --- Build the transaction plan (systemd transaction_activate()) ---
+    // The plan is the closure of every unit pulled in through the
+    // dependency atoms (Requires/Wants/Requisite/BindsTo/Upholds/Conflicts/
+    // PartOf/PropagatesReloadTo), merged to one job per unit, ordered by the
+    // After=/Before= ordering graph, with ordering cycles broken.
+    let plan = {
         let state = allocator.read();
-        match kind {
-            JobKind::Start | JobKind::Restart
-                if mode == JobMode::IgnoreDependencies || mode == JobMode::IgnoreRequirements =>
-            {
-                vec![unit_name.to_string()]
-            }
-            JobKind::Start | JobKind::Restart => compute_start_order(&state.units, unit_name),
-            JobKind::Stop => compute_stop_order(&state.units, unit_name),
-            JobKind::Reload => compute_reload_order(&state.units, unit_name),
+        let units: HashMap<String, UnitFile> = state.units.clone();
+        let states: HashMap<String, UnitActiveState> = state
+            .unit_states
+            .iter()
+            .map(|(n, c)| {
+                (
+                    n.clone(),
+                    UnitActiveState::from_active_state_str(&c.active_state),
+                )
+            })
+            .collect();
+        let installed: HashMap<String, JobType> = state
+            .jobs
+            .values()
+            .filter(|j| matches!(j.status, JobStatus::Running))
+            .map(|j| (j.unit_name.clone(), JobType::from_job_kind(j.kind)))
+            .collect();
+        build_plan(
+            &units,
+            &states,
+            &installed,
+            unit_name,
+            JobType::from_job_kind(kind),
+            PlannerMode::from_job_mode(mode),
+        )
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(e) => {
+            warn!("Transaction for {} ({kind:?}, mode={mode:?}) failed: {e}", unit_name);
+            bail!("{}", e);
         }
     };
 
-    // --- Isolate mode: stop all running units not in the dependency tree ---
-    if mode == JobMode::Isolate && matches!(kind, JobKind::Start) {
-        handle_isolate(allocator.clone(), &units_to_process).await;
-    }
+    debug!(
+        "Plan for {unit_name}: {:?}",
+        plan.steps
+            .iter()
+            .map(|s| (s.unit.as_str(), s.job_type.as_str()))
+            .collect::<Vec<_>>()
+    );
 
-    debug!("Processing order: {:?}", units_to_process);
+    // --- Requisite verification ---
+    // Surviving VerifyActive= steps check the cached runtime state; an
+    // unknown state counts as not active (the plan kept the step because
+    // the unit is not known to be active), matching systemd.
+    if let Some(v) = plan
+        .steps
+        .iter()
+        .find(|s| s.job_type == JobType::VerifyActive)
+    {
+        let active = {
+            let state = allocator.read();
+            state
+                .unit_states
+                .get(&v.unit)
+                .map(|c| UnitActiveState::from_active_state_str(&c.active_state))
+                .unwrap_or(UnitActiveState::Unknown)
+                .is_active_or_reloading()
+        };
+        if !active {
+            warn!(
+                "Requisite check failed: {} depends on {} which is not active",
+                unit_name, v.unit
+            );
+            let job_id = next_job_id();
+            let mut state = allocator.write();
+            if let Some(ref tx) = state.job_completion_tx {
+                let _ = tx.send(JobCompletion {
+                    job_id,
+                    unit_name: unit_name.to_string(),
+                    result: JobResultKind::Dependency,
+                });
+            }
+            emit_job_new(&mut state, job_id, unit_name, kind);
+            return Ok(job_id);
+        }
+    }
 
     // Before dispatching any dependencies, re-check that the root doesn't
     // already have a running job (handles races after the conflict detection above).
@@ -277,7 +486,18 @@ pub async fn enqueue_job(
 
     // Create job records and dispatch tasks.
     let mut created_job_ids: Vec<(u64, String)> = Vec::new();
-    for name in units_to_process.iter() {
+    for step in &plan.steps {
+        let name = &step.unit;
+        // Steps that need no worker interaction (Nop/VerifyActive) are
+        // resolved by the planner; nothing is dispatched for them.
+        let Some(step_kind) = job_kind_from_type(step.job_type) else {
+            debug!(
+                "Skipping worker dispatch for {} ({})",
+                name,
+                step.job_type.as_str()
+            );
+            continue;
+        };
         // The primary job ID belongs to the unit that was directly requested.
         let is_root = name.as_str() == unit_name;
         let job_id = if is_root {
@@ -296,12 +516,14 @@ pub async fn enqueue_job(
                 .jobs
                 .values()
                 .find(|j| {
-                    j.unit_name == *name && j.kind == kind && matches!(j.status, JobStatus::Running)
+                    j.unit_name == *name
+                        && j.kind == step_kind
+                        && matches!(j.status, JobStatus::Running)
                 })
                 .map(|j| j.id);
 
             if let Some(existing_jid) = existing_running_job_id {
-                debug!("Skipping {:?} for {} (existing job running)", kind, name);
+                debug!("Skipping {:?} for {} (existing job running)", step_kind, name);
                 if is_root {
                     return Ok(existing_jid);
                 }
@@ -344,7 +566,7 @@ pub async fn enqueue_job(
                 warn!("{}", err);
                 {
                     let mut state = allocator.write();
-                    emit_job_new(&mut state, job_id, name, kind);
+                    emit_job_new(&mut state, job_id, name, step_kind);
 
                     // Cancel all jobs already created for this request.
                     for (jid, _) in &created_job_ids {
@@ -373,7 +595,7 @@ pub async fn enqueue_job(
         };
 
         // Generate invocation ID for Start/Restart tasks.
-        let invocation_id = match kind {
+        let invocation_id = match step_kind {
             JobKind::Start | JobKind::Restart => Some(generate_invocation_id()),
             _ => None,
         };
@@ -393,18 +615,18 @@ pub async fn enqueue_job(
                 Job {
                     id: job_id,
                     unit_name: name.clone(),
-                    kind,
+                    kind: step_kind,
                     status: JobStatus::Running,
                     timeout_abort: None,
                 },
             );
-            state.task_kinds.insert(task_id, kind);
+            state.task_kinds.insert(task_id, step_kind);
             // Assign unit ownership to the dispatching worker.  Starting an
             // automount implicitly assigns ownership of its companion mount
             // unit (same worker handles both).
             if let Some(wid) = &worker_id {
                 state.unit_owners.insert(name.clone(), wid.clone());
-                if kind == JobKind::Start && name.ends_with(".automount") {
+                if step_kind == JobKind::Start && name.ends_with(".automount") {
                     let mount_name = format!("{}.mount", name.trim_end_matches(".automount"));
                     if state.units.contains_key(&mount_name) {
                         state.unit_owners.insert(mount_name, wid.clone());
@@ -417,10 +639,10 @@ pub async fn enqueue_job(
         }
 
         // Emit JobNew signal for this job.
-        emit_job_new_after_lock(allocator.clone(), job_id, name, kind);
+        emit_job_new_after_lock(allocator.clone(), job_id, name, step_kind);
 
         // --- Timeout monitoring ---
-        let abort_handle = spawn_job_timeout(allocator.clone(), job_id, name, kind, &unit_file);
+        let abort_handle = spawn_job_timeout(allocator.clone(), job_id, name, step_kind, &unit_file);
         if let Some(handle) = abort_handle {
             let mut state = allocator.write();
             if let Some(job) = state.jobs.get_mut(&job_id) {
@@ -429,11 +651,14 @@ pub async fn enqueue_job(
         }
 
         // Build MethodCall envelope for this job.
-        let method_name = match kind {
+        let method_name = match step_kind {
             JobKind::Start => "start",
             JobKind::Stop => "stop",
             JobKind::Restart => "restart",
             JobKind::Reload => "reload",
+            // Nop steps are never dispatched (job_kind_from_type yields
+            // None for them); keep the match exhaustive defensively.
+            JobKind::Nop => "nop",
         };
         let unit_config = {
             let state = allocator.read();
@@ -493,34 +718,6 @@ pub async fn enqueue_job(
     }
 
     Ok(primary_job_id)
-}
-
-/// Handle isolate mode: stop all units not in the dependency tree.
-/// Since we don't cache runtime state, we stop all units that have a
-/// DesiredState::Active but are not in the keep_units set.
-async fn handle_isolate(allocator: AllocatorHandle, keep_units: &[String]) {
-    let to_stop: Vec<String> = {
-        let state = allocator.read();
-        state
-            .desired
-            .iter()
-            .filter(|(name, ds)| matches!(ds, DesiredState::Active) && !keep_units.contains(name))
-            .map(|(name, _)| name.clone())
-            .collect()
-    };
-    for name in to_stop {
-        info!("Isolate mode: stopping unit {}", name);
-        if let Err(e) = Box::pin(enqueue_job(
-            allocator.clone(),
-            &name,
-            JobKind::Stop,
-            JobMode::Replace,
-        ))
-        .await
-        {
-            warn!("Failed to stop {} during isolate: {}", name, e);
-        }
-    }
 }
 
 /// Ask every registered worker for a full state snapshot (`unit.sync_request`).
@@ -591,135 +788,6 @@ fn emit_job_new_after_lock(
     }
 }
 
-/// Compute the order in which units should be stopped.
-/// This includes the requested unit plus all units that have a hard dependency
-/// on it (Requires=, BindsTo=, PartOf=).  The active-state check is removed
-/// since System A no longer caches runtime state — workers handle no-ops.
-fn compute_stop_order(
-    units: &std::collections::HashMap<String, UnitFile>,
-    root: &str,
-) -> Vec<String> {
-    use std::collections::HashSet;
-
-    let mut result = Vec::new();
-    let mut visited = HashSet::new();
-    let mut stack = vec![root.to_string()];
-
-    while let Some(name) = stack.pop() {
-        if visited.contains(&name) {
-            continue;
-        }
-        visited.insert(name.clone());
-        result.push(name.clone());
-
-        // Find all units that have Requires=name, BindsTo=name, or PartOf=name
-        // and include them in the stop order.  No active-state check —
-        // redundant stops are handled as no-ops by the worker.
-        for (other_name, other_unit) in units {
-            if visited.contains(other_name) {
-                continue;
-            }
-            if other_unit.unit.requires.contains(&name)
-                || other_unit.unit.binds_to.contains(&name)
-                || other_unit.unit.part_of.contains(&name)
-            {
-                stack.push(other_name.clone());
-            }
-        }
-    }
-
-    result
-}
-
-/// Compute the reload propagation order.
-/// Includes the root unit plus all units listed in its PropagatesReloadTo=.
-fn compute_reload_order(
-    units: &std::collections::HashMap<String, UnitFile>,
-    root: &str,
-) -> Vec<String> {
-    let mut result = vec![root.to_string()];
-    if let Some(unit) = units.get(root) {
-        for target in &unit.unit.propagates_reload_to {
-            if !result.contains(target) {
-                result.push(target.clone());
-            }
-        }
-    }
-    result
-}
-
-/// Compute the order in which units should be started, respecting After/Before.
-fn compute_start_order(
-    units: &std::collections::HashMap<String, UnitFile>,
-    root: &str,
-) -> Vec<String> {
-    use std::collections::{HashSet, VecDeque};
-
-    let mut result = Vec::new();
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-
-    // Collect all units reachable via Requires/Wants/Requisite/BindsTo/Upholds from root.
-    queue.push_back(root.to_string());
-    let mut reachable = HashSet::new();
-    while let Some(name) = queue.pop_front() {
-        if reachable.contains(&name) {
-            continue;
-        }
-        reachable.insert(name.clone());
-        if let Some(unit) = units.get(&name) {
-            for dep in unit
-                .unit
-                .requires
-                .iter()
-                .chain(unit.unit.wants.iter())
-                .chain(unit.unit.requisite.iter())
-                .chain(unit.unit.binds_to.iter())
-            {
-                queue.push_back(dep.clone());
-            }
-        }
-    }
-
-    // DFS-based topological sort respecting After and Before ordering.
-    fn visit(
-        name: &str,
-        units: &std::collections::HashMap<String, UnitFile>,
-        visited: &mut HashSet<String>,
-        result: &mut Vec<String>,
-    ) {
-        if visited.contains(name) {
-            return;
-        }
-        visited.insert(name.to_string());
-        // Visit After-dependencies first (they must start before us).
-        if let Some(unit) = units.get(name) {
-            for dep in &unit.unit.after {
-                visit(dep, units, visited, result);
-            }
-        }
-        result.push(name.to_string());
-        // Visit Before-targets after us (we must start before them).
-        if let Some(unit) = units.get(name) {
-            for dep in &unit.unit.before {
-                visit(dep, units, visited, result);
-            }
-        }
-    }
-
-    for name in &reachable {
-        visit(name, units, &mut visited, &mut result);
-    }
-
-    // Ensure the root unit appears exactly once, at the end.
-    // The swap-based approach is incorrect when root appears multiple times
-    // due to DFS traversal through After=/Before= edges.
-    result.retain(|n| n != root);
-    result.push(root.to_string());
-
-    result
-}
-
 /// Update unit runtime state from a task result received from a worker.
 pub fn handle_task_result(
     allocator: AllocatorHandle,
@@ -782,6 +850,18 @@ pub fn handle_task_result(
                     result: result_kind,
                 });
             }
+        }
+
+        // --- Failure propagation (systemd job_fail_dependencies()) ---
+        // On a failed Start job, fail the start jobs of every unit pulling
+        // the failed unit in through Requires=/Requisite=/BindsTo=
+        // (UNIT_ATOM_PROPAGATE_START_FAILURE).  On a failed Stop job, the
+        // same for units listed in the failed unit's Conflicts=
+        // (UNIT_ATOM_PROPAGATE_STOP_FAILURE; only the Conflicts reverse
+        // edge carries this atom).  Failures cascade recursively; every
+        // affected job completes with JobResultKind::Dependency.
+        if !success {
+            fail_dependents(&mut state, unit_name, kind);
         }
 
         // --- BindsTo= lifecycle binding (simplified: no runtime check) ---
@@ -907,6 +987,77 @@ pub fn handle_task_result(
     if let Some((ref policy, ref exit_kind)) = task_restart_info {
         if should_restart_service(policy, exit_kind) {
             schedule_automatic_restart(allocator.clone(), unit_name);
+        }
+    }
+}
+
+/// Fail the running start jobs of every unit depending on `failed` through
+/// the propagation atom implied by `kind`, mirroring systemd's
+/// `job_fail_dependencies()`:
+///
+/// - `JobKind::Start` → `UNIT_ATOM_PROPAGATE_START_FAILURE`: units that
+///   list `failed` in Requires=/Requisite=/BindsTo=;
+/// - `JobKind::Stop` → `UNIT_ATOM_PROPAGATE_STOP_FAILURE`: units listed in
+///   `failed`'s Conflicts=.
+///
+/// Only start jobs are affected (systemd restricts to JOB_START /
+/// JOB_VERIFY_ACTIVE).  Each affected job is completed with
+/// `JobResultKind::Dependency` and the failure cascades recursively.
+fn fail_dependents(state: &mut AllocatorState, failed: &str, kind: JobKind) {
+    let is_start = matches!(kind, JobKind::Start);
+    let is_stop = matches!(kind, JobKind::Stop);
+    if !is_start && !is_stop {
+        return;
+    }
+    let mut queue = std::collections::VecDeque::new();
+    let mut visited = std::collections::HashSet::new();
+    queue.push_back(failed.to_string());
+    while let Some(name) = queue.pop_front() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let dependents: Vec<String> = state
+            .units
+            .iter()
+            .filter(|(n, u)| {
+                let connected = if is_start {
+                    u.unit.requires.contains(&name)
+                        || u.unit.requisite.contains(&name)
+                        || u.unit.binds_to.contains(&name)
+                } else {
+                    u.unit.conflicts.contains(&name)
+                };
+                connected
+                    && state.jobs.values().any(|j| {
+                        j.unit_name == **n
+                            && j.kind == JobKind::Start
+                            && matches!(j.status, JobStatus::Running)
+                    })
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        for dep in dependents {
+            let jid = state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == dep && matches!(j.status, JobStatus::Running))
+                .map(|j| j.id);
+            if let Some(jid) = jid {
+                if let Some(job) = state.jobs.get_mut(&jid) {
+                    if let Some(abort) = job.timeout_abort.take() {
+                        abort.abort();
+                    }
+                    job.status = JobStatus::Failed(format!("dependency failed: {name}"));
+                }
+                if let Some(ref tx) = state.job_completion_tx {
+                    let _ = tx.send(JobCompletion {
+                        job_id: jid,
+                        unit_name: dep.clone(),
+                        result: JobResultKind::Dependency,
+                    });
+                }
+                queue.push_back(dep);
+            }
         }
     }
 }
@@ -1168,6 +1319,9 @@ fn spawn_job_timeout(
             .abort_handle();
             Some(handle)
         }
+        // Nop jobs complete immediately and are never timed out; keep the
+        // match exhaustive defensively.
+        JobKind::Nop => None,
     }
 }
 
@@ -1470,8 +1624,9 @@ fn is_first_boot() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Allocator, StartLimitState};
+    use crate::state::{CachedUnitState, StartLimitState, WorkerEntry};
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
 
     // =========================================================================
@@ -1479,25 +1634,36 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_job_mode_from_str_default() {
-        assert_eq!(JobMode::from_str("unknown"), JobMode::Replace);
-        assert_eq!(JobMode::from_str(""), JobMode::Replace);
+    fn test_job_mode_from_str_unknown_is_none() {
+        assert_eq!(JobMode::from_str("unknown"), None);
+        assert_eq!(JobMode::from_str(""), None);
+        assert_eq!(JobMode::from_str("REPLACE"), None);
     }
 
     #[test]
     fn test_job_mode_from_str_all() {
-        assert_eq!(JobMode::from_str("replace"), JobMode::Replace);
-        assert_eq!(JobMode::from_str("fail"), JobMode::Fail);
-        assert_eq!(JobMode::from_str("queue"), JobMode::Queue);
-        assert_eq!(JobMode::from_str("isolate"), JobMode::Isolate);
-        assert_eq!(JobMode::from_str("flush"), JobMode::Flush);
+        assert_eq!(JobMode::from_str("replace"), Some(JobMode::Replace));
+        assert_eq!(JobMode::from_str("fail"), Some(JobMode::Fail));
+        assert_eq!(JobMode::from_str("lenient"), Some(JobMode::Lenient));
+        assert_eq!(JobMode::from_str("queue"), Some(JobMode::Queue));
+        assert_eq!(JobMode::from_str("isolate"), Some(JobMode::Isolate));
+        assert_eq!(JobMode::from_str("flush"), Some(JobMode::Flush));
+        assert_eq!(
+            JobMode::from_str("replace-irreversibly"),
+            Some(JobMode::ReplaceIrreversibly)
+        );
         assert_eq!(
             JobMode::from_str("ignore-dependencies"),
-            JobMode::IgnoreDependencies
+            Some(JobMode::IgnoreDependencies)
         );
         assert_eq!(
             JobMode::from_str("ignore-requirements"),
-            JobMode::IgnoreRequirements
+            Some(JobMode::IgnoreRequirements)
+        );
+        assert_eq!(JobMode::from_str("triggering"), Some(JobMode::Triggering));
+        assert_eq!(
+            JobMode::from_str("restart-dependencies"),
+            Some(JobMode::RestartDependencies)
         );
     }
 
@@ -1506,21 +1672,29 @@ mod tests {
         for mode in &[
             JobMode::Replace,
             JobMode::Fail,
+            JobMode::Lenient,
             JobMode::Queue,
             JobMode::Isolate,
             JobMode::Flush,
+            JobMode::ReplaceIrreversibly,
             JobMode::IgnoreDependencies,
             JobMode::IgnoreRequirements,
+            JobMode::Triggering,
+            JobMode::RestartDependencies,
         ] {
             assert!(matches!(
                 mode,
                 JobMode::Replace
                     | JobMode::Fail
+                    | JobMode::Lenient
                     | JobMode::Queue
                     | JobMode::Isolate
                     | JobMode::Flush
+                    | JobMode::ReplaceIrreversibly
                     | JobMode::IgnoreDependencies
                     | JobMode::IgnoreRequirements
+                    | JobMode::Triggering
+                    | JobMode::RestartDependencies
             ));
         }
     }
@@ -1576,156 +1750,12 @@ mod tests {
     }
 
     // =========================================================================
-    // compute_start_order tests
+    // Unit helper tests
     // =========================================================================
 
     fn make_unit(name: &str) -> UnitFile {
         UnitFile::new(name)
     }
-
-    fn make_unit_after(name: &str, after: &[&str]) -> UnitFile {
-        let mut u = make_unit(name);
-        for dep in after {
-            u.unit.after.insert(dep.to_string());
-        }
-        u
-    }
-
-    #[test]
-    fn test_compute_start_order_single_unit() {
-        let mut units = HashMap::new();
-        units.insert("foo.service".to_string(), make_unit("foo.service"));
-        let order = compute_start_order(&units, "foo.service");
-        assert_eq!(order, vec!["foo.service"]);
-    }
-
-    #[test]
-    fn test_compute_start_order_with_after() {
-        let mut units = HashMap::new();
-        units.insert("a.service".to_string(), make_unit("a.service"));
-        units.insert(
-            "b.service".to_string(),
-            make_unit_after("b.service", &["a.service"]),
-        );
-        units.insert(
-            "c.service".to_string(),
-            make_unit_after("c.service", &["b.service"]),
-        );
-        let order = compute_start_order(&units, "c.service");
-        // a must come before b, b before c
-        let pos_a = order.iter().position(|x| x == "a.service").unwrap();
-        let pos_b = order.iter().position(|x| x == "b.service").unwrap();
-        let pos_c = order.iter().position(|x| x == "c.service").unwrap();
-        assert!(pos_a < pos_b);
-        assert!(pos_b < pos_c);
-    }
-
-    #[test]
-    fn test_compute_start_order_with_requires_expansion() {
-        let mut units = HashMap::new();
-        let a = make_unit("a.service");
-        let mut b = make_unit("b.service");
-        b.unit.requires.insert("a.service".to_string());
-        let mut c = make_unit("c.service");
-        c.unit.requires.insert("b.service".to_string());
-        units.insert("a.service".to_string(), a);
-        units.insert("b.service".to_string(), b);
-        units.insert("c.service".to_string(), c);
-        // compute_start_order BFS from root through requires/wants
-        let order = compute_start_order(&units, "c.service");
-        assert!(order.contains(&"a.service".to_string()));
-        assert!(order.contains(&"b.service".to_string()));
-        assert!(order.contains(&"c.service".to_string()));
-    }
-
-    #[test]
-    fn test_compute_start_order_root_last() {
-        let mut units = HashMap::new();
-        units.insert("dep.service".to_string(), make_unit("dep.service"));
-        units.insert(
-            "root.service".to_string(),
-            make_unit_after("root.service", &["dep.service"]),
-        );
-        let order = compute_start_order(&units, "root.service");
-        assert_eq!(order.last().unwrap(), "root.service");
-    }
-
-    // =========================================================================
-    // compute_stop_order tests
-    // =========================================================================
-
-    #[test]
-    fn test_compute_stop_order_single_unit() {
-        let units = HashMap::new();
-        let order = compute_stop_order(&units, "foo.service");
-        assert_eq!(order, vec!["foo.service"]);
-    }
-
-    #[test]
-    fn test_compute_stop_order_propagates_requires() {
-        let mut units = HashMap::new();
-        let mut b = make_unit("b.service");
-        b.unit.requires.insert("a.service".to_string());
-        units.insert("a.service".to_string(), make_unit("a.service"));
-        units.insert("b.service".to_string(), b);
-
-        let order = compute_stop_order(&units, "a.service");
-        assert!(order.contains(&"a.service".to_string()));
-        assert!(order.contains(&"b.service".to_string()));
-    }
-
-    #[test]
-    fn test_compute_stop_order_propagates_binds_to() {
-        let mut units = HashMap::new();
-        let mut b = make_unit("b.service");
-        b.unit.binds_to.insert("a.service".to_string());
-        units.insert("a.service".to_string(), make_unit("a.service"));
-        units.insert("b.service".to_string(), b);
-
-        let order = compute_stop_order(&units, "a.service");
-        assert!(order.contains(&"b.service".to_string()));
-    }
-
-    #[test]
-    fn test_compute_stop_order_propagates_part_of() {
-        let mut units = HashMap::new();
-        let mut b = make_unit("b.service");
-        b.unit.part_of.insert("a.service".to_string());
-        units.insert("a.service".to_string(), make_unit("a.service"));
-        units.insert("b.service".to_string(), b);
-
-        let order = compute_stop_order(&units, "a.service");
-        assert!(order.contains(&"b.service".to_string()));
-    }
-
-    // =========================================================================
-    // compute_reload_order tests
-    // =========================================================================
-
-    #[test]
-    fn test_compute_reload_order_single() {
-        let units = HashMap::new();
-        let order = compute_reload_order(&units, "foo.service");
-        assert_eq!(order, vec!["foo.service"]);
-    }
-
-    #[test]
-    fn test_compute_reload_order_propagates() {
-        let mut units = HashMap::new();
-        let mut a = make_unit("a.service");
-        a.unit.propagates_reload_to.insert("b.service".to_string());
-        a.unit.propagates_reload_to.insert("c.service".to_string());
-        units.insert("a.service".to_string(), a);
-        let order = compute_reload_order(&units, "a.service");
-        assert!(order.contains(&"a.service".to_string()));
-        assert!(order.contains(&"b.service".to_string()));
-        assert!(order.contains(&"c.service".to_string()));
-        assert_eq!(order.len(), 3);
-    }
-
-    // =========================================================================
-    // Helper function tests
-    // =========================================================================
 
     #[test]
     fn test_strip_negate_normal() {
@@ -1842,16 +1872,266 @@ mod tests {
         for s in &[
             "replace",
             "fail",
+            "lenient",
             "queue",
             "isolate",
             "flush",
+            "replace-irreversibly",
             "ignore-dependencies",
             "ignore-requirements",
+            "triggering",
+            "restart-dependencies",
         ] {
             let mode = JobMode::from_str(s);
             let mode2 = JobMode::from_str(s);
             assert_eq!(mode, mode2);
         }
+    }
+
+    // =========================================================================
+    // Mode validation (check_mode_constraints)
+    // =========================================================================
+
+    #[test]
+    fn test_check_mode_constraints_triggering_is_stop_only() {
+        assert!(check_mode_constraints(JobMode::Triggering, JobKind::Stop, "x.service", false).is_ok());
+        for kind in [JobKind::Start, JobKind::Restart, JobKind::Reload] {
+            assert!(check_mode_constraints(JobMode::Triggering, kind, "x.service", false).is_err());
+        }
+    }
+
+    #[test]
+    fn test_check_mode_constraints_restart_dependencies_is_start_only() {
+        assert!(
+            check_mode_constraints(JobMode::RestartDependencies, JobKind::Start, "x.service", false)
+                .is_ok()
+        );
+        for kind in [JobKind::Stop, JobKind::Restart, JobKind::Reload] {
+            assert!(
+                check_mode_constraints(JobMode::RestartDependencies, kind, "x.service", false)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_mode_constraints_isolate_requires_allow_isolate() {
+        assert!(check_mode_constraints(JobMode::Isolate, JobKind::Start, "x.service", false).is_err());
+        assert!(check_mode_constraints(JobMode::Isolate, JobKind::Start, "x.service", true).is_ok());
+    }
+
+    #[test]
+    fn test_check_mode_constraints_plain_modes_always_pass() {
+        for mode in [JobMode::Replace, JobMode::Flush, JobMode::Queue, JobMode::Lenient] {
+            for kind in [JobKind::Start, JobKind::Stop, JobKind::Restart, JobKind::Reload] {
+                assert!(check_mode_constraints(mode, kind, "x.service", false).is_ok());
+            }
+        }
+    }
+
+    // =========================================================================
+    // enqueue_job_type: state-dependent collapse (step E)
+    // =========================================================================
+
+    fn alloc_with_state(active_state: &str) -> AllocatorHandle {
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        alloc
+            .write()
+            .units
+            .insert("demo.service".to_string(), make_unit("demo.service"));
+        alloc.write().unit_states.insert(
+            "demo.service".to_string(),
+            CachedUnitState {
+                active_state: active_state.to_string(),
+                sub_state: String::new(),
+                main_pid: 0,
+                invocation_id: String::new(),
+                active_enter_timestamp: 0,
+                inactive_enter_timestamp: 0,
+                extensions: HashMap::new(),
+            },
+        );
+        alloc
+    }
+
+    /// Register a fake worker for the "service" unit type.
+    fn register_service_worker(state: &mut AllocatorState) {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        state.workers.insert(
+            "test-worker".to_string(),
+            WorkerEntry {
+                worker_id: "test-worker".to_string(),
+                unit_types: vec!["service".to_string()],
+                envelope_tx: tx,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_try_restart_of_inactive_unit_is_nop() {
+        // try-restart of an inactive unit collapses to Nop: the job is
+        // recorded and completes as done without touching any worker
+        // (systemd: JOB_NOP finishes immediately with JOB_DONE).
+        let alloc = alloc_with_state("inactive");
+        let (job_id, kind) =
+            enqueue_job_type(alloc.clone(), "demo.service", JobType::TryRestart, false, JobMode::Replace)
+                .await
+                .unwrap();
+        assert_eq!(kind, JobKind::Nop);
+        let state = alloc.read();
+        let job = state.jobs.get(&job_id).expect("nop job recorded");
+        assert_eq!(job.kind, JobKind::Nop);
+        assert_eq!(job.status, JobStatus::Done);
+        // No worker interaction: nothing was dispatched.
+        assert!(state.task_kinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_try_reload_of_failed_unit_is_nop() {
+        let alloc = alloc_with_state("failed");
+        let (job_id, kind) =
+            enqueue_job_type(alloc.clone(), "demo.service", JobType::TryReload, false, JobMode::Replace)
+                .await
+                .unwrap();
+        assert_eq!(kind, JobKind::Nop);
+        assert!(matches!(
+            alloc.read().jobs.get(&job_id).unwrap().status,
+            JobStatus::Done
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_try_restart_works_without_worker() {
+        // The collapsed-nop path must succeed even when no worker is
+        // registered (it never dispatches).
+        let alloc = alloc_with_state("inactive");
+        let (job_id, _) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::TryRestart,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.read().jobs.get(&job_id).unwrap().status,
+            JobStatus::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_unknown_state_keeps_try_restart() {
+        // Unknown state is conservative: try-restart collapses to restart,
+        // which needs a worker — and fails without one.
+        let alloc = alloc_with_state("unmapped-state");
+        let res = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::TryRestart,
+            false,
+            JobMode::Replace,
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_active_try_restart_dispatches_restart() {
+        let alloc = alloc_with_state("active");
+        register_service_worker(&mut alloc.write());
+        let (job_id, kind) =
+            enqueue_job_type(alloc.clone(), "demo.service", JobType::TryRestart, false, JobMode::Replace)
+                .await
+                .unwrap();
+        assert_eq!(kind, JobKind::Restart);
+        assert_eq!(alloc.read().jobs.get(&job_id).unwrap().kind, JobKind::Restart);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_reload_if_possible_mangles_to_reload() {
+        // ReloadOrRestartUnit on an active, reloadable unit → reload.
+        let alloc = alloc_with_state("active");
+        {
+            let mut state = alloc.write();
+            state.units.get_mut("demo.service").unwrap().service = Some(
+                crate::unit::types::ServiceSection {
+                    exec_reload: vec![crate::unit::types::ExecCommand::parse(
+                        "/usr/bin/kill -HUP $MAINPID",
+                    )],
+                    ..Default::default()
+                },
+            );
+            register_service_worker(&mut state);
+        }
+        let (job_id, kind) =
+            enqueue_job_type(alloc.clone(), "demo.service", JobType::Restart, true, JobMode::Replace)
+                .await
+                .unwrap();
+        assert_eq!(kind, JobKind::Reload);
+        assert_eq!(alloc.read().jobs.get(&job_id).unwrap().kind, JobKind::Reload);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_reload_or_restart_without_reload_stays_restart() {
+        // ReloadOrRestartUnit on an active unit without ExecReload → restart.
+        let alloc = alloc_with_state("active");
+        register_service_worker(&mut alloc.write());
+        let (job_id, kind) =
+            enqueue_job_type(alloc.clone(), "demo.service", JobType::Restart, true, JobMode::Replace)
+                .await
+                .unwrap();
+        assert_eq!(kind, JobKind::Restart);
+        assert_eq!(
+            alloc.read().jobs.get(&job_id).unwrap().kind,
+            JobKind::Restart
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_reload_or_start_of_inactive_unit_is_start() {
+        let alloc = alloc_with_state("inactive");
+        register_service_worker(&mut alloc.write());
+        let (job_id, kind) =
+            enqueue_job_type(alloc.clone(), "demo.service", JobType::ReloadOrStart, false, JobMode::Replace)
+                .await
+                .unwrap();
+        assert_eq!(kind, JobKind::Start);
+        assert_eq!(alloc.read().jobs.get(&job_id).unwrap().kind, JobKind::Start);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_type_verify_active_root_completes_by_state() {
+        // Direct verify-active request: active unit → done; inactive → skipped.
+        let alloc = alloc_with_state("active");
+        let (job_id, _) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::VerifyActive,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.read().jobs.get(&job_id).unwrap().status,
+            JobStatus::Done
+        );
+
+        let alloc = alloc_with_state("inactive");
+        let (job_id, _) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::VerifyActive,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.read().jobs.get(&job_id).unwrap().status,
+            JobStatus::Done
+        );
     }
 
     // =========================================================================
@@ -1866,10 +2146,171 @@ mod tests {
         // No panic is the success case
     }
 
+    // =========================================================================
+    // Failure propagation (fail_dependents)
+    // =========================================================================
+
+    fn state_with_job(state: &mut AllocatorState, unit: &str, kind: JobKind) -> u64 {
+        let jid = next_job_id();
+        state.jobs.insert(
+            jid,
+            Job {
+                id: jid,
+                unit_name: unit.to_string(),
+                kind,
+                status: JobStatus::Running,
+                timeout_abort: None,
+            },
+        );
+        jid
+    }
+
+    fn unit_requires(name: &str, req: &[&str]) -> (String, UnitFile) {
+        let mut u = make_unit(name);
+        for dep in req {
+            u.unit.requires.insert(dep.to_string());
+        }
+        (name.to_string(), u)
+    }
+
     #[test]
-    fn test_emit_job_new_after_lock() {
-        let alloc = Allocator::new();
-        emit_job_new_after_lock(alloc.clone(), 1, "test.service", JobKind::Start);
-        // No panic is the success case
+    fn test_fail_dependents_start_failure_propagates_requires_chain() {
+        let mut state = AllocatorState::new();
+        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        let (bn, b) = unit_requires("b.service", &["a.service"]);
+        state.units.insert(bn, b);
+        let (cn, c) = unit_requires("c.service", &["b.service"]);
+        state.units.insert(cn, c);
+        state_with_job(&mut state, "a.service", JobKind::Start);
+        state_with_job(&mut state, "b.service", JobKind::Start);
+        state_with_job(&mut state, "c.service", JobKind::Start);
+
+        fail_dependents(&mut state, "a.service", JobKind::Start);
+
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            JobStatus::Failed(_)
+        ));
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "c.service").unwrap().status,
+            JobStatus::Failed(_)
+        ));
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "a.service").unwrap().status,
+            JobStatus::Running
+        ));
+    }
+
+    #[test]
+    fn test_fail_dependents_start_failure_ignores_non_start_jobs() {
+        let mut state = AllocatorState::new();
+        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        let (bn, b) = unit_requires("b.service", &["a.service"]);
+        state.units.insert(bn, b);
+        state_with_job(&mut state, "a.service", JobKind::Start);
+        // b has a stop job — must not be failed
+        state_with_job(&mut state, "b.service", JobKind::Stop);
+
+        fail_dependents(&mut state, "a.service", JobKind::Start);
+
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            JobStatus::Running
+        ));
+    }
+
+    #[test]
+    fn test_fail_dependents_start_failure_propagates_binds_to() {
+        let mut state = AllocatorState::new();
+        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        let (bn, b) = {
+            let (n, mut u) = unit_requires("b.service", &["a.service"]);
+            u.unit.requires.remove("a.service");
+            u.unit.binds_to.insert("a.service".to_string());
+            (n, u)
+        };
+        state.units.insert(bn, b);
+        state_with_job(&mut state, "a.service", JobKind::Start);
+        state_with_job(&mut state, "b.service", JobKind::Start);
+
+        fail_dependents(&mut state, "a.service", JobKind::Start);
+
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            JobStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn test_fail_dependents_stop_failure_propagates_conflicts() {
+        let mut state = AllocatorState::new();
+        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        let mut b = make_unit("b.service");
+        b.unit.conflicts.insert("a.service".to_string());
+        state.units.insert("b.service".to_string(), b);
+        state_with_job(&mut state, "a.service", JobKind::Stop);
+        state_with_job(&mut state, "b.service", JobKind::Start);
+
+        fail_dependents(&mut state, "a.service", JobKind::Stop);
+
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            JobStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn test_fail_dependents_requires_does_not_propagate_on_stop_failure() {
+        let mut state = AllocatorState::new();
+        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        let (bn, b) = unit_requires("b.service", &["a.service"]);
+        state.units.insert(bn, b);
+        state_with_job(&mut state, "a.service", JobKind::Stop);
+        state_with_job(&mut state, "b.service", JobKind::Start);
+
+        // A failed stop job only propagates through Conflicts=
+        fail_dependents(&mut state, "a.service", JobKind::Stop);
+
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            JobStatus::Running
+        ));
+    }
+
+    #[test]
+    fn test_fail_dependents_restart_failure_propagates_nothing() {
+        let mut state = AllocatorState::new();
+        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        let (bn, b) = unit_requires("b.service", &["a.service"]);
+        state.units.insert(bn, b);
+        state_with_job(&mut state, "a.service", JobKind::Restart);
+        state_with_job(&mut state, "b.service", JobKind::Start);
+
+        // systemd: only JOB_START / JOB_VERIFY_ACTIVE failures propagate
+        fail_dependents(&mut state, "a.service", JobKind::Restart);
+
+        assert!(matches!(
+            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            JobStatus::Running
+        ));
+    }
+
+    #[test]
+    fn test_fail_dependents_completion_result_is_dependency() {
+        let mut state = AllocatorState::new();
+        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        let (bn, b) = unit_requires("b.service", &["a.service"]);
+        state.units.insert(bn, b);
+        state_with_job(&mut state, "a.service", JobKind::Start);
+        state_with_job(&mut state, "b.service", JobKind::Start);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.job_completion_tx = Some(tx);
+
+        fail_dependents(&mut state, "a.service", JobKind::Start);
+
+        let completion = rx.try_recv().expect("completion emitted");
+        assert_eq!(completion.unit_name, "b.service");
+        assert_eq!(completion.result, JobResultKind::Dependency);
     }
 }

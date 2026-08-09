@@ -215,7 +215,7 @@ fn shell_words(s: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Common `[Unit]` section fields shared by all unit types.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UnitSection {
     pub description: String,
     pub documentation: Vec<String>,
@@ -243,7 +243,14 @@ pub struct UnitSection {
     pub on_failure: HashSet<String>,
     /// When this unit is reloaded, also reload these units.
     pub propagates_reload_to: HashSet<String>,
+    /// `RequiresMountsFor=` — require every mount unit covering these paths.
+    pub requires_mounts_for: Vec<String>,
+    /// `WantsMountsFor=` — want every mount unit covering these paths.
+    pub wants_mounts_for: Vec<String>,
     pub default_dependencies: bool,
+    /// `AllowIsolate=` — whether the unit may be targeted by `isolate`
+    /// mode jobs (defaults to false, matching systemd).
+    pub allow_isolate: bool,
 
     // ------------------------------------------------------------------
     // Condition checks — parsed; evaluated by the scheduler before start.
@@ -295,6 +302,55 @@ pub struct UnitSection {
     pub assert_first_boot: Vec<String>,
     /// `AssertMemory=`
     pub assert_memory: Vec<String>,
+}
+
+impl Default for UnitSection {
+    /// `DefaultDependencies=` defaults to enabled (systemd unit.c sets it
+    /// on allocation), so units constructed programmatically get the same
+    /// behavior as parsed ones.
+    fn default() -> Self {
+        UnitSection {
+            description: String::new(),
+            documentation: Vec::new(),
+            requires: HashSet::new(),
+            wants: HashSet::new(),
+            conflicts: HashSet::new(),
+            after: HashSet::new(),
+            before: HashSet::new(),
+            part_of: HashSet::new(),
+            binds_to: HashSet::new(),
+            requisite: HashSet::new(),
+            upholds: HashSet::new(),
+            on_success: HashSet::new(),
+            on_failure: HashSet::new(),
+            propagates_reload_to: HashSet::new(),
+            requires_mounts_for: Vec::new(),
+            wants_mounts_for: Vec::new(),
+            default_dependencies: true,
+            allow_isolate: false,
+            condition_path_exists: Vec::new(),
+            condition_path_exists_glob: Vec::new(),
+            condition_file_not_empty: Vec::new(),
+            condition_directory_not_empty: Vec::new(),
+            condition_host: Vec::new(),
+            condition_kernel_command_line: Vec::new(),
+            condition_virtualization: Vec::new(),
+            condition_security: Vec::new(),
+            condition_capability: Vec::new(),
+            condition_ac_power: Vec::new(),
+            condition_needs_update: Vec::new(),
+            condition_first_boot: Vec::new(),
+            condition_environment: Vec::new(),
+            condition_memory: Vec::new(),
+            assert_path_exists: Vec::new(),
+            assert_path_exists_glob: Vec::new(),
+            assert_file_not_empty: Vec::new(),
+            assert_directory_not_empty: Vec::new(),
+            assert_host: Vec::new(),
+            assert_first_boot: Vec::new(),
+            assert_memory: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

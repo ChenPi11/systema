@@ -1008,6 +1008,9 @@ fn update_cache_on_task_result(
             }
         }
         crate::state::JobKind::Reload => {}
+        // Nop jobs never dispatch to a worker, so no state update can be
+        // attributed to them; keep the match exhaustive defensively.
+        crate::state::JobKind::Nop => {}
     }
 }
 

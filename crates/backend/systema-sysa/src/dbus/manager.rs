@@ -12,6 +12,7 @@ use zbus::interface;
 use zvariant::OwnedObjectPath;
 
 use crate::scheduler;
+use crate::scheduler::job_type::JobType;
 use crate::state::{AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
 
 // --------------------------------------------------------------------------
@@ -43,6 +44,61 @@ pub fn job_object_path(job_id: u64) -> OwnedObjectPath {
         .expect("valid job path")
 }
 
+/// Parse a job-mode string, rejecting unknown values like systemd's
+/// `job_mode_from_string()` ("Job mode %s invalid").
+fn parse_job_mode(mode: &str) -> zbus::fdo::Result<JobMode> {
+    JobMode::from_str(mode).ok_or_else(|| {
+        zbus::fdo::Error::InvalidArgs(l10n::fmt(
+            l10n::t_("Job mode {mode} invalid"),
+            &[("mode", mode)],
+        ))
+    })
+}
+
+/// Parse a job type string as accepted by `EnqueueUnitJob()` /
+/// `EnqueueUnitJobMany()`, including the "reload-or-…" magic types
+/// (`bus_unit_parse_job_type()`). Returns the type and whether the
+/// reload-if-possible flag is set.
+fn parse_job_type(s: &str) -> zbus::fdo::Result<(JobType, bool)> {
+    match s {
+        "start" => Ok((JobType::Start, false)),
+        "verify-active" => Ok((JobType::VerifyActive, false)),
+        "stop" => Ok((JobType::Stop, false)),
+        "reload" => Ok((JobType::Reload, false)),
+        "restart" => Ok((JobType::Restart, false)),
+        "try-restart" => Ok((JobType::TryRestart, false)),
+        "try-reload" => Ok((JobType::TryReload, false)),
+        "reload-or-start" => Ok((JobType::ReloadOrStart, false)),
+        "nop" => Ok((JobType::Nop, false)),
+        "reload-or-restart" => Ok((JobType::Restart, true)),
+        "reload-or-try-restart" => Ok((JobType::TryRestart, true)),
+        other => Err(zbus::fdo::Error::InvalidArgs(l10n::fmt(
+            l10n::t_("Job type {other} invalid"),
+            &[("other", other)],
+        ))),
+    }
+}
+
+/// Track the desired state implied by a collapsed job kind, mirroring the
+/// single-unit methods. `Nop` jobs change nothing.
+fn set_desired_state(alloc: &AllocatorHandle, name: &str, kind: JobKind) {
+    match kind {
+        JobKind::Start | JobKind::Restart => {
+            alloc
+                .write()
+                .desired
+                .insert(name.to_string(), DesiredState::Active);
+        }
+        JobKind::Stop => {
+            alloc
+                .write()
+                .desired
+                .insert(name.to_string(), DesiredState::Inactive);
+        }
+        JobKind::Reload | JobKind::Nop => {}
+    }
+}
+
 // --------------------------------------------------------------------------
 // Manager interface
 // --------------------------------------------------------------------------
@@ -68,6 +124,47 @@ impl ManagerInterface {
         if let Some(conn) = self.conn.get() {
             super::register_unit_object(conn, self.allocator.clone(), name).await;
         }
+    }
+
+    /// Load `name` from disk if it is not already in memory.
+    async fn load_unit_if_needed(&self, name: &str) -> zbus::fdo::Result<()> {
+        if self.allocator.read().units.contains_key(name) {
+            return Ok(());
+        }
+        let alloc = self.allocator.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || load_unit_sync(&alloc, &name))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    }
+
+    /// Load the unit if needed, register its D-Bus object, then enqueue a
+    /// state-dependent job type (try-restart and friends), applying the
+    /// desired state unless the job collapsed to a no-op.
+    async fn enqueue_transient(
+        &self,
+        name: &str,
+        job_type: JobType,
+        reload_if_possible: bool,
+        mode: &str,
+        desired: Option<DesiredState>,
+    ) -> zbus::fdo::Result<OwnedObjectPath> {
+        let alloc = self.allocator.clone();
+        let name = name.to_string();
+        self.load_unit_if_needed(&name).await?;
+        self.ensure_unit_object(&name).await;
+        let job_mode = parse_job_mode(mode)?;
+        let (job_id, collapsed) =
+            scheduler::enqueue_job_type(alloc.clone(), &name, job_type, reload_if_possible, job_mode)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        if collapsed != JobKind::Nop {
+            if let Some(d) = desired {
+                alloc.write().desired.insert(name.clone(), d);
+            }
+        }
+        Ok(job_object_path(job_id))
     }
 }
 
@@ -199,7 +296,7 @@ impl ManagerInterface {
         // so the object must be in place by then.
         self.ensure_unit_object(&name).await;
 
-        let job_mode = JobMode::from_str(mode);
+        let job_mode = parse_job_mode(mode)?;
         let job_id = scheduler::enqueue_start_with_mode(alloc.clone(), &name, job_mode)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -219,7 +316,8 @@ impl ManagerInterface {
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
-        let job_id = scheduler::enqueue_stop(alloc.clone(), &name)
+        let job_mode = parse_job_mode(mode)?;
+        let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Stop, job_mode)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
@@ -238,7 +336,8 @@ impl ManagerInterface {
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
-        let job_id = scheduler::enqueue_restart(alloc.clone(), &name)
+        let job_mode = parse_job_mode(mode)?;
+        let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Restart, job_mode)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
@@ -257,40 +356,97 @@ impl ManagerInterface {
         let alloc = self.allocator.clone();
         let name = name.to_string();
 
-        let job_id =
-            scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload, JobMode::Replace)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let job_mode = parse_job_mode(mode)?;
+        let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload, job_mode)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         Ok(job_object_path(job_id))
     }
 
-    /// Try-restart: only restart if currently active.
+    /// Try-restart: restart the unit only if it is active (or at least
+    /// being activated); otherwise the job completes as a no-op. This is
+    /// `systemctl try-restart`.
     async fn try_restart_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
-        debug!("D-Bus TryRestartUnit: name={} mode={}", name, mode);
-        self.restart_unit(name, mode).await
+        info!("D-Bus TryRestartUnit: {} (mode={})", name, mode);
+        self.enqueue_transient(name, JobType::TryRestart, false, mode, Some(DesiredState::Active))
+            .await
     }
 
-    /// Reload-or-restart: reload if supported, otherwise restart.
+    /// Try-reload: reload the unit only if it is active; otherwise the job
+    /// completes as a no-op. This is `systemctl try-reload`.
+    async fn try_reload_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
+        info!("D-Bus TryReloadUnit: {} (mode={})", name, mode);
+        self.enqueue_transient(name, JobType::TryReload, false, mode, None)
+            .await
+    }
+
+    /// Reload-or-restart: reload if the unit supports it, otherwise
+    /// restart. This is `systemctl reload-or-restart`.
     async fn reload_or_restart_unit(
         &self,
         name: &str,
         mode: &str,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
-        debug!("D-Bus ReloadOrRestartUnit: name={} mode={}", name, mode);
-        let can_reload = self
-            .allocator
-            .read()
-            .units
-            .get(name)
-            .and_then(|u| u.service.as_ref())
-            .map(|s| !s.exec_reload.is_empty())
-            .unwrap_or(false);
-        if can_reload {
-            self.reload_unit(name, mode).await
-        } else {
-            self.restart_unit(name, mode).await
-        }
+        info!("D-Bus ReloadOrRestartUnit: {} (mode={})", name, mode);
+        self.enqueue_transient(name, JobType::Restart, true, mode, Some(DesiredState::Active))
+            .await
+    }
+
+    /// Reload-or-try-restart: like reload-or-restart but a no-op when the
+    /// unit is inactive.
+    async fn reload_or_try_restart_unit(
+        &self,
+        name: &str,
+        mode: &str,
+    ) -> zbus::fdo::Result<OwnedObjectPath> {
+        info!("D-Bus ReloadOrTryRestartUnit: {} (mode={})", name, mode);
+        self.enqueue_transient(name, JobType::TryRestart, true, mode, Some(DesiredState::Active))
+            .await
+    }
+
+    /// Enqueue a single job by explicit job type, mirroring systemd's
+    /// `EnqueueUnitJob`. Returns `(job id, job path, unit id, unit path,
+    /// job type, affected jobs)`.
+    async fn enqueue_unit_job(
+        &self,
+        name: &str,
+        job_type: &str,
+        job_mode: &str,
+    ) -> zbus::fdo::Result<(
+        u32,
+        OwnedObjectPath,
+        String,
+        OwnedObjectPath,
+        String,
+        Vec<(u32, OwnedObjectPath, String, OwnedObjectPath, String)>,
+    )> {
+        info!(
+            "D-Bus EnqueueUnitJob: unit={} job_type={} job_mode={}",
+            name, job_type, job_mode
+        );
+        let (kind, reload_if_possible) = parse_job_type(job_type)?;
+        let mode = parse_job_mode(job_mode)?;
+
+        let alloc = self.allocator.clone();
+        let name_owned = name.to_string();
+        self.load_unit_if_needed(&name).await?;
+        self.ensure_unit_object(&name).await;
+
+        let (job_id, collapsed) =
+            scheduler::enqueue_job_type(alloc.clone(), &name_owned, kind, reload_if_possible, mode)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        set_desired_state(&alloc, &name_owned, collapsed);
+
+        Ok((
+            job_id as u32,
+            job_object_path(job_id),
+            name_owned.clone(),
+            unit_object_path(&name_owned),
+            kind.as_str().to_string(),
+            Vec::new(),
+        ))
     }
 
     /// Enqueue jobs for several units in a single call, mirroring systemd's
@@ -326,57 +482,30 @@ impl ManagerInterface {
                 &[],
             )));
         }
-        let kind = match job_type {
-            "start" => JobKind::Start,
-            "stop" => JobKind::Stop,
-            "restart" => JobKind::Restart,
-            "reload" => JobKind::Reload,
-            _ => {
-                return Err(zbus::fdo::Error::InvalidArgs(l10n::fmt(
-                    l10n::t_("Invalid job type: {job_type}"),
-                    &[("job_type", job_type)],
-                )))
-            }
-        };
-        let mode = JobMode::from_str(job_mode);
+        let (kind, reload_if_possible) = parse_job_type(job_type)?;
+        let mode = parse_job_mode(job_mode)?;
 
         let alloc = self.allocator.clone();
         let mut jobs = Vec::with_capacity(units.len());
         for name in units {
             // Load missing units first, mirroring StartUnit.
-            let needs_load = !alloc.read().units.contains_key(&name);
-            if needs_load {
-                let alloc2 = alloc.clone();
-                let name2 = name.clone();
-                tokio::task::spawn_blocking(move || load_unit_sync(&alloc2, &name2))
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
+            self.load_unit_if_needed(&name).await?;
 
             // Ensure the per-unit D-Bus object is registered before returning.
             self.ensure_unit_object(&name).await;
 
-            let job_id = scheduler::enqueue_job(alloc.clone(), &name, kind, mode)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let (job_id, collapsed) = scheduler::enqueue_job_type(
+                alloc.clone(),
+                &name,
+                kind,
+                reload_if_possible,
+                mode,
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
             // Track the desired state like the single-unit methods do.
-            match kind {
-                JobKind::Start | JobKind::Restart => {
-                    alloc
-                        .write()
-                        .desired
-                        .insert(name.clone(), DesiredState::Active);
-                }
-                JobKind::Stop => {
-                    alloc
-                        .write()
-                        .desired
-                        .insert(name.clone(), DesiredState::Inactive);
-                }
-                JobKind::Reload => {}
-            }
+            set_desired_state(&alloc, &name, collapsed);
 
             jobs.push((
                 job_id as u32,
@@ -1193,5 +1322,55 @@ fn glob_match(pattern: &[char], name: &[char]) -> bool {
         (Some(&'?'), Some(_)) => glob_match(&pattern[1..], &name[1..]),
         (Some(p), Some(n)) if p == n => glob_match(&pattern[1..], &name[1..]),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_job_type_accepts_all_systemd_types() {
+        // bus_unit_parse_job_type(): plain types.
+        assert_eq!(parse_job_type("start").unwrap(), (JobType::Start, false));
+        assert_eq!(parse_job_type("stop").unwrap(), (JobType::Stop, false));
+        assert_eq!(parse_job_type("restart").unwrap(), (JobType::Restart, false));
+        assert_eq!(parse_job_type("reload").unwrap(), (JobType::Reload, false));
+        assert_eq!(parse_job_type("try-restart").unwrap(), (JobType::TryRestart, false));
+        assert_eq!(parse_job_type("try-reload").unwrap(), (JobType::TryReload, false));
+        assert_eq!(parse_job_type("reload-or-start").unwrap(), (JobType::ReloadOrStart, false));
+        assert_eq!(parse_job_type("verify-active").unwrap(), (JobType::VerifyActive, false));
+        assert_eq!(parse_job_type("nop").unwrap(), (JobType::Nop, false));
+        // The magic reload-or-* types carry the reload-if-possible flag.
+        assert_eq!(parse_job_type("reload-or-restart").unwrap(), (JobType::Restart, true));
+        assert_eq!(parse_job_type("reload-or-try-restart").unwrap(), (JobType::TryRestart, true));
+    }
+
+    #[test]
+    fn parse_job_type_rejects_unknown() {
+        assert!(parse_job_type("bogus").is_err());
+        assert!(parse_job_type("").is_err());
+    }
+
+    #[test]
+    fn parse_job_mode_accepts_all_systemd_modes() {
+        assert_eq!(parse_job_mode("fail").unwrap(), JobMode::Fail);
+        assert_eq!(parse_job_mode("lenient").unwrap(), JobMode::Lenient);
+        assert_eq!(parse_job_mode("replace").unwrap(), JobMode::Replace);
+        assert_eq!(parse_job_mode("replace-irreversibly").unwrap(), JobMode::ReplaceIrreversibly);
+        assert_eq!(parse_job_mode("isolate").unwrap(), JobMode::Isolate);
+        assert_eq!(parse_job_mode("flush").unwrap(), JobMode::Flush);
+        assert_eq!(parse_job_mode("ignore-dependencies").unwrap(), JobMode::IgnoreDependencies);
+        assert_eq!(parse_job_mode("ignore-requirements").unwrap(), JobMode::IgnoreRequirements);
+        assert_eq!(parse_job_mode("triggering").unwrap(), JobMode::Triggering);
+        assert_eq!(parse_job_mode("restart-dependencies").unwrap(), JobMode::RestartDependencies);
+        // Legacy systema extension.
+        assert_eq!(parse_job_mode("queue").unwrap(), JobMode::Queue);
+    }
+
+    #[test]
+    fn parse_job_mode_rejects_unknown() {
+        assert!(parse_job_mode("bogus").is_err());
+        assert!(parse_job_mode("").is_err());
     }
 }
