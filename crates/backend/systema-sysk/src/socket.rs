@@ -47,13 +47,14 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
 
     for addr in &config.listen {
         if !addr.stream.is_empty() {
-            let listener = bind_stream(&addr.stream, config.backlog).with_context(|| {
+            if let Some(listener) = bind_stream(&addr.stream, config.backlog).with_context(|| {
                 sysa::l10n::fmt(
                     sysa::l10n::t_("Failed to bind ListenStream '{addr_stream}'."),
                     &[("addr_stream", &addr.stream.to_string())],
                 )
-            })?;
-            listeners.push(listener);
+            })? {
+                listeners.push(listener);
+            }
         }
         if !addr.datagram.is_empty() {
             let fd = bind_datagram(&addr.datagram).with_context(|| {
@@ -65,8 +66,8 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
             listeners.push(BoundSocket::Udp(fd));
         }
         if !addr.sequential_packet.is_empty() {
-            let listener =
-                bind_seqpacket(&addr.sequential_packet, config.backlog).with_context(|| {
+            if let Some(listener) = bind_seqpacket(&addr.sequential_packet, config.backlog)
+                .with_context(|| {
                     sysa::l10n::fmt(
                         sysa::l10n::t_(
                             "Failed to bind ListenSequentialPacket '{addr_sequential_packet}'.",
@@ -76,8 +77,10 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
                             &addr.sequential_packet.to_string(),
                         )],
                     )
-                })?;
-            listeners.push(listener);
+                })?
+            {
+                listeners.push(listener);
+            }
         }
         if !addr.fifo.is_empty() {
             create_fifo(&addr.fifo, &config.socket_mode).with_context(|| {
@@ -90,7 +93,16 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
         }
     }
 
-    if listeners.is_empty() {
+    let any_address = config
+        .listen
+        .iter()
+        .any(|addr| {
+            !addr.stream.is_empty()
+                || !addr.datagram.is_empty()
+                || !addr.sequential_packet.is_empty()
+                || !addr.fifo.is_empty()
+        });
+    if !any_address {
         anyhow::bail!(sysa::l10n::t_(
             "Socket '{unit_name}' has no listen addresses configured."
         ));
@@ -103,7 +115,14 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
         config: config.clone(),
     };
     guard.insert(unit_name.to_string(), managed);
-    info!("Socket '{}' started ({} listener(s))", unit_name, n);
+    if n == 0 {
+        info!(
+            "Socket '{}' started: all listen addresses already externally served",
+            unit_name
+        );
+    } else {
+        info!("Socket '{}' started ({} listener(s))", unit_name, n);
+    }
     Ok(())
 }
 
@@ -179,7 +198,6 @@ pub fn get_listener_fd(manager: &SocketManager, unit_name: &str) -> Option<RawFd
 // ---------------------------------------------------------------------------
 // Binding helpers
 // ---------------------------------------------------------------------------
-
 fn resolve_tcp_addr(address: &str) -> Result<std::net::SocketAddr> {
     // If it's just a port number (e.g. "8080"), parse as 0.0.0.0:8080.
     if let Ok(port) = address.parse::<u16>() {
@@ -193,11 +211,29 @@ fn resolve_tcp_addr(address: &str) -> Result<std::net::SocketAddr> {
     })
 }
 
-fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
+/// Return true if a live listener is already accepting on `path` (some other
+/// process owns the socket and is accepting connections).  The probe
+/// connection is dropped immediately afterwards.
+fn probe_live_listener(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+fn bind_stream(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
     if address.starts_with(ABSTRACT_PREFIX) {
-        bind_abstract_unix(address, backlog)
+        bind_abstract_unix(address, backlog).map(Some)
     } else if address.starts_with('/') {
         let path = PathBuf::from(address);
+        // Never clobber a live listener: if another process is already
+        // accepting on this path (e.g. a system bus daemon), treat the
+        // socket unit as externally satisfied instead of unlink()-ing the
+        // live socket out from under it.
+        if probe_live_listener(&path) {
+            info!(
+                "Unix stream at '{}' already has a live listener; treating as externally satisfied",
+                address
+            );
+            return Ok(None);
+        }
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| {
             sysa::l10n::fmt(
@@ -217,7 +253,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
             )
         })?;
         info!("Bound Unix stream at '{}'", address);
-        Ok(BoundSocket::UnixStream(listener))
+        Ok(Some(BoundSocket::UnixStream(listener)))
     } else {
         let addr = resolve_tcp_addr(address)?;
         let std_listener = std::net::TcpListener::bind(addr).with_context(|| {
@@ -239,7 +275,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<BoundSocket> {
             )
         })?;
         info!("Bound TCP stream at '{}'", address);
-        Ok(BoundSocket::Tcp(listener))
+        Ok(Some(BoundSocket::Tcp(listener)))
     }
 }
 
@@ -371,9 +407,9 @@ fn bind_datagram(address: &str) -> Result<RawFd> {
     Ok(fd)
 }
 
-fn bind_seqpacket(address: &str, backlog: u32) -> Result<BoundSocket> {
+fn bind_seqpacket(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
     if address.starts_with(ABSTRACT_PREFIX) {
-        bind_abstract_unix(address, backlog)
+        bind_abstract_unix(address, backlog).map(Some)
     } else {
         // SOCK_SEQPACKET not available in std UnixListener; use SOCK_STREAM
         // which behaves similarly enough for our purposes.
