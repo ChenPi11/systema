@@ -426,35 +426,41 @@ impl AllocatorState {
         Ok(unit_count)
     }
 
-    /// Create a staging area for a given UID.
-    /// Returns an error if the (uid, name) area already exists or if `name`
-    /// does not conform to the staging area naming rules.
+    /// Create a staging area for a given UID, or merge into an existing one.
+    ///
+    /// Re-registering under an already-existing (uid, name) pair reuses that
+    /// area, git-index style: units whose name already exists are overwritten
+    /// by the incoming ones, and new units are added (the union of both).
+    /// Returns the total number of units staged after the merge.
+    ///
+    /// Returns an error only if `name` does not conform to the staging area
+    /// naming rules.
     pub fn init_staging_area(
         &mut self,
         uid: u32,
         name: &str,
         units: HashMap<String, UnitIR>,
     ) -> Result<u32, String> {
-        if self.staging_areas.contains_key(&(uid, name.to_string())) {
-            return Err(format!(
-                "staging area (uid={uid}, name={name}) already exists"
-            ));
-        }
         if !is_valid_staging_name(name) {
             return Err(format!(
                 "invalid staging area name '{name}': must be at most 64 characters long \
                  and contain only letters, underscores, slashes, backslashes, or hyphens"
             ));
         }
-        let count = units.len() as u32;
-        self.staging_areas.insert(
-            (uid, name.to_string()),
-            StagingArea {
-                name: name.to_string(),
-                uid,
-                units,
-            },
-        );
+        let count = {
+            let area = self
+                .staging_areas
+                .entry((uid, name.to_string()))
+                .or_insert_with(|| StagingArea {
+                    name: name.to_string(),
+                    uid,
+                    units: HashMap::new(),
+                });
+            for (id, ir) in units {
+                area.units.insert(id, ir);
+            }
+            area.units.len() as u32
+        };
         info!("init_staging_area(UID={uid}, name={name}): {count} units");
         Ok(count)
     }
@@ -1059,12 +1065,33 @@ mod tests {
             .init_staging_area(7, "systema-sysm/discovery", HashMap::new())
             .unwrap();
         assert_eq!(state.get_staging_areas_by_uid(7).len(), 2);
-
-        let dup = state
-            .init_staging_area(7, "systema-sysd/discovery", HashMap::new())
-            .unwrap_err();
-        assert!(dup.contains("already exists"), "unexpected error: {dup}");
         assert_eq!(state.get_staging_areas_by_uid(7).len(), 2);
+    }
+
+    #[test]
+    fn reinit_same_name_reuses_area_git_style() {
+        let mut state = AllocatorState::new();
+        let mut first = HashMap::new();
+        first.insert("a.service".to_string(), mount_ir("a.service", "/a"));
+        state
+            .init_staging_area(7, "systema-sysd/discovery", first)
+            .unwrap();
+
+        // Re-registering under the same name must not error: units with a
+        // matching name are overwritten, new ones are added (union).
+        let mut second = HashMap::new();
+        second.insert("a.service".to_string(), mount_ir("a.service", "/a-new"));
+        second.insert("b.service".to_string(), mount_ir("b.service", "/b"));
+        let count = state
+            .init_staging_area(7, "systema-sysd/discovery", second)
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let area = state.get_staging_area(7, "systema-sysd/discovery").unwrap();
+        assert_eq!(area.units.len(), 2);
+        let a = &area.units["a.service"];
+        assert_eq!(a.mount.as_ref().unwrap().where_, "/a-new");
+        assert!(area.units.contains_key("b.service"));
     }
 
     #[test]
