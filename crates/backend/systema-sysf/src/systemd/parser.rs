@@ -12,7 +12,7 @@
 //! - Drop-in configuration directories (`unit.service.d/*.conf`) are applied
 //!   on top of the base unit file.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -119,7 +119,7 @@ fn apply_dropin_dir(dir: &Path, unit: &mut UnitFile) -> Result<()> {
 /// override scalar values and append to list values.  An empty value for
 /// a list key (e.g. `ExecStart=`) clears the accumulated list.
 fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
-    let processed = preprocess_content(content);
+    let processed = merge_append_keys(&preprocess_content(content));
     let mut config = Ini::new();
     config.read(processed.clone()).map_err(|e| {
         anyhow::anyhow!(sysa::l10n::fmt(
@@ -294,12 +294,93 @@ fn collect_key_lines(content: &str, section: &str, key: &str) -> Vec<String> {
     results
 }
 
+/// Merge repeated list-valued keys (e.g. `Wants=`) into a single assignment.
+///
+/// systemd appends the values of certain keys across repeated assignments
+/// (two `Wants=` lines accumulate), while configparser retains only the last
+/// occurrence, silently dropping the earlier values. This pass rewrites the
+/// append-only keys so no values are lost; every other key is left untouched
+/// (configparser's last-wins behaviour already matches systemd for scalars).
+fn merge_append_keys(content: &str) -> String {
+    let mut section = String::new();
+    let mut out: Vec<String> = Vec::new();
+    // (section, key) -> (output line index of the first occurrence, values).
+    let mut merged: HashMap<(String, String), (usize, Vec<String>)> = HashMap::new();
+
+    for raw in content.lines() {
+        let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            if let Some(close) = rest.find(']') {
+                section = rest[..close].trim().to_lowercase();
+                out.push(raw.to_string());
+                continue;
+            }
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            out.push(raw.to_string());
+            continue;
+        }
+        if let Some(eq) = trimmed.find('=') {
+            let key = trimmed[..eq].trim().to_lowercase();
+            let value = trimmed[eq + 1..].trim().to_string();
+            if is_append_key(&section, &key) {
+                match merged.get_mut(&(section.clone(), key.clone())) {
+                    Some((_, values)) => values.push(value),
+                    None => {
+                        let idx = out.len();
+                        merged.insert((section.clone(), key), (idx, vec![value]));
+                        // Placeholder line, replaced by the merged assignment
+                        // once the section is fully scanned.
+                        out.push(String::new());
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(raw.to_string());
+    }
+
+    for ((_section, key), (idx, values)) in merged {
+        out[idx] = format!("{key} = {}", values.join(" "));
+    }
+    out.join("\n")
+}
+
+/// Whether systemd appends the values of `key` across repeated assignments
+/// within `section` (as opposed to scalar keys where the last one wins).
+fn is_append_key(section: &str, key: &str) -> bool {
+    match section {
+        "unit" => match key {
+            "documentation"
+            | "requires"
+            | "wants"
+            | "conflicts"
+            | "after"
+            | "before"
+            | "partof"
+            | "bindsto"
+            | "requisite"
+            | "upholds"
+            | "onsuccess"
+            | "onfailure"
+            | "propagatesreloadto"
+            | "propagatesstopto"
+            | "requiresmountsfor"
+            | "wantsmountsfor" => true,
+            k if k.starts_with("condition") || k.starts_with("assert") => true,
+            _ => false,
+        },
+        "install" => matches!(key, "wantedby" | "requiredby" | "also" | "alias"),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core parser
 // ---------------------------------------------------------------------------
 
 fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
-    let processed = preprocess_content(content);
+    let processed = merge_append_keys(&preprocess_content(content));
     let mut config = Ini::new(); // case-insensitive (normalizes to lowercase)
     config.read(processed).map_err(|e| {
         anyhow::anyhow!(sysa::l10n::fmt(
@@ -1909,5 +1990,56 @@ DeviceName=/dev/sda
     fn test_allow_isolate_parsed() {
         let unit = parse_unit("iso.service", "[Unit]\nAllowIsolate=yes\n").unwrap();
         assert!(unit.unit.allow_isolate);
+    }
+
+    // -----------------------------------------------------------------------
+    // Repeated append-only keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repeated_wants_are_appended_not_overwritten() {
+        let content = "[Unit]\nWants=sockets.target timers.target\nWants=tmp.mount\n";
+        let unit = parse_unit("basic.target", content).unwrap();
+        assert!(unit.unit.wants.contains("sockets.target"));
+        assert!(unit.unit.wants.contains("timers.target"));
+        assert!(unit.unit.wants.contains("tmp.mount"));
+    }
+
+    #[test]
+    fn test_repeated_after_are_appended() {
+        let content = "[Unit]\nAfter=a.service\nAfter=b.service\nBefore=c.service\n";
+        let unit = parse_unit("multi.service", content).unwrap();
+        assert!(unit.unit.after.contains("a.service"));
+        assert!(unit.unit.after.contains("b.service"));
+        assert!(unit.unit.before.contains("c.service"));
+    }
+
+    #[test]
+    fn test_repeated_install_keys_are_appended() {
+        let content = "[Install]\nWantedBy=multi-user.target\nWantedBy=graphical.target\nAlso=a.service\nAlso=b.service\n";
+        let unit = parse_unit("app.service", content).unwrap();
+        assert!(unit.install.wanted_by.contains("multi-user.target"));
+        assert!(unit.install.wanted_by.contains("graphical.target"));
+        assert!(unit.install.also.contains("a.service"));
+        assert!(unit.install.also.contains("b.service"));
+    }
+
+    #[test]
+    fn test_scalar_keys_keep_last_win() {
+        // Description= is a scalar: the last assignment must win, untouched
+        // by the append-key merge.
+        let content = "[Unit]\nDescription=first\nWants=a.service\nDescription=second\n";
+        let unit = parse_unit("scalar.service", content).unwrap();
+        assert_eq!(unit.unit.description, "second");
+        assert!(unit.unit.wants.contains("a.service"));
+    }
+
+    #[test]
+    fn test_repeated_condition_keys_are_appended() {
+        let content =
+            "[Unit]\nConditionPathExists=/a\nConditionPathExists=/b\nConditionVirtualization=kvm\n";
+        let unit = parse_unit("cond.service", content).unwrap();
+        assert_eq!(unit.unit.condition_path_exists, vec!["/a", "/b"]);
+        assert_eq!(unit.unit.condition_virtualization, vec!["kvm"]);
     }
 }

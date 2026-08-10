@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -24,17 +25,24 @@ pub fn is_known_extension(name: &str) -> bool {
 /// Discover and parse all systemd unit files from standard search paths.
 pub fn discover_all() -> Result<Vec<UnitFile>> {
     let mut units = Vec::new();
+    // Units pulled in implicitly by `<unit>.wants/` / `<unit>.requires/`
+    // directories, keyed by the name of the unit the directory belongs to
+    // (e.g. `sockets.target.wants/dbus.socket` => sockets.target wants dbus.socket).
+    let mut implicit: HashMap<String, (HashSet<String>, HashSet<String>)> = HashMap::new();
     for dir in sysa::paths::instance().unit_search_paths.iter() {
         let path = Path::new(dir);
         if path.exists() {
-            load_units_from_dir_recursive(path, &mut units).with_context(|| {
-                sysa::l10n::fmt(
-                    sysa::l10n::t_("Scanning {dir} ..."),
-                    &[("dir", &dir.to_string())],
-                )
-            })?;
+            load_units_from_dir_recursive(path, &mut units, &mut implicit, None).with_context(
+                || {
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("Scanning {dir} ..."),
+                        &[("dir", &dir.to_string())],
+                    )
+                },
+            )?;
         }
     }
+    apply_implicit_deps(&mut units, &implicit);
     info!("Systemd finder discovered {} unit(s)", units.len());
     Ok(units)
 }
@@ -90,9 +98,48 @@ fn find_exact_in(dirs: &[String], name: &str) -> Result<Option<UnitFile>> {
     Ok(None)
 }
 
-fn load_units_from_dir_recursive(dir: &Path, units: &mut Vec<UnitFile>) -> Result<usize> {
+/// The kind of dependency implied by a `<unit>.wants/` / `<unit>.requires/`
+/// directory: every unit inside is wanted/required by the owning unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirDepKind {
+    Wants,
+    Requires,
+}
+
+/// Split a directory name like `sockets.target.wants` into the owning unit
+/// name (`sockets.target`) and the dependency kind, if it is a dependency
+/// directory.
+fn dep_dir_target(name: &str) -> Option<(String, DirDepKind)> {
+    name.strip_suffix(".wants")
+        .map(|base| (base.to_string(), DirDepKind::Wants))
+        .or_else(|| {
+            name.strip_suffix(".requires")
+                .map(|base| (base.to_string(), DirDepKind::Requires))
+        })
+}
+
+/// Fold the implicit dependency directories discovered during the scan into
+/// the owning units' `Wants=`/`Requires=` sets.
+fn apply_implicit_deps(
+    units: &mut [UnitFile],
+    implicit: &HashMap<String, (HashSet<String>, HashSet<String>)>,
+) {
+    for unit in units {
+        if let Some((wants, requires)) = implicit.get(&unit.name) {
+            unit.unit.wants.extend(wants.iter().cloned());
+            unit.unit.requires.extend(requires.iter().cloned());
+        }
+    }
+}
+
+fn load_units_from_dir_recursive(
+    dir: &Path,
+    units: &mut Vec<UnitFile>,
+    implicit: &mut HashMap<String, (HashSet<String>, HashSet<String>)>,
+    ctx: Option<(String, DirDepKind)>,
+) -> Result<usize> {
     let mut count = 0usize;
-    count += load_units_from_dir(dir, units)?;
+    count += load_units_from_dir(dir, units, implicit, ctx.as_ref())?;
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -102,7 +149,12 @@ fn load_units_from_dir_recursive(dir: &Path, units: &mut Vec<UnitFile>) -> Resul
                 if dir_name.starts_with('.') || dir_name.ends_with(".d") {
                     continue;
                 }
-                count += load_units_from_dir_recursive(&path, units)?;
+                // `<unit>.wants/` / `<unit>.requires/` directories imply a
+                // dependency edge from `unit` to everything inside them;
+                // nested subdirectories inherit that implication.
+                let child_ctx = dep_dir_target(dir_name).or_else(|| ctx.clone());
+                count +=
+                    load_units_from_dir_recursive(&path, units, implicit, child_ctx)?;
             }
         }
     }
@@ -110,7 +162,12 @@ fn load_units_from_dir_recursive(dir: &Path, units: &mut Vec<UnitFile>) -> Resul
     Ok(count)
 }
 
-fn load_units_from_dir(dir: &Path, units: &mut Vec<UnitFile>) -> Result<usize> {
+fn load_units_from_dir(
+    dir: &Path,
+    units: &mut Vec<UnitFile>,
+    implicit: &mut HashMap<String, (HashSet<String>, HashSet<String>)>,
+    ctx: Option<&(String, DirDepKind)>,
+) -> Result<usize> {
     let mut count = 0usize;
 
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -131,6 +188,17 @@ fn load_units_from_dir(dir: &Path, units: &mut Vec<UnitFile>) -> Result<usize> {
         }
         match parse_unit_from_path(&path) {
             Ok(unit) => {
+                if let Some((target, kind)) = ctx {
+                    let slot = implicit.entry(target.clone()).or_default();
+                    match kind {
+                        DirDepKind::Wants => {
+                            slot.0.insert(unit.name.clone());
+                        }
+                        DirDepKind::Requires => {
+                            slot.1.insert(unit.name.clone());
+                        }
+                    }
+                }
                 units.push(unit);
                 count += 1;
             }
@@ -213,5 +281,77 @@ mod tests {
         // A plain (non-instance) name must never fall back to anything.
         let dirs = vec![dir.to_string_lossy().into_owned()];
         assert!(discover_one_in(&dirs, "sshd.service").unwrap().is_none());
+    }
+
+    #[test]
+    fn wants_dir_synthesizes_dependency_edges() {
+        let dir = temp_dir("wants");
+        let unit_dir = dir.join("system");
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(
+            unit_dir.join("sockets.target"),
+            "[Unit]\nDescription=Socket target\n",
+        )
+        .unwrap();
+        fs::write(
+            unit_dir.join("dbus.socket"),
+            "[Socket]\nListenStream=/run/dbus/system_bus_socket\n",
+        )
+        .unwrap();
+        // A unit pulled in only via the .wants directory.
+        fs::write(
+            unit_dir.join("other.service"),
+            "[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(unit_dir.join("sockets.target.wants")).unwrap();
+        fs::write(
+            unit_dir.join("sockets.target.wants").join("dbus.socket"),
+            "[Socket]\nListenStream=/run/dbus/system_bus_socket\n",
+        )
+        .unwrap();
+        fs::write(
+            unit_dir.join("sockets.target.wants").join("other.service"),
+            "[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&unit_dir, &mut units, &mut implicit, None).unwrap();
+        apply_implicit_deps(&mut units, &implicit);
+
+        let sockets = units.iter().find(|u| u.name == "sockets.target").unwrap();
+        assert!(sockets.unit.wants.contains("dbus.socket"));
+        assert!(sockets.unit.wants.contains("other.service"));
+        assert!(!sockets.unit.requires.contains("dbus.socket"));
+        assert!(!sockets.unit.requires.contains("other.service"));
+    }
+
+    #[test]
+    fn requires_dir_synthesizes_dependency_edges() {
+        let dir = temp_dir("requires");
+        let unit_dir = dir.join("system");
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(
+            unit_dir.join("target.service"),
+            "[Unit]\nDescription=Target\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(unit_dir.join("target.service.requires")).unwrap();
+        fs::write(
+            unit_dir.join("target.service.requires").join("dep.service"),
+            "[Unit]\nDescription=Dep\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&unit_dir, &mut units, &mut implicit, None).unwrap();
+        apply_implicit_deps(&mut units, &implicit);
+
+        let target = units.iter().find(|u| u.name == "target.service").unwrap();
+        assert!(target.unit.requires.contains("dep.service"));
+        assert!(!target.unit.wants.contains("dep.service"));
     }
 }
