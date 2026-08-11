@@ -10,6 +10,9 @@ use std::sync::Arc;
 pub enum EventTopic {
     /// A unit's runtime state changed (unified `unit.state_update`).
     UnitStateChange,
+    /// Events for a single, named unit.  Used by subscribers that want to
+    /// watch a specific unit instead of every unit.
+    Unit(String),
     /// Subscribe to **all** topics.
     All,
 }
@@ -122,6 +125,12 @@ impl EventBus {
             }
         }
 
+        if let Some(handles) = self.subscribers.get(&EventTopic::Unit(event.unit_name.clone())) {
+            for handle in handles {
+                handle.subscriber.on_event(event).await;
+            }
+        }
+
         for handle in &self.all_subscribers {
             handle.subscriber.on_event(event).await;
         }
@@ -133,6 +142,16 @@ impl EventBus {
         let mut tasks = Vec::new();
 
         if let Some(handles) = self.subscribers.get(&event.topic) {
+            for handle in handles {
+                let sub = handle.subscriber.clone();
+                let ev = event.clone();
+                tasks.push(tokio::spawn(async move {
+                    sub.on_event(&ev).await;
+                }));
+            }
+        }
+
+        if let Some(handles) = self.subscribers.get(&EventTopic::Unit(event.unit_name.clone())) {
             for handle in handles {
                 let sub = handle.subscriber.clone();
                 let ev = event.clone();
@@ -159,5 +178,51 @@ impl EventBus {
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RecordingSubscriber {
+        topic: EventTopic,
+        received: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSubscriber for RecordingSubscriber {
+        fn topics(&self) -> Vec<EventTopic> {
+            vec![self.topic.clone()]
+        }
+
+        async fn on_event(&self, event: &Event) {
+            self.received.lock().await.push(event.unit_name.clone());
+        }
+    }
+
+    fn unit_event(unit_name: &str) -> Event {
+        Event {
+            topic: EventTopic::UnitStateChange,
+            unit_name: unit_name.to_string(),
+            worker_id: "worker".to_string(),
+            timestamp: tokio::time::Instant::now(),
+            data: bytes::Bytes::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_topic_receives_only_matching_unit() {
+        let mut bus = EventBus::new();
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        bus.subscribe(Arc::new(RecordingSubscriber {
+            topic: EventTopic::Unit("svc-a.service".to_string()),
+            received: received.clone(),
+        }));
+
+        bus.dispatch(&unit_event("svc-a.service")).await;
+        bus.dispatch(&unit_event("svc-b.service")).await;
+
+        assert_eq!(*received.lock().await, vec!["svc-a.service"]);
     }
 }

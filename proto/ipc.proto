@@ -114,6 +114,23 @@ message UnitSyncRequest {
     // Empty — reserved for future filter fields.
 }
 
+// Sent by a Worker to System A to subscribe to `event.publish` notifications
+// for a specific set of units.  An empty `unit_names` list subscribes to
+// updates for *all* units.  Each call adds to the worker's existing
+// subscription.
+message EventSubscribe {
+    // Unit names to subscribe to; empty = all units.
+    repeated string unit_names = 1;
+}
+
+// Sent by a Worker to System A to cancel one or more unit subscriptions.
+// An empty `unit_names` list removes every subscription (including an
+// all-units subscription).
+message EventUnsubscribe {
+    // Unit names to unsubscribe from; empty = unsubscribe from all.
+    repeated string unit_names = 1;
+}
+
 // Sent by a Worker in response to UnitSyncRequest.  Identical to a
 // full-snapshot UnitStateUpdate; kept as a separate message so the two
 // directions use distinct payload types.

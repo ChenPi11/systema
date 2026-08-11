@@ -1,3 +1,3 @@
 mod handlers;
 
-pub use handlers::RestartHandler;
+pub use handlers::{RestartHandler, WorkerEventForwarder};

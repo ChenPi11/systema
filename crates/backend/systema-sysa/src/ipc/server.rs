@@ -4,7 +4,7 @@
 //! sends a `WorkerRegistration`, then receives dispatched `method.call`
 //! envelopes and sends back `method.result` / `event.publish` envelopes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -16,16 +16,18 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use sysa::controller::UnitStatus;
+use sysa::event_bus::Event;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
-    AdminStagingOp, AdminStagingResult, CommitUnits, Envelope, MethodResult, RegisterAck,
-    RegisterUnits, StagingAreaEntry, StagingQuery, StagingQueryResult, TimerFired,
-    UnitRegistrationAck, UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    AdminStagingOp, AdminStagingResult, CommitUnits, Envelope, EventSubscribe, EventUnsubscribe,
+    MethodResult, RegisterAck, RegisterUnits, StagingAreaEntry, StagingQuery, StagingQueryResult,
+    TimerFired, UnitRegistrationAck, UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport,
+    WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
+use crate::event::WorkerEventForwarder;
 use crate::state::{next_request_id, AllocatorHandle, CachedUnitState, WorkerEntry};
-use sysa::event_bus::Event;
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
 pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
@@ -226,6 +228,9 @@ async fn handle_worker_session(
 
     // Create the envelope channel for this worker.
     let (envelope_tx, mut envelope_rx) = mpsc::channel::<bytes::Bytes>(64);
+    // Clone kept for the WorkerEventForwarder, which shares the worker's
+    // outgoing envelope channel.
+    let forward_tx = envelope_tx.clone();
 
     // Register the worker.
     {
@@ -279,6 +284,12 @@ async fn handle_worker_session(
     let receiver = async move {
         use futures::StreamExt;
         let mut reader = reader_stream;
+
+        // Per-connection subscription to unit events.  `sub_id` is the
+        // current EventBus subscriber ID (None when not subscribed).
+        let mut subscription = WorkerSubscription::default();
+        let mut sub_id: Option<u64> = None;
+
         loop {
             match reader.next().await {
                 None => {
@@ -472,6 +483,72 @@ async fn handle_worker_session(
                         continue;
                     }
 
+                    if env.method == "event.subscribe" {
+                        let req = match EventSubscribe::decode(env.payload.as_slice()) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!(
+                                    "EventSubscribe decode from worker '{}': {} — ignoring",
+                                    worker_id_recv, e
+                                );
+                                continue;
+                            }
+                        };
+                        if req.unit_names.is_empty() {
+                            subscription.all = true;
+                        } else {
+                            for name in &req.unit_names {
+                                subscription.units.insert(name.clone());
+                            }
+                        }
+                        info!(
+                            "Worker '{}' subscribed to unit events (all={}, units={:?})",
+                            worker_id_recv, subscription.all, subscription.units
+                        );
+                        sub_id = apply_worker_subscription(
+                            &alloc_for_recv,
+                            &worker_id_recv,
+                            &forward_tx,
+                            &subscription,
+                            sub_id,
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    if env.method == "event.unsubscribe" {
+                        let req = match EventUnsubscribe::decode(env.payload.as_slice()) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!(
+                                    "EventUnsubscribe decode from worker '{}': {} — ignoring",
+                                    worker_id_recv, e
+                                );
+                                continue;
+                            }
+                        };
+                        if req.unit_names.is_empty() {
+                            subscription = WorkerSubscription::default();
+                        } else {
+                            for name in &req.unit_names {
+                                subscription.units.remove(name);
+                            }
+                        }
+                        info!(
+                            "Worker '{}' unsubscribed from unit events (all={}, units={:?})",
+                            worker_id_recv, subscription.all, subscription.units
+                        );
+                        sub_id = apply_worker_subscription(
+                            &alloc_for_recv,
+                            &worker_id_recv,
+                            &forward_tx,
+                            &subscription,
+                            sub_id,
+                        )
+                        .await;
+                        continue;
+                    }
+
                     warn!(
                         "Unknown method from worker '{}': {} — disconnecting",
                         worker_id_recv, env.method
@@ -480,6 +557,13 @@ async fn handle_worker_session(
                 }
             }
         }
+
+        if let Some(id) = sub_id {
+            let bus = alloc_for_recv.read().event_bus.clone();
+            bus.write().await.unsubscribe(id);
+            info!("Worker '{}' unsubscribed from unit events", worker_id_recv);
+        }
+
         Ok::<_, anyhow::Error>(())
     };
 
@@ -521,6 +605,48 @@ async fn handle_worker_session(
     info!("Worker '{}' deregistered", worker_id);
 
     Ok(())
+}
+
+/// Tracks a worker connection's unit-event subscription.
+///
+/// `event.subscribe` is additive, `event.unsubscribe` subtractive; an empty
+/// unit list on subscribe means "all units", on unsubscribe means "everything".
+#[derive(Debug, Default)]
+struct WorkerSubscription {
+    all: bool,
+    units: HashSet<String>,
+}
+
+/// (Re)register the EventBus subscriber for a worker connection.
+///
+/// Removes the previous subscriber (if any) and registers a fresh
+/// [`WorkerEventForwarder`] matching the given subscription, returning the
+/// new subscriber ID.  Returns `None` when the subscription is empty.
+async fn apply_worker_subscription(
+    allocator: &AllocatorHandle,
+    worker_id: &str,
+    forward_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    subscription: &WorkerSubscription,
+    previous: Option<u64>,
+) -> Option<u64> {
+    let bus = allocator.read().event_bus.clone();
+    let mut bus = bus.write().await;
+
+    if let Some(id) = previous {
+        bus.unsubscribe(id);
+    }
+
+    if !subscription.all && subscription.units.is_empty() {
+        return None;
+    }
+
+    let forwarder = WorkerEventForwarder::new(
+        worker_id,
+        forward_tx.clone(),
+        subscription.all,
+        subscription.units.iter().cloned().collect(),
+    );
+    Some(bus.subscribe(Arc::new(forwarder)))
 }
 
 async fn handle_finder_register(

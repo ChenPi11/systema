@@ -118,7 +118,8 @@ impl EventPublisher {
             error!("Giving up on unit.state_update after {MAX_ATTEMPTS} attempts");
         });
     }
-/// Send a fire-and-forget envelope with the given method name and payload
+
+    /// Send a fire-and-forget envelope with the given method name and payload
     /// (no ACK handling).  Used for one-way notifications such as the
     /// `timer.fired` message sent by the timer worker.
     pub fn send_envelope<P>(&self, method: &str, payload: P)
@@ -151,6 +152,28 @@ impl EventPublisher {
                 warn!("Outgoing channel closed; cannot send {method}");
             }
         });
+    }
+
+    /// Subscribe to `event.publish` notifications for specific units.
+    /// An empty list subscribes to updates for *all* units.  Additive.
+    pub fn subscribe_units(&self, unit_names: &[String]) {
+        self.send_envelope(
+            "event.subscribe",
+            EventSubscribe {
+                unit_names: unit_names.to_vec(),
+            },
+        );
+    }
+
+    /// Cancel a subscription to `event.publish` notifications.
+    /// An empty list removes every subscription.  Subtractive.
+    pub fn unsubscribe_units(&self, unit_names: &[String]) {
+        self.send_envelope(
+            "event.unsubscribe",
+            EventUnsubscribe {
+                unit_names: unit_names.to_vec(),
+            },
+        );
     }
 }
 

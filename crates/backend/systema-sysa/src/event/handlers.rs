@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use prost::Message as ProstMessage;
 use sysa::controller::UnitStatus;
 use sysa::event_bus::{Event, EventSubscriber, EventTopic};
+use sysa::proto::Envelope;
 use tracing::{info, warn};
 
 use crate::scheduler::{schedule_automatic_restart, should_restart_service};
@@ -73,6 +75,88 @@ impl EventSubscriber for RestartHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WorkerEventForwarder
+// ---------------------------------------------------------------------------
+
+/// Forwards unit events from the in-process event bus to a specific System
+/// Worker over its IPC connection.
+///
+/// SysA re-dispatches every `unit.state_update` as an
+/// [`EventTopic::UnitStateChange`].  A worker that subscribes to specific
+/// units registers one forwarder per connection; the forwarder is
+/// registered against `EventTopic::Unit(name)` topics (or
+/// `UnitStateChange` when the worker wants every unit) so it only receives
+/// matching events, and re-emits them as `event.publish` envelopes carrying
+/// the raw protobuf-encoded `UnitStatus` payload.
+pub struct WorkerEventForwarder {
+    worker_id: String,
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    all: bool,
+    units: Vec<String>,
+}
+
+impl WorkerEventForwarder {
+    pub fn new(
+        worker_id: &str,
+        tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        all: bool,
+        units: Vec<String>,
+    ) -> Self {
+        WorkerEventForwarder {
+            worker_id: worker_id.to_string(),
+            tx,
+            all,
+            units,
+        }
+    }
+
+    fn matches(&self, event: &Event) -> bool {
+        self.all || self.units.iter().any(|u| u == &event.unit_name)
+    }
+}
+
+#[async_trait]
+impl EventSubscriber for WorkerEventForwarder {
+    fn topics(&self) -> Vec<EventTopic> {
+        if self.all {
+            vec![EventTopic::UnitStateChange]
+        } else {
+            self.units.iter().cloned().map(EventTopic::Unit).collect()
+        }
+    }
+
+    async fn on_event(&self, event: &Event) {
+        if !self.matches(event) {
+            return;
+        }
+
+        let envelope = Envelope {
+            request_id: 0,
+            source: "system-a".to_string(),
+            target: self.worker_id.clone(),
+            method: "event.publish".to_string(),
+            payload: event.data.to_vec(),
+        };
+
+        let mut buf = bytes::BytesMut::with_capacity(envelope.encoded_len());
+        if let Err(e) = envelope.encode(&mut buf) {
+            warn!(
+                "EventBus: failed to encode event.publish for '{}': {}",
+                self.worker_id, e
+            );
+            return;
+        }
+
+        if let Err(e) = self.tx.try_send(buf.freeze()) {
+            warn!(
+                "EventBus: failed to forward '{}' to '{}': {}",
+                event.unit_name, self.worker_id, e
+            );
+        }
+    }
+}
+
 /// Map a worker-reported unit status to a restart-relevant exit kind.
 ///
 /// Only `active_state == "failed"` counts as a failure; the `last_exit_code`
@@ -92,11 +176,21 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
+    #[cfg(test)]
+    mod tests {
+        use std::collections::HashMap;
 
-    use super::*;
+        use super::*;
+
+        fn unit_event(unit_name: &str) -> Event {
+            Event {
+                topic: EventTopic::UnitStateChange,
+                unit_name: unit_name.to_string(),
+                worker_id: "worker".to_string(),
+                timestamp: tokio::time::Instant::now(),
+                data: bytes::Bytes::new(),
+            }
+        }
 
     fn status(active: &str, last_exit_code: Option<i32>) -> UnitStatus {
         let mut extensions = HashMap::new();
@@ -134,5 +228,23 @@ mod tests {
         assert_eq!(restart_decision(&status("active", Some(7))), None);
         assert_eq!(restart_decision(&status("activating", Some(7))), None);
         assert_eq!(restart_decision(&status("inactive", Some(7))), None);
+    }
+
+    #[test]
+    fn forwarder_matches_only_subscribed_units() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        let scoped = WorkerEventForwarder::new(
+            "system-s-1",
+            tx,
+            false,
+            vec!["a.service".to_string(), "b.service".to_string()],
+        );
+        assert!(scoped.matches(&unit_event("a.service")));
+        assert!(scoped.matches(&unit_event("b.service")));
+        assert!(!scoped.matches(&unit_event("c.service")));
+
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        let all = WorkerEventForwarder::new("system-s-2", tx2, true, vec![]);
+        assert!(all.matches(&unit_event("anything.service")));
     }
 }
