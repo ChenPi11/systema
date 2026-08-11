@@ -1537,6 +1537,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "systema-sysr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "sysa",
+ "systema-sysr-common",
+ "systema-sysr-linux",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "systema-sysr-common"
+version = "0.1.0"
+dependencies = [
+ "configparser",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "systema-sysr-linux"
+version = "0.1.0"
+dependencies = [
+ "systema-sysr-common",
+ "tracing",
+]
+
+[[package]]
 name = "systema-syss"
 version = "0.1.0"
 dependencies = [
