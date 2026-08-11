@@ -1,10 +1,14 @@
 //! cgroup v2 implementation of [`ResourceController`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use systema_sysr_common::{CGROUP_ROOT, ResourceConfig, ResourceController, ResourceError};
+use systema_sysr_common::{
+    CGROUP_ROOT, CgroupMetrics, CgroupProcess, DEFAULT_TASKS_MAX, ResourceConfig,
+    ResourceController, ResourceError, split_device_directive,
+};
 use tracing::{debug, warn};
 
 /// Controllers System R enables in every ancestor cgroup, in the order they
@@ -121,17 +125,20 @@ impl CgroupV2Controller {
         if let Some(w) = cfg.cpu_weight_v2() {
             self.write_limit(dir, "cpu.weight", &w.to_string());
         }
-        if let Some(b) = cfg.memory_max_bytes() {
-            self.write_limit(dir, "memory.max", &b.to_string());
-        }
-        if let Some(b) = cfg.memory_high_bytes() {
-            self.write_limit(dir, "memory.high", &b.to_string());
+        if let Some(b) = cfg.memory_min_bytes() {
+            self.write_limit(dir, "memory.min", &b.to_string());
         }
         if let Some(b) = cfg.memory_low_bytes() {
             self.write_limit(dir, "memory.low", &b.to_string());
         }
-        if let Some(b) = cfg.memory_min_bytes() {
-            self.write_limit(dir, "memory.min", &b.to_string());
+        if let Some(b) = cfg.memory_high_bytes() {
+            self.write_limit(dir, "memory.high", &b.to_string());
+        }
+        if let Some(b) = cfg.memory_max_bytes() {
+            self.write_limit(dir, "memory.max", &b.to_string());
+        }
+        if let Some(b) = cfg.memory_swap_max_bytes() {
+            self.write_limit(dir, "memory.swap.max", &b.to_string());
         }
         if let Some(w) = cfg.io_weight_v2() {
             self.write_limit(dir, "io.weight", &w.to_string());
@@ -147,6 +154,50 @@ impl CgroupV2Controller {
         let mems = pick(&cfg.allowed_memory_nodes, &cfg.cpu_set_memory_nodes);
         if !mems.is_empty() {
             self.write_limit(dir, "cpuset.mems", mems);
+        }
+
+        self.apply_io_device_limits(dir, cfg);
+    }
+
+    /// Apply per-device I/O limits (`io.weight` and `io.max`).
+    ///
+    /// Devices may be given as `/dev` paths or `MAJ:MIN` ids; paths are
+    /// resolved with `stat(2)` so symlinks under `/dev/disk/by-*` work.
+    fn apply_io_device_limits(&self, dir: &Path, cfg: &ResourceConfig) {
+        for line in &cfg.io_device_weight {
+            let Some((device, value)) = split_device_directive(line) else {
+                continue;
+            };
+            let Some(id) = resolve_device(device) else {
+                warn!("Cannot resolve device '{device}' for io.weight on {}", dir.display());
+                continue;
+            };
+            self.write_limit(dir, "io.weight", &format!("{id} {value}"));
+        }
+
+        // Group read/write bandwidth limits per device so each `io.max`
+        // write carries both directions.
+        let mut max: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for line in &cfg.io_read_bandwidth_max {
+            if let Some((device, value)) = split_device_directive(line) {
+                if let Some(id) = resolve_device(device) {
+                    max.entry(id).or_default().push(format!("rbps={value}"));
+                } else {
+                    warn!("Cannot resolve device '{device}' for io.max on {}", dir.display());
+                }
+            }
+        }
+        for line in &cfg.io_write_bandwidth_max {
+            if let Some((device, value)) = split_device_directive(line) {
+                if let Some(id) = resolve_device(device) {
+                    max.entry(id).or_default().push(format!("wbps={value}"));
+                } else {
+                    warn!("Cannot resolve device '{device}' for io.max on {}", dir.display());
+                }
+            }
+        }
+        for (id, fields) in max {
+            self.write_limit(dir, "io.max", &format!("{id} {}", fields.join(" ")));
         }
     }
 
@@ -171,6 +222,109 @@ fn pick<'a>(a: &'a str, b: &'a str) -> &'a str {
     } else {
         ""
     }
+}
+
+/// Resolve a per-device directive's device to a cgroup v2 `MAJ:MIN` id.
+///
+/// `"8:0"` is passed through unchanged; any other value is treated as a
+/// filesystem path (e.g. `/dev/sda` or a `/dev/disk/by-id/...` symlink) and
+/// resolved through `stat(2)`.  Returns `None` when the device is neither a
+/// numeric id nor a resolvable block/char device node.
+fn resolve_device(device: &str) -> Option<String> {
+    if let Some((maj, min)) = device.split_once(':') {
+        let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+        if digits(maj) && digits(min) {
+            return Some(device.to_string());
+        }
+    }
+    let meta = fs::metadata(device).ok()?;
+    let ft = meta.file_type();
+    if !ft.is_block_device() && !ft.is_char_device() {
+        return None;
+    }
+    let dev = meta.rdev();
+    let major = (dev >> 8) & 0xfff;
+    let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+    Some(format!("{major}:{minor}"))
+}
+
+/// Read a single numeric value from a cgroup file (`"512\n"`, `"max\n"`).
+/// `"max"` and unreadable/absent files yield `None`.
+fn read_number(path: &Path) -> Option<u64> {
+    let s = read_file(path).ok()?;
+    let v = s.trim();
+    if v.is_empty() || v == "max" {
+        return None;
+    }
+    v.parse().ok()
+}
+
+/// Read a `"key value"` pair from a cgroup file (e.g. `cpu.stat`).
+fn read_key_value(path: &Path, key: &str) -> Option<u64> {
+    let s = read_file(path).ok()?;
+    s.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        if it.next()? == key {
+            it.next().and_then(|v| v.parse().ok())
+        } else {
+            None
+        }
+    })
+}
+
+/// Aggregate the per-device `io.stat` lines into the systemd I/O properties.
+fn collect_io_stat(dir: &Path, metrics: &mut HashMap<String, u64>) {
+    let Ok(s) = read_file(&dir.join("io.stat")) else {
+        return;
+    };
+    let mut read_bytes = 0u64;
+    let mut read_ops = 0u64;
+    let mut write_bytes = 0u64;
+    let mut write_ops = 0u64;
+    for line in s.lines() {
+        for field in line.split_whitespace().skip(1) {
+            let Some((k, v)) = field.split_once('=') else {
+                continue;
+            };
+            let Ok(v) = v.parse::<u64>() else {
+                continue;
+            };
+            match k {
+                "rbytes" => read_bytes = read_bytes.saturating_add(v),
+                "rios" => read_ops = read_ops.saturating_add(v),
+                "wbytes" => write_bytes = write_bytes.saturating_add(v),
+                "wios" => write_ops = write_ops.saturating_add(v),
+                _ => {}
+            }
+        }
+    }
+    metrics.insert("IOReadBytes".to_string(), read_bytes);
+    metrics.insert("IOReadOperations".to_string(), read_ops);
+    metrics.insert("IOWriteBytes".to_string(), write_bytes);
+    metrics.insert("IOWriteOperations".to_string(), write_ops);
+}
+
+/// Read the PIDs directly in `dir`'s `cgroup.procs` and resolve their comm.
+fn read_processes(dir: &Path) -> Vec<CgroupProcess> {
+    let Ok(s) = read_file(&dir.join("cgroup.procs")) else {
+        return Vec::new();
+    };
+    let mut processes = Vec::new();
+    for line in s.lines() {
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            continue;
+        };
+        let name = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|c| c.trim().to_string())
+            .unwrap_or_default();
+        processes.push(CgroupProcess {
+            subpath: String::new(),
+            pid,
+            name,
+        });
+    }
+    processes
 }
 
 fn read_file(path: &Path) -> std::io::Result<String> {
@@ -288,6 +442,86 @@ impl ResourceController for CgroupV2Controller {
         })?;
         Ok(())
     }
+
+    fn metrics(&self, path: &str) -> CgroupMetrics {
+        let Some(rel) = self.rel(path) else {
+            return CgroupMetrics::default();
+        };
+        let full = self.full(&rel);
+        if !full.is_dir() {
+            return CgroupMetrics::default();
+        }
+
+        let mut metrics = HashMap::new();
+        if let Some(v) = read_number(&full.join("memory.current")) {
+            metrics.insert("MemoryCurrent".to_string(), v);
+        }
+        if let Some(v) = read_number(&full.join("memory.peak")) {
+            metrics.insert("MemoryPeak".to_string(), v);
+        }
+        if let Some(v) = read_number(&full.join("memory.swap.current")) {
+            metrics.insert("MemorySwapCurrent".to_string(), v);
+        }
+        if let Some(usage_usec) = read_key_value(&full.join("cpu.stat"), "usage_usec") {
+            metrics.insert("CPUUsageNSec".to_string(), usage_usec * 1000);
+        }
+        if let Some(v) = read_number(&full.join("pids.current")) {
+            metrics.insert("TasksCurrent".to_string(), v);
+        }
+        if let Some(v) = read_key_value(&full.join("memory.events"), "oom_kill") {
+            metrics.insert("OOMKills".to_string(), v);
+        }
+        collect_io_stat(&full, &mut metrics);
+
+        if let Some(limit) = self.effective_limit(&full, "pids.max") {
+            metrics.insert("EffectiveTasksMax".to_string(), limit);
+        } else {
+            metrics.insert(
+                "EffectiveTasksMax".to_string(),
+                u64::from(DEFAULT_TASKS_MAX),
+            );
+        }
+        if let Some(limit) = self.effective_limit(&full, "memory.max") {
+            metrics.insert("EffectiveMemoryMax".to_string(), limit);
+        }
+
+        let control_group = {
+            let rel_str = rel.to_string_lossy();
+            if rel_str.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{rel_str}")
+            }
+        };
+        let control_group_id = fs::metadata(&full).map(|m| m.ino()).unwrap_or(0);
+        let processes = read_processes(&full);
+
+        CgroupMetrics {
+            control_group,
+            control_group_id,
+            metrics,
+            processes,
+        }
+    }
+}
+
+impl CgroupV2Controller {
+    /// The first finite limit for `file` walking from the unit's cgroup
+    /// `dir` up to the hierarchy root.  A value of `"max"` (unlimited) at a
+    /// level means "inherit", so the walk continues upward; when no level
+    /// sets a finite limit, `None` is returned.
+    fn effective_limit(&self, dir: &Path, file: &str) -> Option<u64> {
+        let mut cur = dir.to_path_buf();
+        loop {
+            if let Some(v) = read_number(&cur.join(file)) {
+                return Some(v);
+            }
+            if cur == self.root {
+                return None;
+            }
+            cur = cur.parent()?.to_path_buf();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -320,5 +554,45 @@ mod tests {
         // The real detection path is filesystem dependent; this exercises the
         // new() constructor only.
         let _ = CgroupV2Controller::new();
+    }
+
+    #[test]
+    fn metrics_parse_number_and_key_value() {
+        let dir = std::env::temp_dir().join(format!("sysr-metrics-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("memory.current"), "1048576\n").unwrap();
+        std::fs::write(dir.join("pids.max"), "max\n").unwrap();
+        std::fs::write(
+            dir.join("cpu.stat"),
+            "usage_usec 12345\nuser_usec 100\nsystem_usec 2345\n",
+        )
+        .unwrap();
+
+        assert_eq!(read_number(&dir.join("memory.current")), Some(1_048_576));
+        assert_eq!(read_number(&dir.join("pids.max")), None);
+        assert_eq!(read_key_value(&dir.join("cpu.stat"), "usage_usec"), Some(12345));
+        assert_eq!(read_key_value(&dir.join("cpu.stat"), "user_usec"), Some(100));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn metrics_aggregate_io_stat() {
+        let dir = std::env::temp_dir().join(format!("sysr-io-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("io.stat"),
+            "8:0 rbytes=1000 wbytes=500 rios=10 wios=5\n8:1 rbytes=2000 wbytes=500 rios=4 wios=3\n",
+        )
+        .unwrap();
+
+        let mut m = HashMap::new();
+        collect_io_stat(&dir, &mut m);
+        assert_eq!(m.get("IOReadBytes"), Some(&3000));
+        assert_eq!(m.get("IOReadOperations"), Some(&14));
+        assert_eq!(m.get("IOWriteBytes"), Some(&1000));
+        assert_eq!(m.get("IOWriteOperations"), Some(&8));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

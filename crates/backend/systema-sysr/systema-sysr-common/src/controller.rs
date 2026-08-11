@@ -1,8 +1,38 @@
 //! The [`ResourceController`] trait, its error type and the no-op fallback.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::config::ResourceConfig;
+
+/// One process found inside a unit's cgroup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgroupProcess {
+    /// cgroup subpath relative to the unit's own cgroup (`""` = the unit's
+    /// own cgroup).  Always empty while only direct processes are sampled.
+    pub subpath: String,
+    pub pid: u32,
+    /// Process comm (from `/proc/<pid>/comm`); may be empty.
+    pub name: String,
+}
+
+/// A snapshot of a unit's cgroup runtime metrics.
+///
+/// Values are keyed by the systemd property name they serve (e.g.
+/// `"MemoryCurrent"`, `"CPUUsageNSec"`).  The metrics are opaque to every
+/// layer above the controller: only the backend that reads cgroupfs knows
+/// what the keys mean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgroupMetrics {
+    /// systemd-style cgroup path, e.g. `/system.slice/app.service`.
+    pub control_group: String,
+    /// Inode of the unit's cgroup directory (0 when unknown).
+    pub control_group_id: u64,
+    /// Runtime metrics keyed by systemd property name.
+    pub metrics: HashMap<String, u64>,
+    /// Processes directly in the unit's cgroup.
+    pub processes: Vec<CgroupProcess>,
+}
 
 /// Errors from a [`ResourceController`] operation.
 #[derive(Debug)]
@@ -70,6 +100,14 @@ pub trait ResourceController: Send + Sync {
     /// Remove the empty cgroup at `path` (errors if it still holds
     /// processes or child cgroups).
     fn remove(&self, path: &str) -> Result<(), ResourceError>;
+
+    /// Read a snapshot of the cgroup's runtime metrics at `path`.
+    ///
+    /// Best-effort: unreadable files are skipped and an empty snapshot is
+    /// returned when the cgroup does not exist.  The systemd-style
+    /// `control_group` path and the cgroup inode are filled in by the
+    /// backend (which knows the mount point).
+    fn metrics(&self, path: &str) -> CgroupMetrics;
 }
 
 /// A controller that reports `available() == false` and is a no-op
@@ -101,5 +139,9 @@ impl ResourceController for NoopController {
 
     fn remove(&self, _path: &str) -> Result<(), ResourceError> {
         Ok(())
+    }
+
+    fn metrics(&self, _path: &str) -> CgroupMetrics {
+        CgroupMetrics::default()
     }
 }

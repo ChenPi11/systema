@@ -15,6 +15,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 async-trait.workspace = true
+prost.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true

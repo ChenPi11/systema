@@ -793,6 +793,7 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection, name: &str) -> Resul
     unit.description = expand(&get_str(config, "unit", "description"));
     unit.default_dependencies = get_bool(config, "unit", "defaultdependencies", true);
     unit.allow_isolate = get_bool(config, "unit", "allowisolate", false);
+    unit.slice = expand(&get_str(config, "unit", "slice"));
 
     let doc = get_str(config, "unit", "documentation");
     if !doc.is_empty() {

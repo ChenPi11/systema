@@ -341,6 +341,12 @@ pub struct AllocatorState {
     /// Incremental `unit.state_update` pushes are only accepted from the
     /// current owner; unknown or unowned units are ignored with a warning.
     pub unit_owners: HashMap<String, String>,
+
+    /// Cgroup runtime metrics cache, populated from `cgroup.metrics` pushes
+    /// from System R.  Values are opaque name-keyed numbers; System A never
+    /// interprets them, it only relays them to the systemd-compatible D-Bus
+    /// properties.  Not subject to the unit ownership table (informational).
+    pub cgroup_metrics: HashMap<String, sysa::proto::UnitCgroupMetrics>,
 }
 
 impl AllocatorState {
@@ -363,6 +369,7 @@ impl AllocatorState {
             invocation_ids: HashMap::new(),
             unit_states: HashMap::new(),
             unit_owners: HashMap::new(),
+            cgroup_metrics: HashMap::new(),
         }
     }
 
@@ -569,6 +576,9 @@ fn apply_ir_patch(ir: &UnitIR, uf: &mut UnitFile) {
     }
     if let Some(description) = &ir.description {
         uf.unit.description.clone_from(description);
+    }
+    if let Some(slice) = &ir.slice {
+        uf.unit.slice.clone_from(slice);
     }
 
     // Map dependency fields when the whole dependency set is provided.
@@ -930,6 +940,7 @@ mod tests {
             description: None,
             source_format: Some("dynamic".to_string()),
             source_path: None,
+            slice: None,
             dependencies: None,
             service: None,
             mount: Some(MountConfig {

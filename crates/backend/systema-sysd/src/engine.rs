@@ -202,6 +202,7 @@ async fn inject_units(shared: &Arc<EngineShared>, names: &[String]) {
                     description: Some(description),
                     source_format: None,
                     source_path: None,
+                    slice: None,
                     dependencies: None,
                     service: None,
                     mount: None,

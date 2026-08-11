@@ -19,14 +19,14 @@ use sysa::controller::UnitStatus;
 use sysa::event_bus::Event;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
-    AdminStagingOp, AdminStagingResult, CommitUnits, Envelope, EventSubscribe, EventUnsubscribe,
-    MethodResult, RegisterAck, RegisterUnits, StagingAreaEntry, StagingQuery, StagingQueryResult,
-    TimerFired, UnitRegistrationAck, UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport,
-    WorkerRegistration,
+    AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope,
+    EventSubscribe, EventUnsubscribe, MethodResult, RegisterAck, RegisterUnits, StagingAreaEntry,
+    StagingQuery, StagingQueryResult, TimerFired, UnitRegistrationAck, UnitStateUpdate,
+    UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
-use crate::event::WorkerEventForwarder;
+use crate::event::{WorkerEventForwarder, replay_active_units};
 use crate::state::{next_request_id, AllocatorHandle, CachedUnitState, WorkerEntry};
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
@@ -433,8 +433,7 @@ async fn handle_worker_session(
                                 );
                                 break;
                             }
-                        };
-                        let target = fired.target_unit.clone();
+                        };                        let target = fired.target_unit.clone();
                         info!(
                             "Timer '{}' fired (elapse={}) — triggering '{}'",
                             fired.timer_unit, fired.elapse_epoch, target
@@ -478,6 +477,30 @@ async fn handle_worker_session(
                             }
                             Err(e) => {
                                 warn!("Cannot start timer-triggered unit '{}': {}", target, e);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if env.method == "cgroup.metrics" {
+                        let update = match CgroupMetricsUpdate::decode(env.payload.as_slice()) {
+                            Ok(u) => u,
+                            Err(e) => {
+                                warn!(
+                                    "CgroupMetricsUpdate decode from worker '{}': {} — disconnecting",
+                                    worker_id_recv, e
+                                );
+                                break;
+                            }
+                        };
+                        // Fire-and-forget: System R is the only authority on
+                        // cgroup metrics, so the snapshot is accepted without
+                        // ownership checks and cached opaquely for the D-Bus
+                        // layer to serve.
+                        if !update.units.is_empty() {
+                            let mut state = alloc_for_recv.write();
+                            for unit in update.units {
+                                state.cgroup_metrics.insert(unit.unit_name.clone(), unit);
                             }
                         }
                         continue;
@@ -620,8 +643,9 @@ struct WorkerSubscription {
 /// (Re)register the EventBus subscriber for a worker connection.
 ///
 /// Removes the previous subscriber (if any) and registers a fresh
-/// [`WorkerEventForwarder`] matching the given subscription, returning the
-/// new subscriber ID.  Returns `None` when the subscription is empty.
+/// [`WorkerEventForwarder`] matching the given subscription, then replays the
+/// currently active units so the worker converges without waiting for the
+/// next transition.  Returns `None` when the subscription is empty.
 async fn apply_worker_subscription(
     allocator: &AllocatorHandle,
     worker_id: &str,
@@ -645,8 +669,17 @@ async fn apply_worker_subscription(
         forward_tx.clone(),
         subscription.all,
         subscription.units.iter().cloned().collect(),
+        allocator.clone(),
     );
-    Some(bus.subscribe(Arc::new(forwarder)))
+    let id = bus.subscribe(Arc::new(forwarder));
+    // Release the bus before replaying: dispatch holds a bus read lock while
+    // subscribers read the allocator, so we must not read allocator state
+    // while holding the bus write lock.
+    drop(bus);
+
+    replay_active_units(allocator, worker_id, forward_tx, subscription.all, &subscription.units);
+
+    Some(id)
 }
 
 async fn handle_finder_register(

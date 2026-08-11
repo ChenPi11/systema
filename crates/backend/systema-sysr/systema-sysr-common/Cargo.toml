@@ -5,6 +5,6 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-configparser.workspace = true
+sysa = { path = "../../../libsysa" }
 thiserror.workspace = true
 tracing.workspace = true

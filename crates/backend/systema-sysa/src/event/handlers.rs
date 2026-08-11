@@ -3,7 +3,7 @@ use prost::Message as ProstMessage;
 use sysa::controller::UnitStatus;
 use sysa::event_bus::{Event, EventSubscriber, EventTopic};
 use sysa::proto::Envelope;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::scheduler::{schedule_automatic_restart, should_restart_service};
 use crate::state::AllocatorHandle;
@@ -88,12 +88,14 @@ impl EventSubscriber for RestartHandler {
 /// registered against `EventTopic::Unit(name)` topics (or
 /// `UnitStateChange` when the worker wants every unit) so it only receives
 /// matching events, and re-emits them as `event.publish` envelopes carrying
-/// the raw protobuf-encoded `UnitStatus` payload.
+/// a protobuf-encoded [`UnitResourceEvent`](sysa::proto::UnitResourceEvent)
+/// — the UnitIR projection System R applies to cgroups.
 pub struct WorkerEventForwarder {
     worker_id: String,
     tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     all: bool,
     units: Vec<String>,
+    allocator: AllocatorHandle,
 }
 
 impl WorkerEventForwarder {
@@ -102,12 +104,14 @@ impl WorkerEventForwarder {
         tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
         all: bool,
         units: Vec<String>,
+        allocator: AllocatorHandle,
     ) -> Self {
         WorkerEventForwarder {
             worker_id: worker_id.to_string(),
             tx,
             all,
             units,
+            allocator,
         }
     }
 
@@ -131,12 +135,38 @@ impl EventSubscriber for WorkerEventForwarder {
             return;
         }
 
+        // The event payload is the protobuf-encoded UnitStatus; its
+        // active_state and main_pid are stamped onto the resource event so
+        // System R knows whether to apply the limits or release the entry,
+        // and which process to move into the unit's cgroup.
+        let decoded = UnitStatus::decode_from(&event.data);
+        let active_state = decoded.as_ref().map(|s| s.active_state.clone()).unwrap_or_default();
+        let main_pid = decoded.as_ref().map(|s| s.main_pid).unwrap_or(0);
+        let Some(resource_event) =
+            build_unit_resource_event(&self.allocator, &event.unit_name, &active_state, main_pid)
+        else {
+            debug!(
+                "EventBus: no UnitResourceEvent for '{}' (not in runtime cache)",
+                event.unit_name
+            );
+            return;
+        };
+
+        let mut payload = bytes::BytesMut::with_capacity(resource_event.encoded_len());
+        if let Err(e) = resource_event.encode(&mut payload) {
+            warn!(
+                "EventBus: failed to encode UnitResourceEvent for '{}': {}",
+                event.unit_name, e
+            );
+            return;
+        }
+
         let envelope = Envelope {
             request_id: 0,
             source: "system-a".to_string(),
             target: self.worker_id.clone(),
             method: "event.publish".to_string(),
-            payload: event.data.to_vec(),
+            payload: payload.to_vec(),
         };
 
         let mut buf = bytes::BytesMut::with_capacity(envelope.encoded_len());
@@ -154,6 +184,123 @@ impl EventSubscriber for WorkerEventForwarder {
                 event.unit_name, self.worker_id, e
             );
         }
+    }
+}
+
+/// Build the [`UnitResourceEvent`](sysa::proto::UnitResourceEvent) pushed to
+/// System R from a unit's runtime IR.
+///
+/// This is the UnitIR projection: only the `[Unit] Slice=` parent and the
+/// resource-control limits cross the wire.  Returns `None` when the unit is
+/// not in the runtime cache (nothing to project).
+pub fn build_unit_resource_event(
+    allocator: &AllocatorHandle,
+    unit_name: &str,
+    active_state: &str,
+    main_pid: u32,
+) -> Option<sysa::proto::UnitResourceEvent> {
+    let state = allocator.read();
+    let unit = state.units.get(unit_name)?;
+    let resource = match &unit.kind {
+        crate::unit::types::UnitKind::Service => unit.service.as_ref().map(|s| &s.rc),
+        crate::unit::types::UnitKind::Slice => unit.slice.as_ref().map(|s| &s.rc),
+        crate::unit::types::UnitKind::Scope => unit.scope.as_ref().map(|s| &s.rc),
+        _ => None,
+    }
+    .map(sd_resource_control_to_proto);
+
+    Some(sysa::proto::UnitResourceEvent {
+        unit_name: unit_name.to_string(),
+        active_state: active_state.to_string(),
+        slice: unit.unit.slice.clone(),
+        resource,
+        main_pid,
+    })
+}
+
+/// Push a `event.publish` envelope carrying a [`UnitResourceEvent`] for every
+/// currently active unit matching a subscription, so the worker converges
+/// immediately on (re)subscribe without waiting for the next transition.
+///
+/// `all` matches every unit; otherwise only the names in `units` match.
+/// Best-effort: a full send queue aborts the remaining replay.
+pub fn replay_active_units(
+    allocator: &AllocatorHandle,
+    worker_id: &str,
+    forward_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    all: bool,
+    units: &std::collections::HashSet<String>,
+) {
+    let active: Vec<String> = {
+        let state = allocator.read();
+        state
+            .unit_states
+            .iter()
+            .filter(|(name, cached)| {
+                let matched = all || units.contains(*name);
+                matched && cached.active_state == "active"
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+
+    for name in active {
+        let main_pid = {
+            let state = allocator.read();
+            state
+                .unit_states
+                .get(&name)
+                .map(|c| c.main_pid)
+                .unwrap_or(0)
+        };
+        let Some(resource_event) = build_unit_resource_event(allocator, &name, "active", main_pid)
+        else {
+            continue;
+        };
+        let mut payload = bytes::BytesMut::with_capacity(resource_event.encoded_len());
+        if resource_event.encode(&mut payload).is_err() {
+            continue;
+        }
+        let envelope = Envelope {
+            request_id: 0,
+            source: "system-a".to_string(),
+            target: worker_id.to_string(),
+            method: "event.publish".to_string(),
+            payload: payload.to_vec(),
+        };
+        let mut buf = bytes::BytesMut::with_capacity(envelope.encoded_len());
+        if envelope.encode(&mut buf).is_err() {
+            continue;
+        }
+        if forward_tx.try_send(buf.freeze()).is_err() {
+            break;
+        }
+    }
+}
+
+/// Convert a parsed systemd resource-control block into the protobuf
+/// projection sent to System R.
+fn sd_resource_control_to_proto(rc: &crate::unit::types::ResourceControl) -> sysa::proto::ResourceConfig {
+    sysa::proto::ResourceConfig {
+        cpu_quota: rc.cpu_quota.clone(),
+        cpu_quota_period: rc.cpu_quota_period.clone(),
+        cpu_weight: rc.cpu_weight,
+        startup_cpu_weight: rc.startup_cpu_weight,
+        cpu_set_cpus: rc.cpu_set_cpus.clone(),
+        cpu_set_memory_nodes: rc.cpu_set_memory_nodes.clone(),
+        memory_min: rc.memory_min.clone(),
+        memory_low: rc.memory_low.clone(),
+        memory_high: rc.memory_high.clone(),
+        memory_max: rc.memory_max.clone(),
+        memory_swap_max: rc.memory_swap_max.clone(),
+        io_weight: rc.io_weight,
+        startup_io_weight: rc.startup_io_weight,
+        io_device_weight: rc.io_device_weight.clone(),
+        io_read_bandwidth_max: rc.io_read_bandwidth_max.clone(),
+        io_write_bandwidth_max: rc.io_write_bandwidth_max.clone(),
+        tasks_max: rc.tasks_max,
+        allowed_cpus: rc.allowed_cpus.clone(),
+        allowed_memory_nodes: rc.allowed_memory_nodes.clone(),
     }
 }
 
@@ -232,19 +379,22 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
 
     #[test]
     fn forwarder_matches_only_subscribed_units() {
+        use crate::state::Allocator;
+        let allocator = Allocator::handle();
         let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         let scoped = WorkerEventForwarder::new(
             "system-s-1",
             tx,
             false,
             vec!["a.service".to_string(), "b.service".to_string()],
+            allocator.clone(),
         );
         assert!(scoped.matches(&unit_event("a.service")));
         assert!(scoped.matches(&unit_event("b.service")));
         assert!(!scoped.matches(&unit_event("c.service")));
 
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
-        let all = WorkerEventForwarder::new("system-s-2", tx2, true, vec![]);
+        let all = WorkerEventForwarder::new("system-s-2", tx2, true, vec![], allocator);
         assert!(all.matches(&unit_event("anything.service")));
     }
 }

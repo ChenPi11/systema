@@ -258,6 +258,11 @@ pub struct UnitIR {
     /// The file path this unit was loaded from, if applicable.
     pub source_path: Option<String>,
 
+    /// `[Unit] Slice=` — the parent slice this unit belongs to (e.g.
+    /// `"system.slice"`).  `None` when the directive is absent or empty;
+    /// consumers default to `system.slice` at apply time.
+    pub slice: Option<String>,
+
     /// Dependencies on other units.  When provided, the whole dependency
     /// set replaces the previous one.
     pub dependencies: Option<DependencySet>,

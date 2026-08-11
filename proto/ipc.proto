@@ -328,6 +328,105 @@ message TimerFired {
     uint64 elapse_epoch = 3;
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Resource control (System R)
+// ──────────────────────────────────────────────────────────────────
+
+// Resource-control (cgroup) limits for a unit: the UnitIR `resource_control`
+// projection sent to System R.  String values keep their unit-file form
+// (e.g. "50%", "1G", "100ms") so the cgroup backend can parse them with the
+// precision it needs.
+message ResourceConfig {
+    // CPUQuota= — e.g. "50%".
+    string cpu_quota = 1;
+    // CPUQuotaPeriodSec= — e.g. "100ms".
+    string cpu_quota_period = 2;
+    // CPUWeight= (default 100).
+    uint32 cpu_weight = 3;
+    // StartupCPUWeight= (used during early boot).
+    uint32 startup_cpu_weight = 4;
+    // CPUSetCPUs= — e.g. "0-3".
+    string cpu_set_cpus = 5;
+    // CPUSetMemoryNodes= — e.g. "0".
+    string cpu_set_memory_nodes = 6;
+    // MemoryMin= — e.g. "128M".
+    string memory_min = 7;
+    // MemoryLow= — e.g. "256M".
+    string memory_low = 8;
+    // MemoryHigh= — e.g. "512M".
+    string memory_high = 9;
+    // MemoryMax= — e.g. "1G".
+    string memory_max = 10;
+    // MemorySwapMax= — e.g. "512M".
+    string memory_swap_max = 11;
+    // IOWeight= (default 100).
+    uint32 io_weight = 12;
+    // StartupIOWeight= (used during early boot).
+    uint32 startup_io_weight = 13;
+    // Per-device IO weights, e.g. "/dev/sda 100".
+    repeated string io_device_weight = 14;
+    // Per-device read bandwidth limits, e.g. "/dev/sda 10M".
+    repeated string io_read_bandwidth_max = 15;
+    // Per-device write bandwidth limits.
+    repeated string io_write_bandwidth_max = 16;
+    // TasksMax= (0 / max = unlimited).
+    uint32 tasks_max = 17;
+    // AllowedCPUs= — e.g. "0-3".
+    string allowed_cpus = 18;
+    // AllowedMemoryNodes= — e.g. "0".
+    string allowed_memory_nodes = 19;
+}
+
+// The UnitIR projection pushed to System R whenever a unit's runtime state
+// changes.  Carries everything System R needs to (re)apply cgroup resource
+// control: the `[Unit] Slice=` parent and the resource-control limits.
+message UnitResourceEvent {
+    string unit_name = 1;
+    // active_state of the unit when the event was emitted
+    // ("active", "inactive", "failed", ...).  System R applies the limits on
+    // "active" and releases the entry on "inactive"/"failed".
+    string active_state = 2;
+    // Parent slice from [Unit] Slice=; empty means the default (system.slice).
+    string slice = 3;
+    // The resource-control limits (empty when the unit sets none).
+    ResourceConfig resource = 4;
+    // Main process PID to move into the unit's cgroup (0 = none/n/a).
+    uint32 main_pid = 5;
+}
+
+// Periodic cgroup runtime metrics pushed by System R to System A.
+// Fire-and-forget (no ACK); System A caches the snapshot opaquely and
+// serves it from the systemd-compatible D-Bus properties.
+message CgroupMetricsUpdate {
+    // Metrics for the currently managed (active) units.
+    repeated UnitCgroupMetrics units = 1;
+}
+
+// One unit's cgroup metrics snapshot.
+message UnitCgroupMetrics {
+    string unit_name = 1;
+    // systemd-style cgroup path, e.g. "/system.slice/app.service".
+    string control_group = 2;
+    // Inode of the unit's cgroup directory (ControlGroupId=).
+    uint64 control_group_id = 3;
+    // Runtime metrics keyed by the systemd property name they serve,
+    // e.g. "MemoryCurrent", "CPUUsageNSec", "TasksCurrent".  System A
+    // never interprets the values; it only relays them.
+    map<string, uint64> metrics = 4;
+    // Processes directly in the unit's cgroup (for Unit.GetProcesses).
+    repeated CgroupProcess processes = 5;
+}
+
+// One process inside a unit's cgroup.
+message CgroupProcess {
+    // cgroup subpath relative to the unit's own cgroup ("" = the unit's
+    // own cgroup; unused while only direct processes are sampled).
+    string subpath = 1;
+    uint32 pid = 2;
+    // Process comm (from /proc/<pid>/comm), may be empty.
+    string name = 3;
+}
+
 // Minimal unit configuration sent from System A to System Workers.
 message UnitConfig {
     string unit_name = 1;

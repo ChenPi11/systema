@@ -458,6 +458,97 @@ impl UnitObject {
     }
 
     // ------------------------------------------------------------------
+    // Runtime cgroup metrics (pushed by System R, served from cache)
+    // ------------------------------------------------------------------
+
+    #[zbus(property, name = "ControlGroup")]
+    fn control_group(&self) -> String {
+        self.cgroup_metrics()
+            .map(|m| m.control_group)
+            .unwrap_or_default()
+    }
+
+    #[zbus(property, name = "ControlGroupId")]
+    fn control_group_id(&self) -> u64 {
+        self.cgroup_metrics()
+            .map(|m| m.control_group_id)
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "MemoryCurrent")]
+    fn memory_current(&self) -> u64 {
+        self.metric("MemoryCurrent")
+    }
+
+    #[zbus(property, name = "MemoryPeak")]
+    fn memory_peak(&self) -> u64 {
+        self.metric("MemoryPeak")
+    }
+
+    #[zbus(property, name = "MemorySwapCurrent")]
+    fn memory_swap_current(&self) -> u64 {
+        self.metric("MemorySwapCurrent")
+    }
+
+    #[zbus(property, name = "CPUUsageNSec")]
+    fn cpu_usage_n_sec(&self) -> u64 {
+        self.metric("CPUUsageNSec")
+    }
+
+    #[zbus(property, name = "TasksCurrent")]
+    fn tasks_current(&self) -> u64 {
+        self.metric("TasksCurrent")
+    }
+
+    #[zbus(property, name = "OOMKills")]
+    fn oom_kills(&self) -> u64 {
+        self.metric("OOMKills")
+    }
+
+    #[zbus(property, name = "IOReadBytes")]
+    fn io_read_bytes(&self) -> u64 {
+        self.metric("IOReadBytes")
+    }
+
+    #[zbus(property, name = "IOReadOperations")]
+    fn io_read_operations(&self) -> u64 {
+        self.metric("IOReadOperations")
+    }
+
+    #[zbus(property, name = "IOWriteBytes")]
+    fn io_write_bytes(&self) -> u64 {
+        self.metric("IOWriteBytes")
+    }
+
+    #[zbus(property, name = "IOWriteOperations")]
+    fn io_write_operations(&self) -> u64 {
+        self.metric("IOWriteOperations")
+    }
+
+    #[zbus(property, name = "EffectiveTasksMax")]
+    fn effective_tasks_max(&self) -> u64 {
+        self.metric("EffectiveTasksMax")
+    }
+
+    #[zbus(property, name = "EffectiveMemoryMax")]
+    fn effective_memory_max(&self) -> u64 {
+        self.metric("EffectiveMemoryMax")
+    }
+
+    /// List the processes running directly inside the unit's cgroup.
+    /// Returns `(subpath, pid, name)` triplets, as systemd does.
+    fn get_processes(&self) -> Vec<(String, u32, String)> {
+        self.cgroup_metrics()
+            .map(|m| {
+                m.processes
+                    .iter()
+                    .map(|p| (p.subpath.clone(), p.pid, p.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // ------------------------------------------------------------------
     // Methods called by systemctl
     // ------------------------------------------------------------------
 
@@ -483,6 +574,24 @@ impl UnitObject {
             UnitKind::Scope => u.scope.as_ref().map(|s| s.rc.clone()),
             _ => None,
         }
+    }
+
+    /// The latest cgroup metrics snapshot for this unit, if System R has
+    /// pushed one.
+    fn cgroup_metrics(&self) -> Option<sysa::proto::UnitCgroupMetrics> {
+        self.allocator
+            .read()
+            .cgroup_metrics
+            .get(&self.unit_name)
+            .cloned()
+    }
+
+    /// A runtime metric value, or `UINT64_MAX` (systemd's "no data"
+    /// convention) when System R has not reported it.
+    fn metric(&self, key: &str) -> u64 {
+        self.cgroup_metrics()
+            .and_then(|m| m.metrics.get(key).copied())
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -722,5 +831,52 @@ mod tests {
         assert_eq!(parse_usec_value("100ms", 0), 100_000);
         assert_eq!(parse_usec_value("1min", 0), 60_000_000);
         assert_eq!(parse_usec_value("default", 100_000), 100_000);
+    }
+
+    #[test]
+    fn cgroup_metrics_properties_are_served_from_cache() {
+        let alloc = handle();
+        {
+            let mut s = alloc.write();
+            s.cgroup_metrics.insert(
+                "demo.service".to_string(),
+                sysa::proto::UnitCgroupMetrics {
+                    unit_name: "demo.service".to_string(),
+                    control_group: "/system.slice/demo.service".to_string(),
+                    control_group_id: 4242,
+                    metrics: [
+                        ("MemoryCurrent".to_string(), 1_048_576u64),
+                        ("CPUUsageNSec".to_string(), 12_345_000u64),
+                        ("TasksCurrent".to_string(), 2u64),
+                        ("EffectiveTasksMax".to_string(), 512u64),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    processes: vec![sysa::proto::CgroupProcess {
+                        subpath: String::new(),
+                        pid: 42,
+                        name: "demo".to_string(),
+                    }],
+                },
+            );
+        }
+        let o = obj(alloc);
+        assert_eq!(o.control_group(), "/system.slice/demo.service");
+        assert_eq!(o.control_group_id(), 4242);
+        assert_eq!(o.memory_current(), 1_048_576);
+        assert_eq!(o.cpu_usage_n_sec(), 12_345_000);
+        assert_eq!(o.tasks_current(), 2);
+        assert_eq!(o.effective_tasks_max(), 512);
+        assert_eq!(o.get_processes(), vec![(String::new(), 42, "demo".to_string())]);
+    }
+
+    #[test]
+    fn cgroup_metrics_absent_means_no_data() {
+        let alloc = handle();
+        let o = obj(alloc);
+        assert_eq!(o.control_group(), "");
+        assert_eq!(o.control_group_id(), 0);
+        assert_eq!(o.memory_current(), u64::MAX);
+        assert_eq!(o.get_processes(), Vec::<(String, u32, String)>::new());
     }
 }

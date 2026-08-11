@@ -76,17 +76,64 @@ pub fn parse_cpu_quota_percent(value: &str) -> Option<f64> {
     Some(pct)
 }
 
+/// Parse a `CPUQuotaPeriodSec=` value into microseconds.
+///
+/// Accepts bare microseconds, `"ms"`, `"s"`, `"us"` suffixes and decimal
+/// prefixes (e.g. `"100ms"`, `"0.1s"`, `"100000"`).  Unparseable input
+/// yields `None`.
+pub fn parse_cpu_period_us(value: &str) -> Option<u64> {
+    let s = value.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, 1_000u64)
+    } else if let Some(stripped) = s.strip_suffix("us") {
+        (stripped, 1u64)
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, 1_000_000u64)
+    } else {
+        (s, 1u64)
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    if !n.is_finite() || n <= 0.0 {
+        return None;
+    }
+    Some((n * mult as f64) as u64)
+}
+
 /// Convert a `CPUQuota=` value into the cgroup v2 `cpu.max` payload
-/// (`"quota_us period_us"`), with the period fixed at 100ms.
+/// (`"quota_us period_us"`) with the default 100ms period.
 pub fn cpu_quota_to_cpu_max(value: &str) -> Option<String> {
+    cpu_quota_to_cpu_max_period(value, super::CPU_MAX_PERIOD_US)
+}
+
+/// Convert a `CPUQuota=` value into the cgroup v2 `cpu.max` payload
+/// (`"quota_us period_us"`) over the given period in microseconds.
+///
+/// A percentage is a fraction of one full period: 50% over a 100ms period
+/// yields a 50ms quota.
+pub fn cpu_quota_to_cpu_max_period(value: &str, period_us: u64) -> Option<String> {
     let pct = parse_cpu_quota_percent(value)?;
-    // A percentage is a fraction of one full period: 50% → 50ms quota on a
-    // 100ms period.
-    let quota_us = (pct / 100.0 * super::CPU_MAX_PERIOD_US as f64) as u64;
+    let quota_us = (pct / 100.0 * period_us as f64) as u64;
     if quota_us == 0 {
         return None;
     }
-    Some(format!("{quota_us} {}", super::CPU_MAX_PERIOD_US))
+    Some(format!("{quota_us} {period_us}"))
+}
+
+/// Split a per-device resource directive (`"DEVICE VALUE"`) into its two
+/// whitespace-separated parts.  `DEVICE` may be a `/dev` path or a cgroup
+/// v2 `"MAJ:MIN"` id.
+pub fn split_device_directive(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.split_whitespace();
+    let device = parts.next()?;
+    let value = parts.next()?;
+    if device.is_empty() || value.is_empty() {
+        None
+    } else {
+        Some((device, value))
+    }
 }
 
 /// Parse a memory size string (systemd `parse_size`) into bytes.
@@ -176,6 +223,43 @@ mod tests {
         assert_eq!(cpu_quota_to_cpu_max("100%"), Some("100000 100000".to_string()));
         assert_eq!(cpu_quota_to_cpu_max("10.5%"), Some("10500 100000".to_string()));
         assert_eq!(cpu_quota_to_cpu_max("infinity"), None);
+    }
+
+    #[test]
+    fn quota_to_cpu_max_custom_period() {
+        assert_eq!(
+            cpu_quota_to_cpu_max_period("50%", 50_000),
+            Some("25000 50000".to_string())
+        );
+        assert_eq!(
+            cpu_quota_to_cpu_max_period("100%", 1_000_000),
+            Some("1000000 1000000".to_string())
+        );
+    }
+
+    #[test]
+    fn cpu_period_parsing() {
+        assert_eq!(parse_cpu_period_us("100ms"), Some(100_000));
+        assert_eq!(parse_cpu_period_us("50ms"), Some(50_000));
+        assert_eq!(parse_cpu_period_us("1s"), Some(1_000_000));
+        assert_eq!(parse_cpu_period_us("250us"), Some(250));
+        assert_eq!(parse_cpu_period_us("100000"), Some(100_000));
+        assert_eq!(parse_cpu_period_us(""), None);
+        assert_eq!(parse_cpu_period_us("junk"), None);
+    }
+
+    #[test]
+    fn device_directives() {
+        assert_eq!(
+            split_device_directive("/dev/sda 100"),
+            Some(("/dev/sda", "100"))
+        );
+        assert_eq!(
+            split_device_directive("8:0 10M"),
+            Some(("8:0", "10M"))
+        );
+        assert_eq!(split_device_directive(""), None);
+        assert_eq!(split_device_directive("/dev/sda"), None);
     }
 
     #[test]

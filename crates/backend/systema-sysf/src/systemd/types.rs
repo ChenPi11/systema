@@ -251,6 +251,9 @@ pub struct UnitSection {
     /// `AllowIsolate=` — whether the unit may be targeted by `isolate`
     /// mode jobs (defaults to false, matching systemd).
     pub allow_isolate: bool,
+    /// `Slice=` — the parent slice this unit belongs to
+    /// (e.g. `"system.slice"`).  Empty when unset.
+    pub slice: String,
 
     // ------------------------------------------------------------------
     // Condition checks — parsed; evaluated by the scheduler before start.
@@ -328,6 +331,7 @@ impl Default for UnitSection {
             wants_mounts_for: Vec::new(),
             default_dependencies: true,
             allow_isolate: false,
+            slice: String::new(),
             condition_path_exists: Vec::new(),
             condition_path_exists_glob: Vec::new(),
             condition_file_not_empty: Vec::new(),

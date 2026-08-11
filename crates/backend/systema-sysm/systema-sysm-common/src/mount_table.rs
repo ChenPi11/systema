@@ -99,6 +99,7 @@ pub fn build_mount_unit_ir(unit_name: &str, entry: &MountTableEntry) -> UnitIR {
         description: Some(entry.mount_point.clone()),
         source_format: Some("dynamic".to_string()),
         source_path: None,
+        slice: None,
         dependencies: None,
         service: None,
         mount: Some(IrMountConfig {

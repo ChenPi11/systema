@@ -51,6 +51,7 @@ fn convert_unit_file(uf: &UnitFile) -> UnitIR {
         description: Some(uf.unit.description.clone()),
         source_format: Some("systemd".to_string()),
         source_path: None,
+        slice: (!uf.unit.slice.is_empty()).then(|| uf.unit.slice.clone()),
         dependencies: Some(convert_dependencies(uf)),
         service: uf.service.as_ref().map(convert_service),
         mount: uf.mount.as_ref().map(convert_mount),

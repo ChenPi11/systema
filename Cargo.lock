@@ -1544,6 +1544,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "prost",
  "sysa",
  "systema-sysr-common",
  "systema-sysr-linux",
@@ -1556,7 +1557,7 @@ dependencies = [
 name = "systema-sysr-common"
 version = "0.1.0"
 dependencies = [
- "configparser",
+ "sysa",
  "thiserror",
  "tracing",
 ]

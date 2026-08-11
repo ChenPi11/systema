@@ -714,13 +714,23 @@ impl ManagerInterface {
     }
 
     /// Return the processes currently running under a unit's control group.
-    /// Each tuple is (cgroup_path, pid, command_line).
+    /// Each tuple is (cgroup_path, pid, command_line).  Served from the
+    /// `cgroup.metrics` cache pushed by System R.
     async fn get_unit_processes(
         &self,
-        _unit_name: &str,
+        unit_name: &str,
     ) -> zbus::fdo::Result<Vec<(String, u32, String)>> {
-        debug!("D-Bus GetUnitProcesses: unit={}", _unit_name);
-        Ok(Vec::new())
+        debug!("D-Bus GetUnitProcesses: unit={}", unit_name);
+        let alloc = self.allocator.read();
+        let Some(metrics) = alloc.cgroup_metrics.get(unit_name) else {
+            return Ok(Vec::new());
+        };
+        let cgroup_path = metrics.control_group.clone();
+        Ok(metrics
+            .processes
+            .iter()
+            .map(|p| (cgroup_path.clone(), p.pid, p.name.clone()))
+            .collect())
     }
 
     // ------------------------------------------------------------------
