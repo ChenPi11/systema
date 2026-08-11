@@ -10,6 +10,7 @@ use zvariant::OwnedObjectPath;
 
 use super::manager::job_object_path;
 use crate::state::{AllocatorHandle, JobStatus};
+use crate::unit::types::{ResourceControl, UnitKind};
 
 /// D-Bus object representing a single loaded unit.
 pub struct UnitObject {
@@ -341,6 +342,122 @@ impl UnitObject {
     }
 
     // ------------------------------------------------------------------
+    // Resource control (cgroup limits)
+    // ------------------------------------------------------------------
+
+    #[zbus(property, name = "MemoryMin")]
+    fn memory_min(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| parse_size_bytes(&rc.memory_min))
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "MemoryLow")]
+    fn memory_low(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| parse_size_bytes(&rc.memory_low))
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "MemoryHigh")]
+    fn memory_high(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| parse_size_bytes(&rc.memory_high))
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "MemoryMax")]
+    fn memory_max(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| parse_size_bytes(&rc.memory_max))
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "MemorySwapMax")]
+    fn memory_swap_max(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| parse_size_bytes(&rc.memory_swap_max))
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "CPUQuotaUSec")]
+    fn cpu_quota_u_sec(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| parse_cpu_quota_usec(&rc.cpu_quota))
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "CPUQuotaPeriodUSec")]
+    fn cpu_quota_period_u_sec(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| parse_usec_value(&rc.cpu_quota_period, 100_000))
+            .unwrap_or(0)
+    }
+
+    #[zbus(property, name = "CPUWeight")]
+    fn cpu_weight(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| rc.cpu_weight as u64)
+            .unwrap_or(100)
+    }
+
+    #[zbus(property, name = "StartupCPUWeight")]
+    fn startup_cpu_weight(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| rc.startup_cpu_weight as u64)
+            .unwrap_or(100)
+    }
+
+    #[zbus(property, name = "IOWeight")]
+    fn io_weight(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| rc.io_weight as u64)
+            .unwrap_or(100)
+    }
+
+    #[zbus(property, name = "StartupIOWeight")]
+    fn startup_io_weight(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| rc.startup_io_weight as u64)
+            .unwrap_or(100)
+    }
+
+    #[zbus(property, name = "TasksMax")]
+    fn tasks_max(&self) -> u64 {
+        self.resource_control()
+            .map(|rc| rc.tasks_max as u64)
+            .unwrap_or(u64::MAX)
+    }
+
+    #[zbus(property, name = "AllowedCPUs")]
+    fn allowed_cpus(&self) -> String {
+        self.resource_control()
+            .map(|rc| rc.allowed_cpus)
+            .unwrap_or_default()
+    }
+
+    #[zbus(property, name = "AllowedMemoryNodes")]
+    fn allowed_memory_nodes(&self) -> String {
+        self.resource_control()
+            .map(|rc| rc.allowed_memory_nodes)
+            .unwrap_or_default()
+    }
+
+    #[zbus(property, name = "CPUSetCPUs")]
+    fn cpu_set_cpus(&self) -> String {
+        self.resource_control()
+            .map(|rc| rc.cpu_set_cpus)
+            .unwrap_or_default()
+    }
+
+    #[zbus(property, name = "CPUSetMemoryNodes")]
+    fn cpu_set_memory_nodes(&self) -> String {
+        self.resource_control()
+            .map(|rc| rc.cpu_set_memory_nodes)
+            .unwrap_or_default()
+    }
+
+    // ------------------------------------------------------------------
     // Methods called by systemctl
     // ------------------------------------------------------------------
 
@@ -350,6 +467,112 @@ impl UnitObject {
 
     fn reset_failed(&self) -> zbus::fdo::Result<()> {
         Ok(())
+    }
+}
+
+/// Internal helpers, not exposed on D-Bus.
+impl UnitObject {
+    /// The resource-control limits parsed for this unit, if its kind owns a
+    /// cgroup section (`[Service]`, `[Slice]`, or `[Scope]`).
+    fn resource_control(&self) -> Option<ResourceControl> {
+        let state = self.allocator.read();
+        let u = state.units.get(&self.unit_name)?;
+        match &u.kind {
+            UnitKind::Service => u.service.as_ref().map(|s| s.rc.clone()),
+            UnitKind::Slice => u.slice.as_ref().map(|s| s.rc.clone()),
+            UnitKind::Scope => u.scope.as_ref().map(|s| s.rc.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a systemd size value ("1G", "500M", "1024K", "infinity") into bytes.
+///
+/// An explicit `infinity` yields `u64::MAX`; empty or unparseable values
+/// yield `0` (not configured) so callers can distinguish "no limit set".
+fn parse_size_bytes(value: &str) -> u64 {
+    let v = value.trim();
+    if v.is_empty() {
+        return 0;
+    }
+    if v.eq_ignore_ascii_case("infinity") {
+        return u64::MAX;
+    }
+    if v.ends_with('%') {
+        // A percentage of available memory cannot be resolved statically;
+        // report it as unlimited rather than fabricate a byte count.
+        return u64::MAX;
+    }
+    let v = v.strip_suffix('B').unwrap_or(v);
+    let (digits, suffix) = match v.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&v[..v.len() - 1], c.to_ascii_uppercase()),
+        _ => (v, '\0'),
+    };
+    let base: u64 = match digits.trim().parse() {
+        Ok(n) => n,
+        Err(_) => return 0,
+    };
+    let mult: u64 = match suffix {
+        'K' => 1 << 10,
+        'M' => 1 << 20,
+        'G' => 1 << 30,
+        'T' => 1 << 40,
+        'P' => 1 << 50,
+        'E' => 1 << 60,
+        _ => 1,
+    };
+    base.saturating_mul(mult)
+}
+
+/// Parse a `CPUQuota=` value into µs per period.
+///
+/// Percentages are resolved against systemd's default 100 ms period
+/// (`"50%"` → 50 000 µs); time values are parsed directly (`"100ms"` →
+/// 100 000 µs). `infinity` yields `u64::MAX`.
+fn parse_cpu_quota_usec(value: &str) -> u64 {
+    let v = value.trim();
+    if v.is_empty() {
+        return 0;
+    }
+    if v.eq_ignore_ascii_case("infinity") || v.eq_ignore_ascii_case("default") {
+        return u64::MAX;
+    }
+    if let Some(pct) = v.strip_suffix('%') {
+        return match pct.trim().parse::<f64>() {
+            Ok(p) if p >= 0.0 => ((p / 100.0) * 100_000.0) as u64,
+            _ => u64::MAX,
+        };
+    }
+    parse_usec_value(v, 0)
+}
+
+/// Parse a systemd time value into microseconds (`"100ms"` → 100 000,
+/// `"1s"` → 1 000 000, `"1min"` → 60 000 000, bare = µs).
+fn parse_usec_value(value: &str, default: u64) -> u64 {
+    let v = value.trim();
+    if v.is_empty() {
+        return default;
+    }
+    if v.eq_ignore_ascii_case("infinity") {
+        return u64::MAX;
+    }
+    if v.eq_ignore_ascii_case("default") {
+        return default;
+    }
+    let (digits, mult) = if let Some(d) = v.strip_suffix("ms") {
+        (d, 1_000)
+    } else if let Some(d) = v.strip_suffix("min") {
+        (d, 60_000_000)
+    } else if let Some(d) = v.strip_suffix('s') {
+        (d, 1_000_000)
+    } else if let Some(d) = v.strip_suffix('h') {
+        (d, 3_600_000_000)
+    } else {
+        (v, 1)
+    };
+    match digits.trim().parse::<u64>() {
+        Ok(n) => n.saturating_mul(mult),
+        Err(_) => default,
     }
 }
 
@@ -453,5 +676,51 @@ mod tests {
         let obj = obj(alloc);
         assert_eq!(obj.active_enter_timestamp(), 1234);
         assert_eq!(obj.inactive_enter_timestamp(), 0);
+    }
+
+    #[test]
+    fn resource_control_properties_are_exposed() {
+        let alloc = handle();
+        {
+            let mut s = alloc.write();
+            let mut uf = crate::unit::types::UnitFile::new("demo.service");
+            let mut svc = crate::unit::types::ServiceSection::default();
+            svc.rc.memory_max = "1G".to_string();
+            svc.rc.cpu_quota = "50%".to_string();
+            svc.rc.cpu_weight = 200;
+            svc.rc.tasks_max = 512;
+            uf.service = Some(svc);
+            s.units.insert("demo.service".to_string(), uf);
+        }
+        let o = obj(alloc);
+        assert_eq!(o.memory_max(), 1 << 30);
+        assert_eq!(o.cpu_quota_u_sec(), 50_000);
+        assert_eq!(o.cpu_weight(), 200);
+        assert_eq!(o.tasks_max(), 512);
+        assert_eq!(o.allowed_cpus(), "");
+    }
+
+    #[test]
+    fn resource_control_properties_absent_without_limits() {
+        let alloc = handle();
+        assert_eq!(obj(alloc.clone()).memory_max(), 0);
+        assert_eq!(obj(alloc.clone()).cpu_quota_u_sec(), 0);
+        assert_eq!(obj(alloc).tasks_max(), u64::MAX);
+    }
+
+    #[test]
+    fn resource_parse_helpers() {
+        assert_eq!(parse_size_bytes("1G"), 1 << 30);
+        assert_eq!(parse_size_bytes("500M"), 500 << 20);
+        assert_eq!(parse_size_bytes("1024K"), 1 << 20);
+        assert_eq!(parse_size_bytes("infinity"), u64::MAX);
+        assert_eq!(parse_size_bytes(""), 0);
+        assert_eq!(parse_cpu_quota_usec("50%"), 50_000);
+        assert_eq!(parse_cpu_quota_usec("100%"), 100_000);
+        assert_eq!(parse_cpu_quota_usec("100ms"), 100_000);
+        assert_eq!(parse_usec_value("1s", 0), 1_000_000);
+        assert_eq!(parse_usec_value("100ms", 0), 100_000);
+        assert_eq!(parse_usec_value("1min", 0), 60_000_000);
+        assert_eq!(parse_usec_value("default", 100_000), 100_000);
     }
 }

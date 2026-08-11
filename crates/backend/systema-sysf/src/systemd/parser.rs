@@ -190,6 +190,10 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
                 if let Some(v) = config.get("service", "standarderror") {
                     svc.standard_error = v;
                 }
+
+                // Resource-control directives override individually so keys
+                // absent from the drop-in keep the base values.
+                apply_dropin_resource_control(&config, "service", &mut svc.rc);
             }
         }
         UnitKind::Mount => {
@@ -237,21 +241,24 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
             }
         }
         UnitKind::Slice => {
-            if config.get("slice", "cpuquota").is_some()
-                || config.get("slice", "memorymax").is_some()
-            {
-                let mut slice = unit.slice.take().unwrap_or_default();
-                parse_slice_section(&config, &mut slice, &unit.name)?;
-                unit.slice = Some(slice);
+            // [Slice] only carries resource-control directives, applied
+            // per-key so drop-ins override exactly what they mention.
+            if let Some(ref mut slice) = unit.slice {
+                apply_dropin_resource_control(&config, "slice", &mut slice.rc);
             }
         }
         UnitKind::Scope => {
             if config.get("scope", "pids").is_some()
                 || config.get("scope", "timeoutstopsec").is_some()
+                || config.get("scope", "runtimemaxsec").is_some()
+                || config.get("scope", "killmode").is_some()
             {
                 let mut scope = unit.scope.take().unwrap_or_default();
                 parse_scope_section(&config, &mut scope, &unit.name)?;
                 unit.scope = Some(scope);
+            }
+            if let Some(ref mut scope) = unit.scope {
+                apply_dropin_resource_control(&config, "scope", &mut scope.rc);
             }
         }
         UnitKind::Device
@@ -966,6 +973,7 @@ fn parse_exec_line(raw: &str, unit_name: &str) -> ExecCommand {
 fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> Result<()> {
     let stype = get_str(config, "service", "type");
     svc.service_type = ServiceType::from(stype.as_str());
+    parse_resource_control(config, "service", &mut svc.rc);
 
     // ExecStart supports multiple values (each call appends).
     // An empty value clears the list (systemd semantics).
@@ -1229,21 +1237,99 @@ fn parse_path_section(config: &Ini, path_sec: &mut PathSection, name: &str) -> R
     Ok(())
 }
 
+/// Parse the resource-control directives (`systemd.resource-control(5)`)
+/// found in `section` into `rc`.
+///
+/// Used for `[Service]`, `[Slice]`, and `[Scope]`, the three unit sections
+/// that own a cgroup and thus accept these directives.
+fn parse_resource_control(config: &Ini, section: &str, rc: &mut ResourceControl) {
+    rc.cpu_quota = get_str(config, section, "cpuquota");
+    rc.cpu_quota_period = get_str(config, section, "cpuquotaperiodsec");
+    rc.cpu_weight = get_u32(config, section, "cpuweight", 100);
+    rc.startup_cpu_weight = get_u32(config, section, "startupcpuweight", 100);
+    rc.cpu_set_cpus = get_str(config, section, "cpusetcpus");
+    rc.cpu_set_memory_nodes = get_str(config, section, "cpusetmemorynodes");
+    rc.memory_min = get_str(config, section, "memorymin");
+    rc.memory_low = get_str(config, section, "memorylow");
+    rc.memory_high = get_str(config, section, "memoryhigh");
+    rc.memory_max = get_str(config, section, "memorymax");
+    rc.memory_swap_max = get_str(config, section, "memoryswapmax");
+    rc.io_weight = get_u32(config, section, "ioweight", 100);
+    rc.startup_io_weight = get_u32(config, section, "startupioweight", 100);
+    rc.io_device_weight = split_vec(&get_str(config, section, "iodeviceweight"));
+    rc.io_read_bandwidth_max = split_vec(&get_str(config, section, "ioreadbandwidthmax"));
+    rc.io_write_bandwidth_max = split_vec(&get_str(config, section, "iowritebandwidthmax"));
+    rc.tasks_max = get_u32(config, section, "tasksmax", u32::MAX);
+    rc.allowed_cpus = get_str(config, section, "allowedcpus");
+    rc.allowed_memory_nodes = get_str(config, section, "allowedmemorynodes");
+}
+
+/// Apply resource-control directives present in a drop-in onto `rc`.
+///
+/// Mirrors systemd's drop-in semantics: only directives actually listed in
+/// the drop-in override the accumulated value; absent ones keep it.
+fn apply_dropin_resource_control(config: &Ini, section: &str, rc: &mut ResourceControl) {
+    if let Some(v) = config.get(section, "cpuquota") {
+        rc.cpu_quota = v.clone();
+    }
+    if let Some(v) = config.get(section, "cpuquotaperiodsec") {
+        rc.cpu_quota_period = v.clone();
+    }
+    if config.get(section, "cpuweight").is_some() {
+        rc.cpu_weight = get_u32(config, section, "cpuweight", 100);
+    }
+    if config.get(section, "startupcpuweight").is_some() {
+        rc.startup_cpu_weight = get_u32(config, section, "startupcpuweight", 100);
+    }
+    if let Some(v) = config.get(section, "cpusetcpus") {
+        rc.cpu_set_cpus = v.clone();
+    }
+    if let Some(v) = config.get(section, "cpusetmemorynodes") {
+        rc.cpu_set_memory_nodes = v.clone();
+    }
+    if let Some(v) = config.get(section, "memorymin") {
+        rc.memory_min = v.clone();
+    }
+    if let Some(v) = config.get(section, "memorylow") {
+        rc.memory_low = v.clone();
+    }
+    if let Some(v) = config.get(section, "memoryhigh") {
+        rc.memory_high = v.clone();
+    }
+    if let Some(v) = config.get(section, "memorymax") {
+        rc.memory_max = v.clone();
+    }
+    if let Some(v) = config.get(section, "memoryswapmax") {
+        rc.memory_swap_max = v.clone();
+    }
+    if config.get(section, "ioweight").is_some() {
+        rc.io_weight = get_u32(config, section, "ioweight", 100);
+    }
+    if config.get(section, "startupioweight").is_some() {
+        rc.startup_io_weight = get_u32(config, section, "startupioweight", 100);
+    }
+    if let Some(v) = config.get(section, "iodeviceweight") {
+        rc.io_device_weight = split_vec(&v);
+    }
+    if let Some(v) = config.get(section, "ioreadbandwidthmax") {
+        rc.io_read_bandwidth_max = split_vec(&v);
+    }
+    if let Some(v) = config.get(section, "iowritebandwidthmax") {
+        rc.io_write_bandwidth_max = split_vec(&v);
+    }
+    if config.get(section, "tasksmax").is_some() {
+        rc.tasks_max = get_u32(config, section, "tasksmax", u32::MAX);
+    }
+    if let Some(v) = config.get(section, "allowedcpus") {
+        rc.allowed_cpus = v.clone();
+    }
+    if let Some(v) = config.get(section, "allowedmemorynodes") {
+        rc.allowed_memory_nodes = v.clone();
+    }
+}
+
 fn parse_slice_section(config: &Ini, slice: &mut SliceSection, _name: &str) -> Result<()> {
-    slice.cpu_quota = get_str(config, "slice", "cpuquota");
-    slice.cpu_weight = get_u32(config, "slice", "cpuweight", 100);
-    slice.startup_cpu_weight = get_u32(config, "slice", "startupcpuweight", 100);
-    slice.cpu_set_cpus = get_str(config, "slice", "cpusetcpus");
-    slice.cpu_set_memory_nodes = get_str(config, "slice", "cpusetmemorynodes");
-    slice.memory_max = get_str(config, "slice", "memorymax");
-    slice.memory_high = get_str(config, "slice", "memoryhigh");
-    slice.memory_low = get_str(config, "slice", "memorylow");
-    slice.memory_min = get_str(config, "slice", "memorymin");
-    slice.io_weight = get_u32(config, "slice", "ioweight", 100);
-    slice.io_bandwidth_max = get_str(config, "slice", "iobandwidthmax");
-    slice.tasks_max = get_u32(config, "slice", "tasksmax", u32::MAX);
-    slice.allowed_cpus = get_str(config, "slice", "allowedcpus");
-    slice.allowed_memory_nodes = get_str(config, "slice", "allowedmemorynodes");
+    parse_resource_control(config, "slice", &mut slice.rc);
     Ok(())
 }
 
@@ -1257,10 +1343,7 @@ fn parse_scope_section(config: &Ini, scope: &mut ScopeSection, _name: &str) -> R
     scope.kill_mode = get_str(config, "scope", "killmode");
     scope.kill_signal = get_str(config, "scope", "killsignal");
     scope.send_sighup = get_bool(config, "scope", "sendsighup", false);
-    scope.cpu_quota = get_str(config, "scope", "cpuquota");
-    scope.cpu_weight = get_u32(config, "scope", "cpuweight", 100);
-    scope.memory_max = get_str(config, "scope", "memorymax");
-    scope.tasks_max = get_u32(config, "scope", "tasksmax", u32::MAX);
+    parse_resource_control(config, "scope", &mut scope.rc);
     Ok(())
 }
 
@@ -1715,10 +1798,10 @@ CPUWeight=200
         let unit = parse_unit("system.slice", SLICE_UNIT).unwrap();
         assert!(matches!(unit.kind, UnitKind::Slice));
         let slice = unit.slice.unwrap();
-        assert_eq!(slice.cpu_quota, "50%");
-        assert_eq!(slice.memory_max, "1G");
-        assert_eq!(slice.tasks_max, 512);
-        assert_eq!(slice.cpu_weight, 200);
+        assert_eq!(slice.rc.cpu_quota, "50%");
+        assert_eq!(slice.rc.memory_max, "1G");
+        assert_eq!(slice.rc.tasks_max, 512);
+        assert_eq!(slice.rc.cpu_weight, 200);
     }
 
     // -----------------------------------------------------------------------
@@ -1741,7 +1824,7 @@ MemoryMax=2G
         assert_eq!(scope.pids, vec!["1234", "5678"]);
         assert_eq!(scope.timeout_stop_sec, 30);
         assert_eq!(scope.kill_mode, "control-group");
-        assert_eq!(scope.memory_max, "2G");
+        assert_eq!(scope.rc.memory_max, "2G");
     }
 
     // -----------------------------------------------------------------------
@@ -1819,6 +1902,60 @@ DeviceName=/dev/sda
         assert_eq!(svc.standard_input, "tty");
         assert_eq!(svc.standard_error, "tty");
         assert_eq!(svc.standard_output, "tty");
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource-control parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_service_resource_control() {
+        let content = r#"
+[Service]
+ExecStart=/usr/bin/foo
+MemoryMax=1G
+MemoryHigh=768M
+CPUQuota=50%
+CPUWeight=200
+TasksMax=512
+AllowedCPUs=0-3
+"#;
+        let unit = parse_unit("foo.service", content).unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.rc.memory_max, "1G");
+        assert_eq!(svc.rc.memory_high, "768M");
+        assert_eq!(svc.rc.cpu_quota, "50%");
+        assert_eq!(svc.rc.cpu_weight, 200);
+        assert_eq!(svc.rc.tasks_max, 512);
+        assert_eq!(svc.rc.allowed_cpus, "0-3");
+        // Keys absent from the section keep parser defaults.
+        assert_eq!(svc.rc.cpu_quota_period, "");
+        assert_eq!(svc.rc.memory_swap_max, "");
+        assert_eq!(svc.rc.io_weight, 100);
+    }
+
+    #[test]
+    fn test_dropin_resource_control_overrides_only_listed_keys() {
+        let base = "[Service]\nExecStart=/usr/bin/foo\nMemoryMax=1G\nCPUQuota=50%\n";
+        let mut unit = parse_unit("foo.service", base).unwrap();
+        let dropin = "[Service]\nMemoryMax=2G\n";
+        apply_dropin_content(&mut unit, dropin).unwrap();
+        let svc = unit.service.unwrap();
+        // Listed key overrides, absent key keeps its base value.
+        assert_eq!(svc.rc.memory_max, "2G");
+        assert_eq!(svc.rc.cpu_quota, "50%");
+    }
+
+    #[test]
+    fn test_dropin_slice_resource_control_overrides() {
+        let base = "[Slice]\nCPUQuota=50%\nMemoryMax=1G\n";
+        let mut unit = parse_unit("app.slice", base).unwrap();
+        let dropin = "[Slice]\nTasksMax=256\n";
+        apply_dropin_content(&mut unit, dropin).unwrap();
+        let slice = unit.slice.unwrap();
+        assert_eq!(slice.rc.tasks_max, 256);
+        assert_eq!(slice.rc.memory_max, "1G");
+        assert_eq!(slice.rc.cpu_quota, "50%");
     }
 
     // -----------------------------------------------------------------------

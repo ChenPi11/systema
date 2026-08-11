@@ -6,8 +6,8 @@ use async_trait::async_trait;
 
 use super::loader;
 use super::types::{
-    ExecCommand as SdExecCommand, RestartPolicy as SdRestartPolicy, ServiceSection, UnitFile,
-    UnitKind,
+    ExecCommand as SdExecCommand, ResourceControl as SdResourceControl,
+    RestartPolicy as SdRestartPolicy, ServiceSection, UnitFile, UnitKind,
 };
 use crate::ir::{
     self, AutomountConfig, Condition, DependencySet, ExecCommand, MountConfig, ServiceConfig,
@@ -61,6 +61,43 @@ fn convert_unit_file(uf: &UnitFile) -> UnitIR {
         asserts: Some(convert_asserts(uf)),
         wanted_by: Some(uf.install.wanted_by.iter().cloned().collect()),
         required_by: Some(uf.install.required_by.iter().cloned().collect()),
+        resource_control: extract_resource_control(uf),
+    }
+}
+
+/// Pull the parsed resource-control directives from the unit's cgroup-owned
+/// section (`[Service]`, `[Slice]`, or `[Scope]`) into the unified IR.
+fn extract_resource_control(uf: &UnitFile) -> Option<ir::ResourceControl> {
+    let rc = match &uf.kind {
+        UnitKind::Service => uf.service.as_ref().map(|s| &s.rc),
+        UnitKind::Slice => uf.slice.as_ref().map(|s| &s.rc),
+        UnitKind::Scope => uf.scope.as_ref().map(|s| &s.rc),
+        _ => return None,
+    };
+    rc.map(convert_resource_control)
+}
+
+fn convert_resource_control(rc: &SdResourceControl) -> ir::ResourceControl {
+    ir::ResourceControl {
+        cpu_quota: rc.cpu_quota.clone(),
+        cpu_quota_period: rc.cpu_quota_period.clone(),
+        cpu_weight: rc.cpu_weight,
+        startup_cpu_weight: rc.startup_cpu_weight,
+        cpu_set_cpus: rc.cpu_set_cpus.clone(),
+        cpu_set_memory_nodes: rc.cpu_set_memory_nodes.clone(),
+        memory_min: rc.memory_min.clone(),
+        memory_low: rc.memory_low.clone(),
+        memory_high: rc.memory_high.clone(),
+        memory_max: rc.memory_max.clone(),
+        memory_swap_max: rc.memory_swap_max.clone(),
+        io_weight: rc.io_weight,
+        startup_io_weight: rc.startup_io_weight,
+        io_device_weight: rc.io_device_weight.clone(),
+        io_read_bandwidth_max: rc.io_read_bandwidth_max.clone(),
+        io_write_bandwidth_max: rc.io_write_bandwidth_max.clone(),
+        tasks_max: rc.tasks_max,
+        allowed_cpus: rc.allowed_cpus.clone(),
+        allowed_memory_nodes: rc.allowed_memory_nodes.clone(),
     }
 }
 

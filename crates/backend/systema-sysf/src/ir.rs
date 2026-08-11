@@ -172,6 +172,53 @@ pub struct TimerConfig {
     pub persistent: bool,
 }
 
+/// Resource-control (cgroup) limits for a unit.
+///
+/// Mirrors `systemd.resource-control(5)`. String values are kept in their
+/// original unit-file form (e.g. `"50%"`, `"1G"`, `"100ms"`) so downstream
+/// consumers (System R, D-Bus) can parse them with the precision they need.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceControl {
+    /// CPU quota: `"50%"` of one CPU or an absolute time slice like `"100ms"`.
+    pub cpu_quota: String,
+    /// Period over which `CPUQuota` applies, e.g. `"100ms"`.
+    pub cpu_quota_period: String,
+    /// Relative CPU weight (default 100).
+    pub cpu_weight: u32,
+    /// CPU weight used during boot.
+    pub startup_cpu_weight: u32,
+    /// CPUs the unit's processes may be pinned to (`CPUSetCPUs=`).
+    pub cpu_set_cpus: String,
+    /// Memory nodes the unit's processes may be pinned to (`CPUSetMemoryNodes=`).
+    pub cpu_set_memory_nodes: String,
+    /// Hard floor on memory usage.
+    pub memory_min: String,
+    /// Gentle floor on memory usage.
+    pub memory_low: String,
+    /// Soft memory limit.
+    pub memory_high: String,
+    /// Hard memory limit, e.g. `"1G"`.
+    pub memory_max: String,
+    /// Swap usage limit.
+    pub memory_swap_max: String,
+    /// IO weight (default 100).
+    pub io_weight: u32,
+    /// IO weight used during boot.
+    pub startup_io_weight: u32,
+    /// Per-device IO weights, e.g. `"/dev/sda 100"`.
+    pub io_device_weight: Vec<String>,
+    /// Per-device read bandwidth limits, e.g. `"/dev/sda 1G"`.
+    pub io_read_bandwidth_max: Vec<String>,
+    /// Per-device write bandwidth limits.
+    pub io_write_bandwidth_max: Vec<String>,
+    /// Maximum number of tasks/threads in the unit's cgroup.
+    pub tasks_max: u32,
+    /// CPUs this unit may run on (`AllowedCPUs=`).
+    pub allowed_cpus: String,
+    /// Memory nodes this unit may use (`AllowedMemoryNodes=`).
+    pub allowed_memory_nodes: String,
+}
+
 /// Socket-specific configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SocketConfig {
@@ -221,6 +268,10 @@ pub struct UnitIR {
     pub automount: Option<AutomountConfig>,
     pub timer: Option<TimerConfig>,
     pub socket: Option<SocketConfig>,
+
+    /// Resource-control (cgroup) limits parsed from the unit file.
+    #[serde(default)]
+    pub resource_control: Option<ResourceControl>,
 
     /// Conditions that must be met for the unit to start.
     pub conditions: Option<Vec<Condition>>,

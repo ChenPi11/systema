@@ -406,6 +406,8 @@ pub struct ServiceSection {
     pub start_limit_action: StartLimitAction,
     pub restart_steps: u32,
     pub restart_max_delay_sec: u32,
+    /// Resource-control directives from the `[Service]` section.
+    pub rc: ResourceControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -748,6 +750,57 @@ impl Default for SwapSection {
 }
 
 // ---------------------------------------------------------------------------
+// Resource control
+// ---------------------------------------------------------------------------
+
+/// Resource-control (cgroup) directives shared by unit types that own a
+/// cgroup: `[Service]`, `[Slice]`, `[Scope]`, and friends.
+///
+/// Mirror of `systemd.resource-control(5)`. String values keep their
+/// original unit-file form (e.g. `"50%"`, `"1G"`, `"100ms"`).
+#[derive(Debug, Clone, Default)]
+pub struct ResourceControl {
+    /// CPU quota relative to one CPU (`CPUQuota=`), e.g. `"50%"` or `"100ms"`.
+    pub cpu_quota: String,
+    /// Period over which `CPUQuota` applies (`CPUQuotaPeriodSec=`).
+    pub cpu_quota_period: String,
+    /// Relative CPU weight, default 100 (`CPUWeight=`).
+    pub cpu_weight: u32,
+    /// CPU weight used during boot (`StartupCPUWeight=`).
+    pub startup_cpu_weight: u32,
+    /// CPU set (`CPUSetCPUs=`).
+    pub cpu_set_cpus: String,
+    /// Memory nodes (`CPUSetMemoryNodes=`).
+    pub cpu_set_memory_nodes: String,
+    /// Hard floor on memory usage (`MemoryMin=`).
+    pub memory_min: String,
+    /// Gentle floor on memory usage (`MemoryLow=`).
+    pub memory_low: String,
+    /// Soft memory limit (`MemoryHigh=`).
+    pub memory_high: String,
+    /// Hard memory limit (`MemoryMax=`), e.g. `"1G"`.
+    pub memory_max: String,
+    /// Swap usage limit (`MemorySwapMax=`).
+    pub memory_swap_max: String,
+    /// IO weight, default 100 (`IOWeight=`).
+    pub io_weight: u32,
+    /// IO weight used during boot (`StartupIOWeight=`).
+    pub startup_io_weight: u32,
+    /// Per-device IO weights (`IODeviceWeight=DEV WEIGHT`).
+    pub io_device_weight: Vec<String>,
+    /// Per-device read bandwidth limits (`IOReadBandwidthMax=DEV BYTES`).
+    pub io_read_bandwidth_max: Vec<String>,
+    /// Per-device write bandwidth limits (`IOWriteBandwidthMax=DEV BYTES`).
+    pub io_write_bandwidth_max: Vec<String>,
+    /// Maximum number of tasks/threads (`TasksMax=`), default `u32::MAX`.
+    pub tasks_max: u32,
+    /// CPUs this unit may run on (`AllowedCPUs=`).
+    pub allowed_cpus: String,
+    /// Memory nodes this unit may use (`AllowedMemoryNodes=`).
+    pub allowed_memory_nodes: String,
+}
+
+// ---------------------------------------------------------------------------
 // [Slice] section
 // ---------------------------------------------------------------------------
 
@@ -758,31 +811,8 @@ impl Default for SwapSection {
 /// for resource control.
 #[derive(Debug, Clone, Default)]
 pub struct SliceSection {
-    /// CPU quota relative to the total CPU time (`CPUQuota=`).
-    /// e.g. "50%" means the slice can use at most 50% of one CPU.
-    pub cpu_quota: String,
-    /// CPU weight (relative weight, default 100) (`CPUWeight=`).
-    pub cpu_weight: u32,
-    /// Startup CPU weight (`StartupCPUWeight=`).
-    pub startup_cpu_weight: u32,
-    /// CPU set (`CPUSetCPUs=`, `CPUSetMemoryNodes=`).
-    pub cpu_set_cpus: String,
-    pub cpu_set_memory_nodes: String,
-    /// Memory limit (`MemoryMax=`, `MemoryHigh=`, `MemoryLow=`, `MemoryMin=`).
-    pub memory_max: String,
-    pub memory_high: String,
-    pub memory_low: String,
-    pub memory_min: String,
-    /// IO weight (`IOWeight=`).
-    pub io_weight: u32,
-    /// IO bandwidth limits (`IOBandwidthMax=`).
-    pub io_bandwidth_max: String,
-    /// Tasks max (`TasksMax=`).
-    pub tasks_max: u32,
-    /// Allowed CPUs (`AllowedCPUs=`).
-    pub allowed_cpus: String,
-    /// Allowed memory nodes (`AllowedMemoryNodes=`).
-    pub allowed_memory_nodes: String,
+    /// Resource-control directives from the `[Slice]` section.
+    pub rc: ResourceControl,
 }
 
 // ---------------------------------------------------------------------------
@@ -808,11 +838,8 @@ pub struct ScopeSection {
     pub kill_signal: String,
     /// Whether to send SIGHUP before SIGKILL (`SendSIGHUP=`).
     pub send_sighup: bool,
-    /// Resource limits (same as Slice).
-    pub cpu_quota: String,
-    pub cpu_weight: u32,
-    pub memory_max: String,
-    pub tasks_max: u32,
+    /// Resource-control directives (same directives as `[Slice]`).
+    pub rc: ResourceControl,
 }
 
 // ---------------------------------------------------------------------------

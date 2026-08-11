@@ -611,6 +611,24 @@ fn apply_ir_patch(ir: &UnitIR, uf: &mut UnitFile) {
     if let Some(sock) = &ir.socket {
         uf.socket = Some(socket_config_to_section(sock));
     }
+
+    // Resource-control directives apply to whichever cgroup-owned section the
+    // unit's kind owns (`[Service]`, `[Slice]`, or `[Scope]`).
+    if let Some(rc) = &ir.resource_control {
+        let section_rc = resource_control_to_section(rc);
+        match uf.kind {
+            UnitKind::Service => {
+                uf.service.get_or_insert_with(Default::default).rc = section_rc;
+            }
+            UnitKind::Slice => {
+                uf.slice.get_or_insert_with(Default::default).rc = section_rc;
+            }
+            UnitKind::Scope => {
+                uf.scope.get_or_insert_with(Default::default).rc = section_rc;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Convert a [`UnitIR`] into a brand-new internal [`UnitFile`] for units
@@ -685,6 +703,32 @@ fn service_config_to_section(
         standard_error: cfg.standard_error.clone(),
         tty_path: cfg.tty_path.clone(),
         ..Default::default()
+    }
+}
+
+fn resource_control_to_section(
+    rc: &systema_sysf::ir::ResourceControl,
+) -> crate::unit::types::ResourceControl {
+    crate::unit::types::ResourceControl {
+        cpu_quota: rc.cpu_quota.clone(),
+        cpu_quota_period: rc.cpu_quota_period.clone(),
+        cpu_weight: rc.cpu_weight,
+        startup_cpu_weight: rc.startup_cpu_weight,
+        cpu_set_cpus: rc.cpu_set_cpus.clone(),
+        cpu_set_memory_nodes: rc.cpu_set_memory_nodes.clone(),
+        memory_min: rc.memory_min.clone(),
+        memory_low: rc.memory_low.clone(),
+        memory_high: rc.memory_high.clone(),
+        memory_max: rc.memory_max.clone(),
+        memory_swap_max: rc.memory_swap_max.clone(),
+        io_weight: rc.io_weight,
+        startup_io_weight: rc.startup_io_weight,
+        io_device_weight: rc.io_device_weight.clone(),
+        io_read_bandwidth_max: rc.io_read_bandwidth_max.clone(),
+        io_write_bandwidth_max: rc.io_write_bandwidth_max.clone(),
+        tasks_max: rc.tasks_max,
+        allowed_cpus: rc.allowed_cpus.clone(),
+        allowed_memory_nodes: rc.allowed_memory_nodes.clone(),
     }
 }
 
@@ -902,6 +946,7 @@ mod tests {
             asserts: None,
             wanted_by: None,
             required_by: None,
+            resource_control: None,
         }
     }
 
