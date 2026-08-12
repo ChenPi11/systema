@@ -565,14 +565,18 @@ pub fn compute_next_elapse(
 ) -> Option<(u64, &'static str)> {
     let mut candidates: Vec<(u64, &'static str)> = Vec::new();
 
-    if let Some(v) = cfg.on_active_sec {
-        candidates.push((activated_epoch.saturating_add(v as u64), "OnActiveSec"));
-    }
-    if let Some(v) = cfg.on_boot_sec {
-        candidates.push((boot_epoch.saturating_add(v as u64), "OnBootSec"));
-    }
-    if let Some(v) = cfg.on_startup_sec {
-        candidates.push((started_epoch.saturating_add(v as u64), "OnStartupSec"));
+    // Monotonic one-shot triggers are consumed by the first fire: they only
+    // enter the schedule while the timer has never fired yet.
+    if last_elapse.is_none() {
+        if let Some(v) = cfg.on_active_sec {
+            candidates.push((activated_epoch.saturating_add(v as u64), "OnActiveSec"));
+        }
+        if let Some(v) = cfg.on_boot_sec {
+            candidates.push((boot_epoch.saturating_add(v as u64), "OnBootSec"));
+        }
+        if let Some(v) = cfg.on_startup_sec {
+            candidates.push((started_epoch.saturating_add(v as u64), "OnStartupSec"));
+        }
     }
     if let Some(v) = cfg.on_unit_active_sec {
         let base = last_elapse.map(|e| e.saturating_add(v as u64))
@@ -785,6 +789,34 @@ mod tests {
         assert_eq!(first.0, 1300);
         let second = compute_next_elapse(&cfg, Some(1300), 1350, 0, 0, 1000).unwrap();
         assert_eq!(second.0, 1600);
+    }
+
+    #[test]
+    fn one_shot_not_rescheduled_after_fire() {
+        // Regression: systemd-tmpfiles-clean.timer (OnBootSec=15min +
+        // OnUnitActiveSec=1d) used to refire on every engine tick because the
+        // already-consumed OnBootSec one-shot was recomputed into the past and
+        // clamped to "now".  After the first fire only the repeating trigger
+        // may schedule the next elapse.
+        let mut cfg = tcfg(Some(900), None, vec![]);
+        cfg.on_unit_active_sec = Some(86400);
+        // boot at 0, activated at 0, now = 900 (first fire of OnBootSec).
+        let (first, reason) = compute_next_elapse(&cfg, None, 900, 0, 0, 0).unwrap();
+        assert_eq!(first, 900);
+        assert_eq!(reason, "OnBootSec");
+        // Next computation happens right after that fire: must be +1d, not now.
+        let (second, reason) = compute_next_elapse(&cfg, Some(900), 901, 0, 0, 0).unwrap();
+        assert_eq!(second, 900 + 86400);
+        assert_eq!(reason, "OnUnitActiveSec");
+    }
+
+    #[test]
+    fn pure_one_shot_becomes_elapsed() {
+        let cfg = tcfg(Some(900), None, vec![]);
+        // First elapse is scheduled...
+        assert_eq!(compute_next_elapse(&cfg, None, 0, 0, 0, 0).unwrap().0, 900);
+        // ...but once fired there is nothing left to schedule.
+        assert!(compute_next_elapse(&cfg, Some(900), 901, 0, 0, 0).is_none());
     }
 
     #[test]
