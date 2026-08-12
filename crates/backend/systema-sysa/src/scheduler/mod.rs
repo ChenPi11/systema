@@ -26,8 +26,8 @@ use crate::unit::types::{
     ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitSection,
 };
 use sysa::proto::{
-    AutomountConfig, MountConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig, DeviceConfig,
-    UnitConfig,
+    AutomountConfig, MountConfig, PathConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig,
+    DeviceConfig, UnitConfig,
 };
 
 use crate::scheduler::job_type::{job_type_collapse, JobType, UnitActiveState};
@@ -1312,6 +1312,19 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         property: d.property.clone(),
     });
 
+    let path = uf.path.as_ref().map(|p| PathConfig {
+        path_exists: p.path_exists.clone(),
+        path_exists_glob: p.path_exists_glob.clone(),
+        path_changed: p.path_changed.clone(),
+        path_modified: p.path_modified.clone(),
+        directory_not_empty: p.directory_not_empty.clone(),
+        unit: p.unit.clone(),
+        make_directory: p.make_directory,
+        directory_mode: p.directory_mode.clone(),
+        trigger_limit_interval_sec: p.trigger_limit_interval_sec,
+        trigger_limit_burst: p.trigger_limit_burst,
+    });
+
     UnitConfig {
         unit_name: uf.name.clone(),
         description: uf.unit.description.clone(),
@@ -1321,6 +1334,7 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         automount,
         timer,
         device,
+        path,
     }
 }
 

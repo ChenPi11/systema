@@ -328,6 +328,44 @@ message TimerFired {
     uint64 elapse_epoch = 3;
 }
 
+// Configuration for a .path unit, sent inside UnitConfig.
+message PathConfig {
+    // Activate when the path exists (PathExists=).
+    repeated string path_exists = 1;
+    // Activate when a path matching the glob exists (PathExistsGlob=).
+    repeated string path_exists_glob = 2;
+    // Activate when the path is created or modified (PathChanged=).
+    repeated string path_changed = 3;
+    // Activate when the path is modified (PathModified=).
+    repeated string path_modified = 4;
+    // Activate when the directory is non-empty (DirectoryNotEmpty=).
+    repeated string directory_not_empty = 5;
+    // Unit to activate when the path triggers (Unit=).  Defaults to the
+    // sibling ".service" unit with the same base name.
+    string unit = 6;
+    // Create watched directories before watching (MakeDirectory=).
+    bool make_directory = 7;
+    // Permission mode for auto-created directories (DirectoryMode=), e.g. "0755".
+    string directory_mode = 8;
+    // Trigger rate-limit interval in seconds (TriggerLimitIntervalSec=);
+    // 0 disables rate limiting.  Default 2.
+    uint32 trigger_limit_interval_sec = 9;
+    // Trigger rate-limit burst count (TriggerLimitBurst=); 0 disables rate
+    // limiting.  Default 200.
+    uint32 trigger_limit_burst = 10;
+}
+
+// Sent by System P (the path worker) to System A when a monitored path
+// condition is satisfied, asking System A to activate the path unit's target.
+message PathFired {
+    // The path unit that fired, e.g. "foo.path".
+    string path_unit = 1;
+    // The unit to activate, e.g. "foo.service".
+    string target_unit = 2;
+    // When the trigger occurred (unix epoch seconds).
+    uint64 fired_epoch = 3;
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Resource control (System R)
 // ──────────────────────────────────────────────────────────────────
@@ -443,6 +481,8 @@ message UnitConfig {
     TimerConfig timer = 7;
     // For device units.
     DeviceConfig device = 8;
+    // For path units.
+    PathConfig path = 9;
 }
 
 message ServiceConfig {

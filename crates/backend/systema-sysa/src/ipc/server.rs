@@ -20,9 +20,9 @@ use sysa::event_bus::Event;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
     AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope,
-    EventSubscribe, EventUnsubscribe, MethodResult, RegisterAck, RegisterUnits, StagingAreaEntry,
-    StagingQuery, StagingQueryResult, TimerFired, UnitRegistrationAck, UnitStateUpdate,
-    UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    EventSubscribe, EventUnsubscribe, MethodResult, PathFired, RegisterAck, RegisterUnits,
+    StagingAreaEntry, StagingQuery, StagingQueryResult, TimerFired, UnitRegistrationAck,
+    UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
@@ -477,6 +477,66 @@ async fn handle_worker_session(
                             }
                             Err(e) => {
                                 warn!("Cannot start timer-triggered unit '{}': {}", target, e);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if env.method == "path.fired" {
+                        let fired = match PathFired::decode(env.payload.as_slice()) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(
+                                    "PathFired decode from worker '{}': {} — disconnecting",
+                                    worker_id_recv, e
+                                );
+                                break;
+                            }
+                        };
+                        let target = fired.target_unit.clone();
+                        info!(
+                            "Path '{}' fired (epoch={}) — triggering '{}'",
+                            fired.path_unit, fired.fired_epoch, target
+                        );
+
+                        // Ensure the target unit is loaded before enqueueing.
+                        if !alloc_for_recv.read().units.contains_key(&target) {
+                            let alloc2 = alloc_for_recv.clone();
+                            let name2 = target.clone();
+                            let loaded =
+                                tokio::task::spawn_blocking(move || load_unit_sync(&alloc2, &name2))
+                                    .await;
+                            match loaded {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        "Failed to load path-triggered unit '{}': {}",
+                                        target, e
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to load path-triggered unit '{}': {}",
+                                        target, e
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        match crate::scheduler::enqueue_start_with_mode(
+                            alloc_for_recv.clone(),
+                            &target,
+                            crate::state::JobMode::Replace,
+                        )
+                        .await
+                        {
+                            Ok(job_id) => {
+                                info!("Enqueued job {job_id} for path-triggered '{target}'");
+                            }
+                            Err(e) => {
+                                warn!("Cannot start path-triggered unit '{}': {}", target, e);
                             }
                         }
                         continue;
