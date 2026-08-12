@@ -18,8 +18,9 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    generate_invocation_id, next_job_id, next_task_id, AllocatorHandle, AllocatorState, Job,
-    JobCompletion, JobKind, JobMode, JobNewInfo, JobResultKind, JobStatus, StartLimitState,
+    generate_invocation_id, next_job_id, next_task_id, AllocatorHandle, AllocatorState,
+    DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo, JobResultKind, JobStatus,
+    StartLimitState,
 };
 use crate::unit::types::{
     ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitSection,
@@ -78,6 +79,93 @@ pub async fn enqueue_start_with_mode(
     mode: JobMode,
 ) -> Result<u64> {
     enqueue_job(allocator, unit_name, JobKind::Start, mode).await
+}
+
+/// Activate a transient unit (created via `StartTransientUnit`) without
+/// dispatching to a worker.
+///
+/// Transient units (scopes, transient slices) wrap already-existing
+/// processes and have no on-disk unit file, so activation is instantaneous:
+/// the unit is marked active and the job completes immediately as "done".
+/// This honours the systemd1 `StartTransientUnit` contract for callers such
+/// as logind even though no worker exists for `.scope`/`.slice` units.
+pub async fn activate_transient_unit(
+    allocator: AllocatorHandle,
+    unit_name: &str,
+    mode: JobMode,
+) -> Result<u64> {
+    info!("Activating transient unit {} (mode={:?})", unit_name, mode);
+
+    // Validate mode/type constraints like enqueue_job does.
+    {
+        let state = allocator.read();
+        let allow_isolate = state
+            .units
+            .get(unit_name)
+            .map(|u| u.unit.allow_isolate)
+            .unwrap_or(false);
+        check_mode_constraints(mode, JobKind::Start, unit_name, allow_isolate)?;
+    }
+
+    let job_id = next_job_id();
+    let invocation_id = generate_invocation_id();
+    {
+        let mut state = allocator.write();
+        if !state.units.contains_key(unit_name) {
+            bail!(
+                "{}",
+                l10n::fmt(
+                    l10n::t_("Transient unit {unit_name} is not loaded."),
+                    &[("unit_name", unit_name)],
+                )
+            );
+        }
+
+        // Mark the unit active immediately.  A transient unit wraps existing
+        // processes, so there is nothing to wait for.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        {
+            let entry = state.unit_states.entry(unit_name.to_string()).or_default();
+            entry.active_state = "active".to_string();
+            entry.sub_state = "running".to_string();
+            entry.invocation_id = invocation_id.clone();
+            entry.active_enter_timestamp = now;
+            entry.inactive_enter_timestamp = 0;
+        }
+        state
+            .invocation_ids
+            .insert(unit_name.to_string(), invocation_id);
+        state
+            .desired
+            .insert(unit_name.to_string(), DesiredState::Active);
+
+        // Create the job and complete it immediately as "done".
+        state.jobs.insert(
+            job_id,
+            Job {
+                id: job_id,
+                unit_name: unit_name.to_string(),
+                kind: JobKind::Start,
+                status: JobStatus::Running,
+                timeout_abort: None,
+            },
+        );
+        emit_job_new(&mut state, job_id, unit_name, JobKind::Start);
+        if let Some(job) = state.jobs.get_mut(&job_id) {
+            job.status = JobStatus::Done;
+        }
+        if let Some(ref tx) = state.job_completion_tx {
+            let _ = tx.send(JobCompletion {
+                job_id,
+                unit_name: unit_name.to_string(),
+                result: JobResultKind::Done,
+            });
+        }
+    }
+    Ok(job_id)
 }
 
 /// Enqueue a job by full systemd job type, collapsing state-dependent
@@ -2020,6 +2108,51 @@ mod tests {
         assert_eq!(job.status, JobStatus::Done);
         // No worker interaction: nothing was dispatched.
         assert!(state.task_kinds.is_empty());
+    }
+
+    // =========================================================================
+    // activate_transient_unit (StartTransientUnit support)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_activate_transient_unit_activates_without_worker() {
+        // A transient scope has no on-disk unit file and no registered
+        // worker; activation must mark it active and complete the job
+        // without touching any worker (systemd: scope activation is
+        // instantaneous since it wraps existing processes).
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut uf = UnitFile::new("session-1.scope");
+            uf.transient = true;
+            alloc.write().units.insert("session-1.scope".to_string(), uf);
+        }
+
+        let job_id = activate_transient_unit(alloc.clone(), "session-1.scope", JobMode::Replace)
+            .await
+            .expect("transient activation succeeds");
+
+        let state = alloc.read();
+        let job = state.jobs.get(&job_id).expect("job recorded");
+        assert_eq!(job.kind, JobKind::Start);
+        assert_eq!(job.status, JobStatus::Done);
+        let cached = state
+            .unit_states
+            .get("session-1.scope")
+            .expect("unit marked active");
+        assert_eq!(cached.active_state, "active");
+        assert_eq!(cached.sub_state, "running");
+        assert_eq!(state.desired.get("session-1.scope"), Some(&DesiredState::Active));
+        // No worker interaction: nothing was dispatched.
+        assert!(state.task_kinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_activate_transient_unit_rejects_unknown_unit() {
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        let err = activate_transient_unit(alloc.clone(), "missing.scope", JobMode::Replace)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not loaded"));
     }
 
     #[tokio::test]

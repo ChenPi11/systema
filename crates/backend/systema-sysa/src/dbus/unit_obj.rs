@@ -104,7 +104,9 @@ impl UnitObject {
             .units
             .get(&self.unit_name)
             .map(|u| {
-                if !u.install.wanted_by.is_empty() {
+                if u.transient {
+                    "transient"
+                } else if !u.install.wanted_by.is_empty() {
                     "enabled"
                 } else {
                     "static"
@@ -257,7 +259,12 @@ impl UnitObject {
 
     #[zbus(property)]
     fn transient(&self) -> bool {
-        false
+        self.allocator
+            .read()
+            .units
+            .get(&self.unit_name)
+            .map(|u| u.transient)
+            .unwrap_or(false)
     }
 
     #[zbus(property)]

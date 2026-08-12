@@ -562,6 +562,10 @@ pub struct UnitFile {
     /// The canonical unit name, e.g. "sshd.service".
     pub name: String,
     pub kind: UnitKind,
+    /// True for transient units created at runtime (e.g. via
+    /// `StartTransientUnit`, like logind's session scopes).  Transient units
+    /// have no on-disk unit file; their configuration is supplied inline.
+    pub transient: bool,
     pub unit: UnitSection,
     pub install: InstallSection,
     /// Present only for service units.
@@ -593,6 +597,7 @@ impl UnitFile {
         UnitFile {
             name,
             kind,
+            transient: false,
             unit: UnitSection::default(),
             install: InstallSection::default(),
             service: None,

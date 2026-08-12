@@ -14,6 +14,7 @@ use zvariant::OwnedObjectPath;
 use crate::scheduler;
 use crate::scheduler::job_type::JobType;
 use crate::state::{AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
+use crate::unit::types::{ScopeSection, UnitFile, UnitKind};
 
 // --------------------------------------------------------------------------
 // Helper: D-Bus path encoding
@@ -100,6 +101,88 @@ fn set_desired_state(alloc: &AllocatorHandle, name: &str, kind: JobKind) {
 }
 
 // --------------------------------------------------------------------------
+// Helper: transient unit construction (StartTransientUnit)
+// --------------------------------------------------------------------------
+
+/// Build a transient `UnitFile` from a `StartTransientUnit` properties
+/// argument (an `a(sv)` array).  Only the subset of properties that map onto
+/// System A's unit model is honoured; unknown properties are ignored.
+fn transient_unit_from_properties(name: &str, properties: &[(String, zvariant::OwnedValue)]) -> UnitFile {
+    let mut uf = UnitFile::new(name);
+    uf.transient = true;
+
+    if let Some(d) = get_prop_str(properties, "Description") {
+        uf.unit.description = d;
+    }
+    if let Some(b) = get_prop_bool(properties, "DefaultDependencies") {
+        uf.unit.default_dependencies = b;
+    }
+
+    // Dependency sets.
+    if let Some(v) = get_prop_strs(properties, "Requires") {
+        uf.unit.requires.extend(v);
+    }
+    if let Some(v) = get_prop_strs(properties, "Wants") {
+        uf.unit.wants.extend(v);
+    }
+    if let Some(v) = get_prop_strs(properties, "After") {
+        uf.unit.after.extend(v);
+    }
+    if let Some(v) = get_prop_strs(properties, "Before") {
+        uf.unit.before.extend(v);
+    }
+    if let Some(v) = get_prop_strs(properties, "Conflicts") {
+        uf.unit.conflicts.extend(v);
+    }
+    if let Some(v) = get_prop_strs(properties, "BindsTo") {
+        uf.unit.binds_to.extend(v);
+    }
+    if let Some(v) = get_prop_strs(properties, "PartOf") {
+        uf.unit.part_of.extend(v);
+    }
+
+    // `Slice=` — scopes/slices live under a slice; mirror the service
+    // loader's `Requires=` + `After=` edge on the parent slice.
+    if let Some(slice) = get_prop_str(properties, "Slice") {
+        if !slice.is_empty() && slice != "root.slice" {
+            uf.unit.requires.insert(slice.clone());
+            uf.unit.after.insert(slice);
+        }
+    }
+
+    // Scope-specific: the PIDs of the processes the scope wraps.
+    if uf.kind == UnitKind::Scope {
+        let mut scope = ScopeSection::default();
+        if let Some(pids) = get_prop_u32s(properties, "PIDs") {
+            scope.pids = pids.iter().map(u32::to_string).collect();
+        }
+        uf.scope = Some(scope);
+    }
+
+    uf
+}
+
+fn get_prop_str(properties: &[(String, zvariant::OwnedValue)], key: &str) -> Option<String> {
+    let value = &properties.iter().find(|(k, _)| k == key)?.1;
+    String::try_from(value.try_clone().ok()?).ok()
+}
+
+fn get_prop_bool(properties: &[(String, zvariant::OwnedValue)], key: &str) -> Option<bool> {
+    let value = &properties.iter().find(|(k, _)| k == key)?.1;
+    bool::try_from(value.try_clone().ok()?).ok()
+}
+
+fn get_prop_strs(properties: &[(String, zvariant::OwnedValue)], key: &str) -> Option<Vec<String>> {
+    let value = &properties.iter().find(|(k, _)| k == key)?.1;
+    Vec::<String>::try_from(value.try_clone().ok()?).ok()
+}
+
+fn get_prop_u32s(properties: &[(String, zvariant::OwnedValue)], key: &str) -> Option<Vec<u32>> {
+    let value = &properties.iter().find(|(k, _)| k == key)?.1;
+    Vec::<u32>::try_from(value.try_clone().ok()?).ok()
+}
+
+// --------------------------------------------------------------------------
 // Manager interface
 // --------------------------------------------------------------------------
 
@@ -165,6 +248,25 @@ impl ManagerInterface {
             }
         }
         Ok(job_object_path(job_id))
+    }
+
+    /// Create a transient unit (no on-disk unit file) from a
+    /// `StartTransientUnit` properties argument and insert it into the
+    /// allocator.  An existing unit with the same name is left untouched.
+    async fn insert_transient_unit(
+        &self,
+        name: &str,
+        properties: &[(String, zvariant::OwnedValue)],
+    ) -> zbus::fdo::Result<()> {
+        {
+            let mut state = self.allocator.write();
+            if !state.units.contains_key(name) {
+                let uf = transient_unit_from_properties(name, properties);
+                state.units.insert(name.to_string(), uf);
+            }
+        }
+        self.ensure_unit_object(name).await;
+        Ok(())
     }
 }
 
@@ -514,6 +616,71 @@ impl ManagerInterface {
                 unit_object_path(&name),
                 kind.as_str().to_string(),
             ));
+        }
+        Ok(jobs)
+    }
+
+    /// Create a transient unit (e.g. a scope or transient slice) and start
+    /// it.  Transient units have no on-disk unit file — their configuration
+    /// is supplied inline via `properties` (an `a(sv)` array).
+    ///
+    /// Transient units wrap already-existing processes, so activation is
+    /// instantaneous: System A creates the unit, marks it active and returns
+    /// a job that completes immediately as "done", without dispatching to a
+    /// worker (no worker is registered for `.scope`/`.slice`).
+    ///
+    /// `aux_units` are additional transient units created alongside the
+    /// primary one (they are created but not started).
+    async fn start_transient_unit(
+        &self,
+        name: &str,
+        mode: &str,
+        properties: Vec<(String, zvariant::OwnedValue)>,
+        aux_units: Vec<(String, Vec<(String, zvariant::OwnedValue)>)>,
+    ) -> zbus::fdo::Result<OwnedObjectPath> {
+        info!("D-Bus StartTransientUnit: {} (mode={})", name, mode);
+        let job_mode = parse_job_mode(mode)?;
+
+        // Create the transient unit (and any auxiliary units) in the allocator.
+        self.insert_transient_unit(name, &properties).await?;
+        for (aux_name, aux_props) in &aux_units {
+            self.insert_transient_unit(aux_name, aux_props).await?;
+        }
+
+        let job_id = scheduler::activate_transient_unit(self.allocator.clone(), name, job_mode)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        Ok(job_object_path(job_id))
+    }
+
+    /// Like [`Self::start_transient_unit`] but creates and starts several
+    /// transient units in one call, mirroring systemd's
+    /// `StartTransientUnitMany`.  Returns one job path per transient unit.
+    async fn start_transient_unit_many(
+        &self,
+        units: Vec<(String, Vec<(String, zvariant::OwnedValue)>)>,
+        mode: &str,
+        aux_units: Vec<(String, Vec<(String, zvariant::OwnedValue)>)>,
+    ) -> zbus::fdo::Result<Vec<OwnedObjectPath>> {
+        info!(
+            "D-Bus StartTransientUnitMany: {} unit(s), mode={}",
+            units.len(),
+            mode
+        );
+        let job_mode = parse_job_mode(mode)?;
+
+        let mut jobs = Vec::with_capacity(units.len());
+        for (name, properties) in units {
+            self.insert_transient_unit(&name, &properties).await?;
+            for (aux_name, aux_props) in &aux_units {
+                self.insert_transient_unit(aux_name, aux_props).await?;
+            }
+            let job_id =
+                scheduler::activate_transient_unit(self.allocator.clone(), &name, job_mode)
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            jobs.push(job_object_path(job_id));
         }
         Ok(jobs)
     }
@@ -1372,5 +1539,78 @@ mod tests {
     fn parse_job_mode_rejects_unknown() {
         assert!(parse_job_mode("bogus").is_err());
         assert!(parse_job_mode("").is_err());
+    }
+
+    // =========================================================================
+    // transient_unit_from_properties (StartTransientUnit support)
+    // =========================================================================
+
+    fn sv(s: &str) -> zvariant::OwnedValue {
+        zvariant::OwnedValue::try_from(zvariant::Value::new(s)).unwrap()
+    }
+
+    fn bv(b: bool) -> zvariant::OwnedValue {
+        zvariant::OwnedValue::try_from(zvariant::Value::new(b)).unwrap()
+    }
+
+    fn strs(v: Vec<&str>) -> zvariant::OwnedValue {
+        zvariant::OwnedValue::try_from(zvariant::Value::new(v)).unwrap()
+    }
+
+    fn u32s(v: Vec<u32>) -> zvariant::OwnedValue {
+        zvariant::OwnedValue::try_from(zvariant::Value::new(v)).unwrap()
+    }
+
+    fn props() -> Vec<(String, zvariant::OwnedValue)> {
+        vec![
+            ("Description".to_string(), sv("Session 1 of root")),
+            ("Slice".to_string(), sv("system.slice")),
+            ("DefaultDependencies".to_string(), bv(true)),
+            ("After".to_string(), strs(vec!["systemd-user-sessions.service"])),
+            ("Requires".to_string(), strs(vec!["systemd-user-sessions.service"])),
+            ("PIDs".to_string(), u32s(vec![1234])),
+        ]
+    }
+
+    #[test]
+    fn transient_scope_built_from_properties() {
+        let uf = transient_unit_from_properties("session-1.scope", &props());
+        assert!(uf.transient);
+        assert_eq!(uf.kind, UnitKind::Scope);
+        assert_eq!(uf.unit.description, "Session 1 of root");
+        assert!(uf.unit.default_dependencies);
+        assert_eq!(uf.unit.after.len(), 2); // Slice + After property
+        assert!(uf.unit.after.contains("system.slice"));
+        assert!(uf.unit.after.contains("systemd-user-sessions.service"));
+        assert!(uf.unit.requires.contains("system.slice"));
+        assert!(uf.unit.requires.contains("systemd-user-sessions.service"));
+        let scope = uf.scope.expect("scope section present");
+        assert_eq!(scope.pids, vec!["1234"]);
+    }
+
+    #[test]
+    fn transient_unit_defaults_without_properties() {
+        let uf = transient_unit_from_properties("x.slice", &[]);
+        assert!(uf.transient);
+        assert_eq!(uf.kind, UnitKind::Slice);
+        assert!(uf.unit.description.is_empty());
+        assert!(uf.unit.after.is_empty());
+        assert!(uf.unit.requires.is_empty());
+    }
+
+    #[test]
+    fn transient_property_getters_ignore_wrong_types() {
+        let p = vec![
+            ("Name".to_string(), sv("value")),
+            ("Flag".to_string(), bv(true)),
+            ("List".to_string(), strs(vec!["a", "b"])),
+            ("Pids".to_string(), u32s(vec![1, 2])),
+        ];
+        assert_eq!(get_prop_str(&p, "Name"), Some("value".to_string()));
+        assert_eq!(get_prop_str(&p, "Missing"), None);
+        assert_eq!(get_prop_str(&p, "Flag"), None); // bool is not a string
+        assert_eq!(get_prop_bool(&p, "Flag"), Some(true));
+        assert_eq!(get_prop_strs(&p, "List"), Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(get_prop_u32s(&p, "Pids"), Some(vec![1, 2]));
     }
 }
