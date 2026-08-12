@@ -11,13 +11,12 @@
 //! The cgroup backend is (re)built on every connection attempt so a cgroup
 //! filesystem that appears later is picked up on reconnect.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use prost::Message as ProstMessage;
 use sysa::proto::{Envelope, UnitResourceEvent};
 use sysa::worker_ipc::WorkerIpc;
-use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::worker::{ResourceWorker, new_registry};
@@ -53,7 +52,7 @@ pub async fn run() -> Result<()> {
                     // Push cgroup runtime metrics to System A every second.
                     worker.start_metrics_sampler(std::time::Duration::from_secs(1));
                 }
-                *current.blocking_lock() = Some(worker.clone());
+                *current.lock().unwrap() = Some(worker.clone());
                 worker
             },
             move |env, _event_pub| {
@@ -80,7 +79,7 @@ fn handle_resource_envelope(
             return;
         }
     };
-    let worker = current.blocking_lock();
+    let worker = current.lock().unwrap();
     match worker.as_ref() {
         Some(worker) => worker.handle_resource_event(&event),
         None => warn!("event.publish for {} before worker initialised", event.unit_name),

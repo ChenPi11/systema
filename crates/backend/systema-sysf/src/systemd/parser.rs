@@ -795,6 +795,27 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection, name: &str) -> Resul
     unit.allow_isolate = get_bool(config, "unit", "allowisolate", false);
     unit.slice = expand(&get_str(config, "unit", "slice"));
 
+    // --- Start rate limiting (systemd v229+: [Unit] section; legacy [Service]) ---
+    unit.start_limit_interval_sec = get_u32(
+        config,
+        "unit",
+        "startlimitintervalsec",
+        get_u32(config, "service", "startlimitintervalsec", 10),
+    );
+    unit.start_limit_burst = get_u32(
+        config,
+        "unit",
+        "startlimitburst",
+        get_u32(config, "service", "startlimitburst", 5),
+    );
+    let sla = get_str(config, "unit", "startlimitaction");
+    let sla = if sla.is_empty() {
+        get_str(config, "service", "startlimitaction")
+    } else {
+        sla
+    };
+    unit.start_limit_action = StartLimitAction::from(sla.as_str());
+
     let doc = get_str(config, "unit", "documentation");
     if !doc.is_empty() {
         unit.documentation.extend(split_vec(&expand(&doc)));
@@ -1071,13 +1092,6 @@ fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> 
     }
 
     svc.watchdog_sec = get_u32(config, "service", "watchdogusec", 0);
-
-    // --- Start limit fields ---
-    svc.start_limit_interval_sec = get_u32(config, "service", "startlimitintervalsec", 10);
-    svc.start_limit_burst = get_u32(config, "service", "startlimitburst", 5);
-
-    let sla = get_str(config, "service", "startlimitaction");
-    svc.start_limit_action = StartLimitAction::from(sla.as_str());
 
     svc.restart_steps = get_u32(config, "service", "restartsteps", 0);
     svc.restart_max_delay_sec = get_u32(config, "service", "restartmaxdelaysec", 0);

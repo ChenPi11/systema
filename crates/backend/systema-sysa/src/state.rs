@@ -197,7 +197,14 @@ impl StartLimitState {
 
     /// Prune timestamps older than `interval` and check if the burst limit
     /// has been exceeded.
+    ///
+    /// Mirrors systemd's `ratelimit_configured()`: a zero interval or zero
+    /// burst disables rate limiting entirely (`StartLimitIntervalSec=0` or
+    /// `StartLimitBurst=0` in systemd mean "no limiting").
     pub fn check_rate_limit(&mut self, interval: std::time::Duration, burst: u32) -> bool {
+        if interval.is_zero() || burst == 0 {
+            return true;
+        }
         let now = Instant::now();
         self.timestamps
             .retain(|t| now.duration_since(*t) < interval);
@@ -657,6 +664,9 @@ fn unit_file_from_ir(ir: &UnitIR) -> Result<(String, UnitFile), String> {
     })?;
     let mut uf = UnitFile::new(&ir.id);
     uf.kind = unit_kind_from_type(unit_type);
+    // systemd defaults for units that don't specify StartLimit* explicitly.
+    uf.unit.start_limit_interval_sec = 10;
+    uf.unit.start_limit_burst = 5;
     apply_ir_patch(ir, &mut uf);
     Ok((uf.name.clone(), uf))
 }

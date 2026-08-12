@@ -775,12 +775,14 @@ impl ManagerInterface {
     /// Reset the failed state of a unit.
     async fn reset_failed_unit(&self, name: &str) -> zbus::fdo::Result<()> {
         debug!("D-Bus ResetFailedUnit: name={}", name);
+        self.allocator.write().start_limit_state.remove(name);
         Ok(())
     }
 
     /// Reset all failed units.
     async fn reset_failed(&self) -> zbus::fdo::Result<()> {
         debug!("D-Bus ResetFailed");
+        self.allocator.write().start_limit_state.clear();
         Ok(())
     }
 

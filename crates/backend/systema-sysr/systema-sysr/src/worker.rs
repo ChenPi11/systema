@@ -13,7 +13,7 @@
 //! stays platform-neutral.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -23,7 +23,6 @@ use systema_sysr_common::{
 use sysa::controller::{UnitController, UnitStatus};
 use sysa::proto::{CgroupMetricsUpdate, CgroupProcess, UnitCgroupMetrics, UnitResourceEvent};
 use sysa::worker_ipc::EventPublisher;
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// The default parent slice for services that do not set `[Unit] Slice=`.
@@ -132,7 +131,7 @@ impl ResourceWorker {
                     } else {
                         event.slice.clone()
                     };
-                    self.registry.blocking_lock().insert(
+                    self.registry.lock().unwrap().insert(
                         event.unit_name.clone(),
                         ManagedUnit {
                             config,
@@ -148,7 +147,7 @@ impl ResourceWorker {
                 }
             }
         } else {
-            self.registry.blocking_lock().remove(&event.unit_name);
+            self.registry.lock().unwrap().remove(&event.unit_name);
             debug!("Released resource control for {}", event.unit_name);
         }
     }
@@ -157,13 +156,13 @@ impl ResourceWorker {
     /// place so sibling service cgroups that may still reference the slice
     /// are never torn down.
     fn release_unit(&self, unit_name: &str) {
-        self.registry.blocking_lock().remove(unit_name);
+        self.registry.lock().unwrap().remove(unit_name);
     }
 
     /// Whether the unit is currently managed (authoritative for status under
     /// the no-op controller, where cgroups do not exist).
     fn is_managed(&self, unit_name: &str) -> bool {
-        self.registry.blocking_lock().contains_key(unit_name)
+        self.registry.lock().unwrap().contains_key(unit_name)
     }
 
     /// Build a `UnitStatus` for a unit.
@@ -174,7 +173,7 @@ impl ResourceWorker {
             ("inactive", "dead")
         };
         let mut extensions = HashMap::new();
-        let entry = self.registry.blocking_lock().get(unit_name).cloned();
+        let entry = self.registry.lock().unwrap().get(unit_name).cloned();
         let main_pid = entry.as_ref().map(|e| e.main_pid).unwrap_or(0);
         if let Some(entry) = entry {
             extensions.insert("cgroup_path".to_string(), entry.cgroup_path.clone());
@@ -226,7 +225,7 @@ impl ResourceWorker {
     /// Sample cgroup metrics for every managed unit.  Units whose cgroup
     /// yields no readable metrics are skipped.
     fn sample_metrics(&self) -> Vec<UnitCgroupMetrics> {
-        let guard = self.registry.blocking_lock();
+        let guard = self.registry.lock().unwrap();
         guard
             .iter()
             .filter_map(|(name, entry)| {
@@ -281,7 +280,7 @@ impl UnitController for ResourceWorker {
 
     async fn sync_state(&self) -> Vec<UnitStatus> {
         let names: Vec<String> = {
-            let guard = self.registry.lock().await;
+            let guard = self.registry.lock().unwrap();
             guard.keys().cloned().collect()
         };
         names
@@ -388,7 +387,7 @@ mod tests {
     fn active_event_manages_unit() {
         let w = worker();
         w.handle_resource_event(&resource_event("app.slice", "", true));
-        let entry = w.registry.blocking_lock().get("app.slice").cloned();
+        let entry = w.registry.lock().unwrap().get("app.slice").cloned();
         assert_eq!(entry.unwrap().config.cpu_quota, "50%");
         assert!(w.is_managed("app.slice"));
     }
@@ -405,7 +404,7 @@ mod tests {
     fn service_entry_uses_event_slice_parent() {
         let w = worker();
         w.handle_resource_event(&resource_event("svc.service", "work.slice", true));
-        let entry = w.registry.blocking_lock().get("svc.service").cloned().unwrap();
+        let entry = w.registry.lock().unwrap().get("svc.service").cloned().unwrap();
         assert_eq!(entry.parent_slice, "work.slice");
         assert_eq!(entry.cgroup_path, "/sys/fs/cgroup/work.slice/svc.service");
     }
@@ -414,7 +413,7 @@ mod tests {
     fn default_slice_parent_when_event_slice_empty() {
         let w = worker();
         w.handle_resource_event(&resource_event("svc.service", "", true));
-        let entry = w.registry.blocking_lock().get("svc.service").cloned().unwrap();
+        let entry = w.registry.lock().unwrap().get("svc.service").cloned().unwrap();
         assert_eq!(entry.parent_slice, "system.slice");
     }
 
@@ -424,7 +423,7 @@ mod tests {
         let mut ev = resource_event("ghost.slice", "", true);
         ev.resource = Some(ProtoResourceConfig::default());
         w.handle_resource_event(&ev);
-        let entry = w.registry.blocking_lock().get("ghost.slice").cloned();
+        let entry = w.registry.lock().unwrap().get("ghost.slice").cloned();
         assert!(entry.unwrap().config.is_empty());
     }
 

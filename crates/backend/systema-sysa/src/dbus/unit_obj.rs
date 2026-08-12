@@ -557,6 +557,10 @@ impl UnitObject {
     }
 
     fn reset_failed(&self) -> zbus::fdo::Result<()> {
+        self.allocator
+            .write()
+            .start_limit_state
+            .remove(&self.unit_name);
         Ok(())
     }
 }

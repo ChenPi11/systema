@@ -342,6 +342,46 @@ pub async fn enqueue_job(
         }
     }
 
+    // --- Start rate limiting (systemd unit_start → unit_test_start_limit) ---
+    // Every start attempt counts: manual starts, auto-restarts and
+    // dependency-triggered starts all funnel through enqueue_job(Start).
+    if matches!(kind, JobKind::Start | JobKind::Restart) {
+        let (interval_sec, burst, action) = {
+            let state = allocator.read();
+            state
+                .units
+                .get(unit_name)
+                .map(|u| {
+                    (
+                        u.unit.start_limit_interval_sec,
+                        u.unit.start_limit_burst,
+                        u.unit.start_limit_action.clone(),
+                    )
+                })
+                .unwrap_or((10, 5, StartLimitAction::None))
+        };
+        let rate_ok = {
+            let mut state = allocator.write();
+            let limit_state = state
+                .start_limit_state
+                .entry(unit_name.to_string())
+                .or_insert_with(StartLimitState::new);
+            limit_state.check_rate_limit(Duration::from_secs(interval_sec as u64), burst)
+        };
+        if !rate_ok {
+            warn!(
+                "Start rate limit exceeded for {} (interval={}s burst={}), refusing to start",
+                unit_name, interval_sec, burst
+            );
+            execute_start_limit_action(&action, unit_name);
+            bail!("{}", l10n::fmt(l10n::t_("Start rate limit exceeded for {unit_name} (interval={interval_sec}s burst={burst})."), &[
+                ("unit_name", unit_name),
+                ("interval_sec", &interval_sec.to_string()),
+                ("burst", &burst.to_string()),
+            ]));
+        }
+    }
+
     // --- Job conflict detection ---
     {
         let read_state = allocator.read();
@@ -1356,70 +1396,22 @@ pub fn should_restart_service(policy: &RestartPolicy, exit_kind: &ExitKind) -> b
     }
 }
 
-/// Check the start rate limit for `unit_name` and, if it passes, spawn an
-/// async task that waits `RestartSec` and then enqueues a `Start` job.
+/// Schedule an automatic restart of `unit_name` after its `RestartSec`.
 ///
-/// Rate-limit parameters are read from the unit's `[Service]` section
-/// (`StartLimitIntervalSec` / `StartLimitBurst`), falling back to 10 s / 5.
-///
-/// Returns `true` if the restart was scheduled, `false` if rate-limited.
-pub fn schedule_automatic_restart(allocator: AllocatorHandle, unit_name: &str) -> bool {
-    let (interval_sec, burst, restart_sec) = {
+/// The start rate limit (`StartLimitIntervalSec=` / `StartLimitBurst=`) is
+/// enforced centrally in [`enqueue_job`], so every start attempt — manual,
+/// auto-restart, or dependency-triggered — counts against it.  This function
+/// only sleeps the configured `RestartSec` and then enqueues a `Start` job.
+pub fn schedule_automatic_restart(allocator: AllocatorHandle, unit_name: &str) {
+    let restart_sec = {
         let state = allocator.read();
-        let svc = state.units.get(unit_name).and_then(|u| u.service.as_ref());
-        (
-            svc.map(|s| s.start_limit_interval_sec).unwrap_or(10),
-            svc.map(|s| s.start_limit_burst).unwrap_or(5),
-            svc.map(|s| s.restart_sec as u64).unwrap_or(0),
-        )
+        state
+            .units
+            .get(unit_name)
+            .and_then(|u| u.service.as_ref())
+            .map(|s| s.restart_sec as u64)
+            .unwrap_or(0)
     };
-
-    let rate_ok = {
-        let mut state = allocator.write();
-        let limit_state = state
-            .start_limit_state
-            .entry(unit_name.to_string())
-            .or_insert_with(StartLimitState::new);
-        limit_state.check_rate_limit(Duration::from_secs(interval_sec as u64), burst)
-    };
-
-    if !rate_ok {
-        warn!(
-            "Restart rate limit exceeded for {} (interval={}s burst={}), not auto-restarting",
-            unit_name, interval_sec, burst
-        );
-        // Consult StartLimitAction.
-        let action = {
-            let state = allocator.read();
-            state
-                .units
-                .get(unit_name)
-                .and_then(|u| u.service.as_ref())
-                .map(|svc| svc.start_limit_action.clone())
-                .unwrap_or(StartLimitAction::None)
-        };
-        match action {
-            StartLimitAction::None => {}
-            StartLimitAction::Reboot
-            | StartLimitAction::RebootForce
-            | StartLimitAction::RebootImmediate => {
-                warn!("StartLimitAction={:?}: rebooting system", action);
-                let _ = std::process::Command::new("shutdown")
-                    .args(["-r", "now", "StartLimitAction triggered by systema"])
-                    .spawn();
-            }
-            StartLimitAction::Poweroff => {
-                warn!("StartLimitAction=poweroff: powering off system");
-                let _ = std::process::Command::new("shutdown")
-                    .args(["-P", "now", "StartLimitAction triggered by systema"])
-                    .spawn();
-            }
-            StartLimitAction::Exit => {
-                warn!("StartLimitAction=exit: exiting (no-op, logging only)");
-            }
-        }
-        return false;
-    }
 
     let alloc = allocator.clone();
     let name = unit_name.to_string();
@@ -1432,8 +1424,31 @@ pub fn schedule_automatic_restart(allocator: AllocatorHandle, unit_name: &str) -
             warn!("Failed to auto-restart {}: {}", name, e);
         }
     });
+}
 
-    true
+/// Execute the `StartLimitAction=` configured for a unit whose start rate
+/// limit was exceeded (mirrors systemd's `unit_start_limit_action()`).
+fn execute_start_limit_action(action: &StartLimitAction, unit_name: &str) {
+    match action {
+        StartLimitAction::None => {}
+        StartLimitAction::Reboot
+        | StartLimitAction::RebootForce
+        | StartLimitAction::RebootImmediate => {
+            warn!("StartLimitAction={:?} for {}: rebooting system", action, unit_name);
+            let _ = std::process::Command::new("shutdown")
+                .args(["-r", "now", "StartLimitAction triggered by systema"])
+                .spawn();
+        }
+        StartLimitAction::Poweroff => {
+            warn!("StartLimitAction=poweroff for {}: powering off system", unit_name);
+            let _ = std::process::Command::new("shutdown")
+                .args(["-P", "now", "StartLimitAction triggered by systema"])
+                .spawn();
+        }
+        StartLimitAction::Exit => {
+            warn!("StartLimitAction=exit for {} (no-op, logging only)", unit_name);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1747,6 +1762,27 @@ mod tests {
         // With short interval, they should be pruned
         assert!(state.check_rate_limit(Duration::from_secs(1), 5));
         assert_eq!(state.timestamps.len(), 1); // only the new one remains
+    }
+
+    #[test]
+    fn test_start_limit_zero_interval_disables_rate_limiting() {
+        // systemd: StartLimitIntervalSec=0 disables rate limiting.
+        let mut state = StartLimitState::new();
+        for _ in 0..100 {
+            assert!(state.check_rate_limit(Duration::from_secs(0), 5));
+        }
+        // Disabled limiting must not record timestamps.
+        assert!(state.timestamps.is_empty());
+    }
+
+    #[test]
+    fn test_start_limit_zero_burst_disables_rate_limiting() {
+        // systemd: StartLimitBurst=0 disables rate limiting.
+        let mut state = StartLimitState::new();
+        for _ in 0..100 {
+            assert!(state.check_rate_limit(Duration::from_secs(10), 0));
+        }
+        assert!(state.timestamps.is_empty());
     }
 
     // =========================================================================

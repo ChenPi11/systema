@@ -256,6 +256,16 @@ pub struct UnitSection {
     pub slice: String,
 
     // ------------------------------------------------------------------
+    // Start rate limiting (systemd v229+: these live in the [Unit] section)
+    // ------------------------------------------------------------------
+    /// `StartLimitIntervalSec=` — interval in seconds (0 disables limiting).
+    pub start_limit_interval_sec: u32,
+    /// `StartLimitBurst=` — max start attempts within the interval (0 disables).
+    pub start_limit_burst: u32,
+    /// `StartLimitAction=` — action taken when the start rate limit is exceeded.
+    pub start_limit_action: StartLimitAction,
+
+    // ------------------------------------------------------------------
     // Condition checks — parsed; evaluated by the scheduler before start.
     // ------------------------------------------------------------------
     /// `ConditionPathExists=` — skip start if path does not exist.
@@ -332,6 +342,9 @@ impl Default for UnitSection {
             default_dependencies: true,
             allow_isolate: false,
             slice: String::new(),
+            start_limit_interval_sec: 10,
+            start_limit_burst: 5,
+            start_limit_action: StartLimitAction::None,
             condition_path_exists: Vec::new(),
             condition_path_exists_glob: Vec::new(),
             condition_file_not_empty: Vec::new(),
@@ -405,9 +418,6 @@ pub struct ServiceSection {
     pub standard_output: String,
     pub standard_error: String,
     pub tty_path: String,
-    pub start_limit_interval_sec: u32,
-    pub start_limit_burst: u32,
-    pub start_limit_action: StartLimitAction,
     pub restart_steps: u32,
     pub restart_max_delay_sec: u32,
     /// Resource-control directives from the `[Service]` section.
