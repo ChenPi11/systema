@@ -30,7 +30,11 @@ pub fn is_known_extension(name: &str) -> bool {
 /// masks to a non-file (`/dev/null` masking is skipped by `is_file()` before
 /// this is called), or when the resolved target is not a unit file.  A symlink
 /// whose basename already equals the target's basename (e.g. a `.wants/`
-/// enablement link pointing at the same-named unit) is not an alias.
+/// enablement link pointing at the same-named unit) is not an alias, and
+/// neither is an enablement link that *instantiates* a template
+/// (`foo@bar.service` -> `foo@.service`): such a link is an instance of the
+/// template, not another name for it, and must be loaded under its own
+/// instance name so `%i`/`%I` are expanded (see [`parse_unit_from_path`]).
 fn symlink_alias(path: &Path) -> Option<(String, String)> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.file_type().is_symlink() {
@@ -40,6 +44,11 @@ fn symlink_alias(path: &Path) -> Option<(String, String)> {
     let canonical_name = target.file_name().and_then(|n| n.to_str())?.to_string();
     let alias_name = path.file_name().and_then(|n| n.to_str())?.to_string();
     if canonical_name == alias_name || !is_known_extension(&canonical_name) {
+        return None;
+    }
+    if sysa::unit_name::is_template(&canonical_name)
+        && sysa::unit_name::template_of(&alias_name).as_deref() == Some(canonical_name.as_str())
+    {
         return None;
     }
     Some((canonical_name, alias_name))
@@ -83,6 +92,12 @@ pub fn discover_one(name: &str) -> Result<Option<UnitFile>> {
 /// [`discover_one`] over an explicit search-path list (testable without
 /// touching the global path configuration).
 fn discover_one_in(dirs: &[String], name: &str) -> Result<Option<UnitFile>> {
+    // A bare template (e.g. `getty@.service`) is a definition, not a unit
+    // that can be looked up or started; refusing it here keeps a reference
+    // to `foo@.service` from ever materialising as a unit.
+    if sysa::unit_name::is_template(name) {
+        return Ok(None);
+    }
     if let Some(unit) = find_exact_in(dirs, name)? {
         return Ok(Some(unit));
     }
@@ -221,6 +236,15 @@ fn load_units_from_dir(
             None => continue,
         };
         if !is_known_extension(&name) {
+            continue;
+        }
+        // A template unit (e.g. `getty@.service`) is a definition, not a
+        // runnable unit: only its instances (`getty@tty1.service`) are real
+        // units.  Treating the bare template as a unit would let it be
+        // started with unexpanded `%i`/`%I` specifiers (e.g. a getty with
+        // `TTYPath=/dev/`).  It is never emitted to the committed set.
+        if sysa::unit_name::is_template(&name) {
+            debug!("Skipping template unit {}", name);
             continue;
         }
         // A unit-file symlink aliases its resolved target: the canonical unit
@@ -491,5 +515,81 @@ mod tests {
 
         let names: Vec<String> = units.iter().map(|u| u.name.clone()).collect();
         assert_eq!(names, vec!["iodined.service".to_string()]);
+    }
+
+    #[test]
+    fn bare_template_unit_is_skipped_in_discovery() {
+        let dir = temp_dir("tplskip");
+        fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %I\nTTYPath=/dev/%I\n",
+        )
+        .unwrap();
+
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&dir, &mut units, &mut implicit, None).unwrap();
+
+        assert!(units.iter().all(|u| u.name != "getty@.service"));
+    }
+
+    #[test]
+    fn discover_one_bare_template_returns_none() {
+        let dir = temp_dir("tplone");
+        fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %I\n",
+        )
+        .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        assert!(discover_one_in(&dirs, "getty@.service").unwrap().is_none());
+        // Instances are still resolved through the template.
+        let unit = discover_one_in(&dirs, "getty@tty3.service").unwrap().unwrap();
+        assert_eq!(unit.name, "getty@tty3.service");
+    }
+
+    #[test]
+    fn instance_enablement_symlink_becomes_instance_unit() {
+        let dir = temp_dir("tplwant");
+        let unit_dir = dir.join("system");
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(
+            unit_dir.join("getty@.service"),
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %I\nTTYPath=/dev/%I\n",
+        )
+        .unwrap();
+        fs::write(
+            unit_dir.join("getty.target"),
+            "[Unit]\nDescription=Getty\n",
+        )
+        .unwrap();
+        // The enablement link instantiates the template: the symlink basename
+        // is `getty@tty1.service`, NOT an alias of `getty@.service`.
+        fs::create_dir_all(unit_dir.join("getty.target.wants")).unwrap();
+        std::os::unix::fs::symlink(
+            unit_dir.join("getty@.service"),
+            unit_dir.join("getty.target.wants").join("getty@tty1.service"),
+        )
+        .unwrap();
+
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&unit_dir, &mut units, &mut implicit, None).unwrap();
+        apply_implicit_deps(&mut units, &implicit);
+
+        // The bare template is never a unit.
+        assert!(units.iter().all(|u| u.name != "getty@.service"));
+        // The enablement symlink is an instance unit, with %I expanded.
+        let getty = units
+            .iter()
+            .find(|u| u.name == "getty@tty1.service")
+            .unwrap();
+        assert_eq!(getty.unit.description, "Getty on tty1");
+        assert_eq!(getty.service.as_ref().unwrap().tty_path, "/dev/tty1");
+        // The wants edge references the instance, not the template.
+        let target = units.iter().find(|u| u.name == "getty.target").unwrap();
+        assert!(target.unit.wants.contains("getty@tty1.service"));
+        assert!(!target.unit.wants.contains("getty@.service"));
     }
 }

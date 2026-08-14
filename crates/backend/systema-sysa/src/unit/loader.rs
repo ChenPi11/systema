@@ -163,6 +163,10 @@ where
             continue;
         }
 
+        if sysa::unit_name::is_template(&name) {
+            continue;
+        }
+
         {
             let state = allocator.read();
             if state.units.contains_key(&name) {
@@ -203,8 +207,10 @@ async fn load_units_from_dir(dir: &Path, allocator: AllocatorHandle) -> Result<u
             None => continue,
         };
 
-        // Only process known unit extensions.
-        if !is_known_extension(&name) {
+        // Only process known unit extensions; bare templates (e.g.
+        // `getty@.service`) are definitions, not runnable units, and are
+        // never loaded into the unit set.
+        if !is_known_extension(&name) || sysa::unit_name::is_template(&name) {
             continue;
         }
 
@@ -261,6 +267,17 @@ pub fn load_unit_flexible(name: &str) -> Result<UnitFile> {
 /// [`load_unit_flexible`] over an explicit search-path list (testable
 /// without touching the global path configuration).
 fn load_unit_flexible_in(dirs: &[String], name: &str) -> Result<UnitFile> {
+    // A bare template (e.g. `getty@.service`) is a definition, not a runnable
+    // unit: loading it would let `systemctl start getty@.service` dispatch a
+    // unit whose `%i`/`%I` specifiers expand to nothing (e.g. a getty with
+    // `TTYPath=/dev/`).  Refuse the load so a template is never materialised
+    // as a unit.  Instances such as `getty@tty1.service` are unaffected.
+    if sysa::unit_name::is_template(name) {
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("Unit {name} is a template and cannot be loaded directly"),
+            &[("name", name)],
+        ));
+    }
     for dir in dirs {
         let path = std::path::Path::new(dir).join(name);
         if path.is_file() {
@@ -313,6 +330,17 @@ fn load_unit_file(path: &Path) -> Result<UnitFile> {
         .unwrap_or("")
         .to_string();
     if canonical == alias {
+        return super::parser::parse_unit_from_path(path);
+    }
+    // An enablement symlink `foo@bar.service -> foo@.service` is an
+    // *instance* of the template, not an alias: folding it into the
+    // canonical template name would instantiate the template with an empty
+    // `%i` (e.g. a getty with `TTYPath=/dev/`).  Parse it under the
+    // symlink's own instance name instead, mirroring `systema-sysf`'s
+    // `symlink_alias`.
+    if sysa::unit_name::is_template(canonical)
+        && sysa::unit_name::template_of(&alias).as_deref() == Some(canonical)
+    {
         return super::parser::parse_unit_from_path(path);
     }
     let mut unit = super::parser::parse_unit_from_path_as(path, canonical)?;
@@ -1271,5 +1299,46 @@ mod tests {
             .alias
             .iter()
             .any(|a| a == "display-manager.service"));
+    }
+
+    #[test]
+    fn load_flexible_rejects_bare_template() {
+        let dir = temp_dir("tplrej");
+        std::fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %I\nTTYPath=/dev/%I\n",
+        )
+        .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let err = load_unit_flexible_in(&dirs, "getty@.service").unwrap_err();
+        assert!(err.to_string().contains("template"), "unexpected error: {err}");
+        // Instances are still resolved through the template.
+        let unit = load_unit_flexible_in(&dirs, "getty@tty3.service").unwrap();
+        assert_eq!(unit.name, "getty@tty3.service");
+        assert_eq!(unit.unit.description, "Getty on tty3");
+    }
+
+    #[test]
+    fn load_unit_file_instantiates_instance_symlink() {
+        let dir = temp_dir("instsym");
+        std::fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %I\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.join("getty@.service"), dir.join("getty@tty1.service"))
+            .unwrap();
+
+        // The enablement symlink is an *instance* of the template, not an
+        // alias: it must be loaded under its own instance name with %I
+        // expanded, never folded into the bare template.
+        let unit = load_unit_file(&dir.join("getty@tty1.service")).unwrap();
+        assert_eq!(unit.name, "getty@tty1.service");
+        assert_eq!(unit.unit.description, "Getty on tty1");
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.exec_start[0].program, "/sbin/agetty");
+        assert_eq!(svc.exec_start[0].args, vec!["tty1"]);
+        assert!(unit.install.alias.is_empty());
     }
 }
