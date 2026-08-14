@@ -49,6 +49,12 @@ pub struct CachedUnitState {
     pub inactive_enter_timestamp: u64,
     /// Worker-specific extensions (e.g. `last_exit_code`, `last_error`).
     pub extensions: HashMap<String, String>,
+    /// PIDs wrapped by a scope unit (transient `PIDs=` property), reported
+    /// by the System E worker.  Empty for non-scope units.
+    pub pids: Vec<u32>,
+    /// D-Bus unique name of the scope's controller (the client that created
+    /// the transient scope via `StartTransientUnit`).  Empty when none.
+    pub controller: String,
 }
 
 // --------------------------------------------------------------------------
@@ -426,6 +432,8 @@ impl AllocatorState {
                 active_enter_timestamp: now,
                 inactive_enter_timestamp: 0,
                 extensions: HashMap::new(),
+                pids: Vec::new(),
+                controller: String::new(),
             },
         );
         self.desired

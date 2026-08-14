@@ -7,6 +7,7 @@
 pub mod manager;
 pub mod mount_obj;
 pub mod properties;
+pub mod scope_obj;
 pub mod service_obj;
 pub mod slice_obj;
 pub mod socket_obj;
@@ -123,6 +124,21 @@ pub(super) async fn register_unit_object(
                 Err(e) => {
                     warn!(
                         "Failed to register D-Bus slice interface for {}: {}",
+                        unit_name, e
+                    );
+                }
+            }
+        }
+        Some(UnitKind::Scope) => {
+            let scope = scope_obj::ScopeObject {
+                allocator: allocator.clone(),
+                unit_name: unit_name.to_string(),
+            };
+            match conn.object_server().at(path.clone(), scope).await {
+                Ok(true) | Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to register D-Bus scope interface for {}: {}",
                         unit_name, e
                     );
                 }

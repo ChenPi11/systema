@@ -104,9 +104,9 @@ impl ResourceWorker {
     /// Apply (or re-apply) the resource control carried by an event.
     ///
     /// `active_state == "active"` ensures the cgroup hierarchy, writes the
-    /// limits, and moves `main_pid` into the cgroup when one is reported;
-    /// any other state releases the registry entry.  Best-effort: failures
-    /// are logged, never propagated.
+    /// limits, and moves the reported PIDs into the cgroup (`pids`, falling
+    /// back to the legacy single `main_pid`); any other state releases the
+    /// registry entry.  Best-effort: failures are logged, never propagated.
     pub fn handle_resource_event(&self, event: &UnitResourceEvent) {
         if event.active_state == "active" {
             let cgroup_path = Self::cgroup_path(&event.unit_name, &event.slice);
@@ -116,11 +116,22 @@ impl ResourceWorker {
             };
             match self.controller.ensure(&cgroup_path, &config) {
                 Ok(()) => {
-                    if event.main_pid != 0 {
-                        if let Err(e) = self.controller.attach(&cgroup_path, event.main_pid) {
+                    // Scopes wrap several externally-created processes: move
+                    // every reported PID into the unit's cgroup.
+                    let pids: Vec<u32> = if event.pids.is_empty() {
+                        if event.main_pid != 0 {
+                            vec![event.main_pid]
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        event.pids.clone()
+                    };
+                    for pid in pids {
+                        if let Err(e) = self.controller.attach(&cgroup_path, pid) {
                             warn!(
                                 "Cannot move pid {} into {}: {}",
-                                event.main_pid, event.unit_name, e
+                                pid, event.unit_name, e
                             );
                         }
                     }
@@ -137,7 +148,11 @@ impl ResourceWorker {
                             config,
                             cgroup_path,
                             parent_slice,
-                            main_pid: event.main_pid,
+                            main_pid: event.pids.first().copied().or(if event.main_pid != 0 {
+                                Some(event.main_pid)
+                            } else {
+                                None
+                            }).unwrap_or(0),
                         },
                     );
                     debug!("Applied resource control for {}", event.unit_name);
@@ -364,6 +379,7 @@ mod tests {
                 ..Default::default()
             }),
             main_pid: 0,
+            pids: vec![],
         }
     }
 

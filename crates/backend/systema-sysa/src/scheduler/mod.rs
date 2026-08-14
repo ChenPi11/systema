@@ -23,11 +23,11 @@ use crate::state::{
     StartLimitState,
 };
 use crate::unit::types::{
-    ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitSection,
+    ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitKind, UnitSection,
 };
 use sysa::proto::{
     AutomountConfig, MountConfig, PathConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig,
-    DeviceConfig, UnitConfig,
+    DeviceConfig, UnitConfig, ScopeConfig,
 };
 
 use crate::scheduler::job_type::{job_type_collapse, JobType, UnitActiveState};
@@ -81,20 +81,33 @@ pub async fn enqueue_start_with_mode(
     enqueue_job(allocator, unit_name, JobKind::Start, mode).await
 }
 
-/// Activate a transient unit (created via `StartTransientUnit`) without
-/// dispatching to a worker.
+/// Activate a transient unit (created via `StartTransientUnit`).
 ///
-/// Transient units (scopes, transient slices) wrap already-existing
-/// processes and have no on-disk unit file, so activation is instantaneous:
-/// the unit is marked active and the job completes immediately as "done".
-/// This honours the systemd1 `StartTransientUnit` contract for callers such
-/// as logind even though no worker exists for `.scope`/`.slice` units.
+/// Scopes are dispatched through the normal job machinery: the System E
+/// worker attaches the transient `PIDs=` to the scope's cgroup and reports
+/// back, so the job completes when the worker's `task.result` arrives.
+/// Other transient units (slices, auxiliaries) wrap already-existing
+/// processes and need no worker: the unit is marked active and the job
+/// completes immediately as "done".  This honours the systemd1
+/// `StartTransientUnit` contract for callers such as logind.
 pub async fn activate_transient_unit(
     allocator: AllocatorHandle,
     unit_name: &str,
     mode: JobMode,
 ) -> Result<u64> {
     info!("Activating transient unit {} (mode={:?})", unit_name, mode);
+
+    let is_scope = {
+        let state = allocator.read();
+        state
+            .units
+            .get(unit_name)
+            .map(|u| u.kind == UnitKind::Scope)
+            .unwrap_or(false)
+    };
+    if is_scope {
+        return enqueue_start_with_mode(allocator, unit_name, mode).await;
+    }
 
     // Validate mode/type constraints like enqueue_job does.
     {
@@ -325,6 +338,26 @@ pub async fn enqueue_job(
             .map(|u| u.unit.allow_isolate)
             .unwrap_or(false);
         check_mode_constraints(mode, kind, unit_name, allow_isolate)?;
+    }
+
+    // --- Non-transient scopes are refused (systemd scope_start) ---
+    //
+    // Scopes wrap externally-created processes and exist only as transient
+    // units: a `.scope` on disk cannot be started by us.  Mirrors
+    // systemd's `scope_start()` returning -ENOENT for non-transient scopes.
+    if kind == JobKind::Start {
+        let state = allocator.read();
+        if let Some(unit) = state.units.get(unit_name) {
+            if unit.kind == UnitKind::Scope && !unit.transient {
+                bail!(
+                    "{}",
+                    l10n::fmt(
+                        l10n::t_("Scope {unit_name} is not transient and cannot be started."),
+                        &[("unit_name", unit_name)],
+                    )
+                );
+            }
+        }
     }
 
     // --- Early check: ensure at least one worker exists for the root unit ---
@@ -1393,6 +1426,20 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         trigger_limit_burst: p.trigger_limit_burst,
     });
 
+    let scope = uf.scope.as_ref().map(|s| ScopeConfig {
+        pids: s
+            .pids
+            .iter()
+            .filter_map(|p| p.trim().parse::<u32>().ok())
+            .collect(),
+        timeout_stop_secs: s.timeout_stop_sec,
+        runtime_max_secs: s.runtime_max_sec,
+        kill_signal: s.kill_signal.clone(),
+        send_sighup: s.send_sighup,
+        controller: String::new(),
+        slice: uf.unit.slice.clone(),
+    });
+
     UnitConfig {
         unit_name: uf.name.clone(),
         description: uf.unit.description.clone(),
@@ -1403,6 +1450,7 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         timer,
         device,
         path,
+        scope,
     }
 }
 
@@ -2155,6 +2203,8 @@ mod tests {
                 active_enter_timestamp: 0,
                 inactive_enter_timestamp: 0,
                 extensions: HashMap::new(),
+                pids: Vec::new(),
+                controller: String::new(),
             },
         );
         alloc
@@ -2197,11 +2247,11 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_activate_transient_unit_activates_without_worker() {
-        // A transient scope has no on-disk unit file and no registered
-        // worker; activation must mark it active and complete the job
-        // without touching any worker (systemd: scope activation is
-        // instantaneous since it wraps existing processes).
+    async fn test_activate_transient_scope_requires_scope_worker() {
+        // A transient scope is dispatched through the normal job machinery
+        // to the System E worker.  Without a registered scope worker the
+        // activation must fail ("No worker available"), unlike transient
+        // slices which still take the instantaneous fast path.
         let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
         {
             let mut uf = UnitFile::new("session-1.scope");
@@ -2209,9 +2259,71 @@ mod tests {
             alloc.write().units.insert("session-1.scope".to_string(), uf);
         }
 
+        let err = activate_transient_unit(alloc.clone(), "session-1.scope", JobMode::Replace)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("No worker available"), "{}", err);
+
+        let state = alloc.read();
+        assert!(state.jobs.is_empty());
+        assert!(!state.unit_states.contains_key("session-1.scope"));
+    }
+
+    #[tokio::test]
+    async fn test_activate_transient_scope_dispatches_to_worker() {
+        // With a registered scope worker, activating a transient scope
+        // enqueues a real Start job and dispatches a task to the worker;
+        // the job stays Running until the worker reports back.
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut uf = UnitFile::new("session-1.scope");
+            uf.transient = true;
+            alloc.write().units.insert("session-1.scope".to_string(), uf);
+        }
+        {
+            let mut state = alloc.write();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            // Keep the worker side alive (drain incoming envelopes) so the
+            // dispatch never sees a "Worker disconnected" failure.
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-e-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-e-1".to_string(),
+                    unit_types: vec!["scope".to_string()],
+                    envelope_tx: tx,
+                },
+            );
+        }
+
         let job_id = activate_transient_unit(alloc.clone(), "session-1.scope", JobMode::Replace)
             .await
-            .expect("transient activation succeeds");
+            .expect("scope activation dispatches to worker");
+
+        let state = alloc.read();
+        let job = state.jobs.get(&job_id).expect("job recorded");
+        assert_eq!(job.kind, JobKind::Start);
+        assert_eq!(job.status, JobStatus::Running);
+        // A task was dispatched to the worker (task_kinds holds the mapping).
+        assert!(!state.task_kinds.is_empty());
+        // Desired state is committed only when the worker reports back.
+        assert_eq!(state.desired.get("session-1.scope"), None);
+    }
+
+    #[tokio::test]
+    async fn test_activate_transient_slice_still_fast_path() {
+        // Transient slices (and other non-scope transient units) keep the
+        // instantaneous fast path: marked active, job done, no worker.
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut uf = UnitFile::new("test.slice");
+            uf.transient = true;
+            alloc.write().units.insert("test.slice".to_string(), uf);
+        }
+
+        let job_id = activate_transient_unit(alloc.clone(), "test.slice", JobMode::Replace)
+            .await
+            .expect("transient slice activation succeeds");
 
         let state = alloc.read();
         let job = state.jobs.get(&job_id).expect("job recorded");
@@ -2219,11 +2331,10 @@ mod tests {
         assert_eq!(job.status, JobStatus::Done);
         let cached = state
             .unit_states
-            .get("session-1.scope")
+            .get("test.slice")
             .expect("unit marked active");
         assert_eq!(cached.active_state, "active");
         assert_eq!(cached.sub_state, "running");
-        assert_eq!(state.desired.get("session-1.scope"), Some(&DesiredState::Active));
         // No worker interaction: nothing was dispatched.
         assert!(state.task_kinds.is_empty());
     }
@@ -2685,6 +2796,8 @@ mod tests {
                 active_enter_timestamp: 0,
                 inactive_enter_timestamp: 0,
                 extensions: HashMap::new(),
+                pids: Vec::new(),
+                controller: String::new(),
             },
         );
     }

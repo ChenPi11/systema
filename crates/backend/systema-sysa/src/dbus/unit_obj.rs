@@ -734,6 +734,8 @@ mod tests {
                     active_enter_timestamp: 0,
                     inactive_enter_timestamp: 0,
                     extensions: Default::default(),
+                    pids: Vec::new(),
+                    controller: String::new(),
                 },
             );
         }
@@ -775,6 +777,8 @@ mod tests {
                 active_enter_timestamp: 0,
                 inactive_enter_timestamp: 0,
                 extensions: Default::default(),
+                pids: Vec::new(),
+                controller: String::new(),
             },
         );
         assert_eq!(obj(alloc).invocation_id(), vec![0u8; 16]);
@@ -793,6 +797,8 @@ mod tests {
                 active_enter_timestamp: 1234,
                 inactive_enter_timestamp: 0,
                 extensions: Default::default(),
+                pids: Vec::new(),
+                controller: String::new(),
             },
         );
         let obj = obj(alloc);

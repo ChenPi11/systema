@@ -239,6 +239,11 @@ pub fn build_unit_resource_event(
         slice: unit.unit.slice.clone(),
         resource,
         main_pid,
+        pids: state
+            .unit_states
+            .get(unit_name)
+            .map(|s| s.pids.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -383,6 +388,8 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
                 active_enter_timestamp: 0,
                 inactive_enter_timestamp: 0,
                 extensions: HashMap::new(),
+                pids: Vec::new(),
+                controller: String::new(),
             },
         );
         allocator
@@ -478,6 +485,8 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
                     active_enter_timestamp: 0,
                     inactive_enter_timestamp: 0,
                     extensions: HashMap::new(),
+                    pids: Vec::new(),
+                    controller: String::new(),
                 },
             );
         }
@@ -500,6 +509,8 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
                     active_enter_timestamp: 0,
                     inactive_enter_timestamp: 0,
                     extensions: HashMap::new(),
+                    pids: Vec::new(),
+                    controller: String::new(),
                 },
             );
         }

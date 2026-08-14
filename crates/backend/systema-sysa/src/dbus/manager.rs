@@ -7,13 +7,14 @@ use anyhow::Result;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use sysa::l10n;
+use sysa::proto::ScopeAbandon;
 use tracing::{debug, info, warn};
 use zbus::interface;
 use zvariant::OwnedObjectPath;
 
 use crate::scheduler;
 use crate::scheduler::job_type::JobType;
-use crate::state::{AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
+use crate::state::{next_task_id, AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
 use crate::unit::types::{ScopeSection, UnitFile, UnitKind};
 
 // --------------------------------------------------------------------------
@@ -107,7 +108,15 @@ fn set_desired_state(alloc: &AllocatorHandle, name: &str, kind: JobKind) {
 /// Build a transient `UnitFile` from a `StartTransientUnit` properties
 /// argument (an `a(sv)` array).  Only the subset of properties that map onto
 /// System A's unit model is honoured; unknown properties are ignored.
-fn transient_unit_from_properties(name: &str, properties: &[(String, zvariant::OwnedValue)]) -> UnitFile {
+///
+/// `sender_pid` is the PID of the calling process (resolved from the D-Bus
+/// sender unique name); it backs the systemd semantics of an empty `PIDs=`
+/// (or `PIDs=[0]`) on scope units.
+fn transient_unit_from_properties(
+    name: &str,
+    properties: &[(String, zvariant::OwnedValue)],
+    sender_pid: Option<u32>,
+) -> UnitFile {
     let mut uf = UnitFile::new(name);
     uf.transient = true;
 
@@ -151,10 +160,32 @@ fn transient_unit_from_properties(name: &str, properties: &[(String, zvariant::O
     }
 
     // Scope-specific: the PIDs of the processes the scope wraps.
+    //
+    // Mirrors systemd (`bus_scope_set_transient_property`, PIDs=): an
+    // empty array, or entries of 0, denote the *sender* of the
+    // `StartTransientUnit` call.
     if uf.kind == UnitKind::Scope {
         let mut scope = ScopeSection::default();
         if let Some(pids) = get_prop_u32s(properties, "PIDs") {
-            scope.pids = pids.iter().map(u32::to_string).collect();
+            if pids.is_empty() {
+                if let Some(pid) = sender_pid {
+                    scope.pids = vec![pid.to_string()];
+                }
+            } else {
+                scope.pids = pids
+                    .into_iter()
+                    .map(|p| {
+                        if p == 0 {
+                            sender_pid.unwrap_or(0).to_string()
+                        } else {
+                            p.to_string()
+                        }
+                    })
+                    .collect();
+            }
+        } else if let Some(pid) = sender_pid {
+            // systemd: no PIDs= at all still resolves to the sender.
+            scope.pids = vec![pid.to_string()];
         }
         uf.scope = Some(scope);
     }
@@ -259,17 +290,126 @@ impl ManagerInterface {
         &self,
         name: &str,
         properties: &[(String, zvariant::OwnedValue)],
+        sender: Option<&str>,
     ) -> zbus::fdo::Result<()> {
+        let sender_pid = match sender {
+            Some(name) => self.sender_pid(name).await,
+            None => None,
+        };
+        let controller = sender.map(str::to_string).unwrap_or_default();
         {
             let mut state = self.allocator.write();
             if !state.units.contains_key(name) {
-                let uf = transient_unit_from_properties(name, properties);
+                let uf = transient_unit_from_properties(name, properties, sender_pid);
+                if uf.kind == UnitKind::Scope {
+                    let entry = state
+                        .unit_states
+                        .entry(name.to_string())
+                        .or_default();
+                    entry.pids = uf
+                        .scope
+                        .as_ref()
+                        .map(|s| {
+                            s.pids
+                                .iter()
+                                .filter_map(|p| p.trim().parse::<u32>().ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    entry.controller = controller.clone();
+                }
                 state.units.insert(name.to_string(), uf);
             }
         }
         self.ensure_unit_object(name).await;
         Ok(())
     }
+
+    /// Resolve the PID of the process owning the given unique bus name
+    /// (via `org.freedesktop.DBus.GetConnectionUnixProcessID`).
+    async fn sender_pid(&self, sender: &str) -> Option<u32> {
+        let conn = self.conn.get()?;
+        let proxy = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+        let bus_name = zbus::names::BusName::try_from(sender).ok()?;
+        proxy
+            .get_connection_unix_process_id(bus_name)
+            .await
+            .ok()
+    }
+}
+
+/// Shared implementation of scope abandonment (used by the Manager
+/// `AbandonScope` method and the per-unit `Scope.Abandon` method).
+pub async fn abandon_scope_impl(
+    allocator: &AllocatorHandle,
+    name: &str,
+) -> zbus::fdo::Result<()> {
+    let (worker_tx, active_state) = {
+        let state = allocator.read();
+        if !state
+            .units
+            .get(name)
+            .map(|u| u.kind == UnitKind::Scope)
+            .unwrap_or(false)
+        {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "{} is not a scope unit.",
+                name
+            )));
+        }
+        let active_state = state
+            .unit_states
+            .get(name)
+            .map(|s| s.active_state.clone())
+            .unwrap_or_else(|| "inactive".to_string());
+        let worker_tx = state
+            .workers
+            .values()
+            .find(|w| w.unit_types.iter().any(|t| t == "scope"))
+            .map(|w| w.envelope_tx.clone());
+        (worker_tx, active_state)
+    };
+    if !matches!(active_state.as_str(), "active" | "activating") {
+        return Err(zbus::fdo::Error::Failed(format!(
+            "Scope {} is not running, cannot abandon.",
+            name
+        )));
+    }
+
+    // Notify the worker (best effort) and update the cached state: the
+    // unit keeps its active state but transitions to "abandoned".
+    if let Some(tx) = worker_tx {
+        match sysa::ipc::make_envelope(
+            next_task_id(),
+            "system-a",
+            "system-e-1",
+            "scope.abandon",
+            ScopeAbandon {
+                unit_name: name.to_string(),
+            },
+        )
+        .and_then(|env| {
+            let mut buf = bytes::BytesMut::new();
+            prost::Message::encode(&env, &mut buf)
+                .map(|_| buf.freeze())
+                .map_err(Into::into)
+        }) {
+            Ok(encoded) => {
+                if tx.send(encoded).await.is_err() {
+                    warn!("Cannot send scope.abandon to worker for {}", name);
+                }
+            }
+            Err(e) => warn!("Failed to encode scope.abandon: {}", e),
+        }
+    }
+
+    {
+        let mut state = allocator.write();
+        if let Some(entry) = state.unit_states.get_mut(name) {
+            entry.sub_state = "abandoned".to_string();
+        }
+    }
+    Ok(())
 }
 
 /// Unit info tuple returned by ListUnits.
@@ -639,6 +779,7 @@ impl ManagerInterface {
     /// primary one (they are created but not started).
     async fn start_transient_unit(
         &self,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
         name: &str,
         mode: &str,
         properties: Vec<(String, zvariant::OwnedValue)>,
@@ -646,11 +787,12 @@ impl ManagerInterface {
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus StartTransientUnit: {} (mode={})", name, mode);
         let job_mode = parse_job_mode(mode)?;
+        let sender = header.sender().map(|s| s.as_str());
 
         // Create the transient unit (and any auxiliary units) in the allocator.
-        self.insert_transient_unit(name, &properties).await?;
+        self.insert_transient_unit(name, &properties, sender).await?;
         for (aux_name, aux_props) in &aux_units {
-            self.insert_transient_unit(aux_name, aux_props).await?;
+            self.insert_transient_unit(aux_name, aux_props, sender).await?;
         }
 
         let job_id = scheduler::activate_transient_unit(self.allocator.clone(), name, job_mode)
@@ -665,6 +807,7 @@ impl ManagerInterface {
     /// `StartTransientUnitMany`.  Returns one job path per transient unit.
     async fn start_transient_unit_many(
         &self,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
         units: Vec<(String, Vec<(String, zvariant::OwnedValue)>)>,
         mode: &str,
         aux_units: Vec<(String, Vec<(String, zvariant::OwnedValue)>)>,
@@ -675,12 +818,13 @@ impl ManagerInterface {
             mode
         );
         let job_mode = parse_job_mode(mode)?;
+        let sender = header.sender().map(|s| s.as_str());
 
         let mut jobs = Vec::with_capacity(units.len());
         for (name, properties) in units {
-            self.insert_transient_unit(&name, &properties).await?;
+            self.insert_transient_unit(&name, &properties, sender).await?;
             for (aux_name, aux_props) in &aux_units {
-                self.insert_transient_unit(aux_name, aux_props).await?;
+                self.insert_transient_unit(aux_name, aux_props, sender).await?;
             }
             let job_id =
                 scheduler::activate_transient_unit(self.allocator.clone(), &name, job_mode)
@@ -976,6 +1120,18 @@ impl ManagerInterface {
         debug!("D-Bus ResetFailed");
         self.allocator.write().start_limit_state.clear();
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Scope management methods
+    // ------------------------------------------------------------------
+
+    /// Abandon a scope unit: the processes wrapped by the scope keep
+    /// running, but System A stops managing the unit.
+    async fn abandon_scope(&self, name: &str) -> zbus::fdo::Result<()> {
+        debug!("D-Bus AbandonScope: name={}", name);
+        let name = self.allocator.read().resolve_unit_name(name);
+        abandon_scope_impl(&self.allocator, &name).await
     }
 
     // ------------------------------------------------------------------
@@ -1606,7 +1762,7 @@ mod tests {
 
     #[test]
     fn transient_scope_built_from_properties() {
-        let uf = transient_unit_from_properties("session-1.scope", &props());
+        let uf = transient_unit_from_properties("session-1.scope", &props(), None);
         assert!(uf.transient);
         assert_eq!(uf.kind, UnitKind::Scope);
         assert_eq!(uf.unit.description, "Session 1 of root");
@@ -1622,7 +1778,7 @@ mod tests {
 
     #[test]
     fn transient_unit_defaults_without_properties() {
-        let uf = transient_unit_from_properties("x.slice", &[]);
+        let uf = transient_unit_from_properties("x.slice", &[], None);
         assert!(uf.transient);
         assert_eq!(uf.kind, UnitKind::Slice);
         assert!(uf.unit.description.is_empty());

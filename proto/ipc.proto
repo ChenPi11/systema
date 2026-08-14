@@ -429,7 +429,12 @@ message UnitResourceEvent {
     // The resource-control limits (empty when the unit sets none).
     ResourceConfig resource = 4;
     // Main process PID to move into the unit's cgroup (0 = none/n/a).
+    // Kept for backward compatibility; new senders fill `pids` instead.
     uint32 main_pid = 5;
+    // Process PIDs to move into the unit's cgroup (empty = none/n/a).
+    // Scopes wrap externally-created processes, so this may carry several
+    // PIDs at once (from the transient `PIDs=` property).
+    repeated uint32 pids = 6;
 }
 
 // Periodic cgroup runtime metrics pushed by System R to System A.
@@ -466,6 +471,14 @@ message CgroupProcess {
     string name = 3;
 }
 
+// Sent by System A to the System E worker to abandon a scope: the scope's
+// controller gave up on it (explicit `AbandonScope` / scope `Abandon`), so
+// the worker must stop managing it and release its resources — the wrapped
+// processes themselves are left running.
+message ScopeAbandon {
+    string unit_name = 1;
+}
+
 // Minimal unit configuration sent from System A to System Workers.
 message UnitConfig {
     string unit_name = 1;
@@ -484,6 +497,8 @@ message UnitConfig {
     DeviceConfig device = 8;
     // For path units.
     PathConfig path = 9;
+    // For scope units.
+    ScopeConfig scope = 10;
 }
 
 message ServiceConfig {
@@ -504,4 +519,27 @@ message ServiceConfig {
     string standard_output = 15;
     string standard_error = 16;
     string tty_path = 17;
+}
+
+// Configuration for `.scope` units, sent to the System E worker.
+//
+// Scopes wrap externally-created processes (not spawned by systemd): the
+// caller passes the PIDs via the transient `PIDs=` property and the worker
+// attaches them to the scope's cgroup.  The scope runs until its cgroup
+// becomes empty, is stopped, or its controller abandons it.
+message ScopeConfig {
+    // Processes wrapped by the scope (`PIDs=`).
+    repeated uint32 pids = 1;
+    // Timeout for the scope in seconds (`TimeoutStopSec=`, default 90).
+    uint32 timeout_stop_secs = 2;
+    // Runtime timeout in seconds (`RuntimeMaxSec=`, 0 = unlimited).
+    uint32 runtime_max_secs = 3;
+    // Signal to send when stopping (`KillSignal=`, default SIGTERM).
+    string kill_signal = 4;
+    // Whether to send SIGHUP before SIGKILL (`SendSIGHUP=`).
+    bool send_sighup = 5;
+    // D-Bus name of the controller that created the scope.
+    string controller = 6;
+    // Parent slice from [Unit] Slice=; empty means the default (system.slice).
+    string slice = 7;
 }
