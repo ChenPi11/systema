@@ -6,12 +6,27 @@ use sysa::proto::Envelope;
 use tracing::{debug, info, warn};
 
 use crate::scheduler::{schedule_automatic_restart, should_restart_service};
-use crate::state::AllocatorHandle;
+use crate::state::{AllocatorHandle, AllocatorState};
 use crate::unit::types::ExitKind;
 
 // ---------------------------------------------------------------------------
 // RestartHandler
 // ---------------------------------------------------------------------------
+
+/// True when the unit still has a live instance per the cached runtime
+/// state: it is either `active`/`activating`, or a main PID is tracked.
+///
+/// Guards automatic restarts from being scheduled on top of an instance
+/// that is still running (e.g. the failure report raced with a fresh start
+/// that is already active/activating). Service workers clear `main_pid` on
+/// exit, so a genuine `failed` report is never blocked by this check.
+fn has_live_instance(state: &AllocatorState, unit_name: &str) -> bool {
+    state
+        .unit_states
+        .get(unit_name)
+        .map(|c| matches!(c.active_state.as_str(), "active" | "activating") || c.main_pid != 0)
+        .unwrap_or(false)
+}
 
 /// Listens for unit state changes, evaluates the unit's `RestartPolicy`
 /// on failure, and schedules an automatic restart if needed.
@@ -66,6 +81,15 @@ impl EventSubscriber for RestartHandler {
         };
 
         if should {
+            let state = self.allocator.read();
+            if has_live_instance(&state, unit_name) {
+                let cached = state.unit_states.get(unit_name).unwrap();
+                warn!(
+                    "EventBus: restart of {} suppressed: live instance present (active_state={}, main_pid={})",
+                    unit_name, cached.active_state, cached.main_pid
+                );
+                return;
+            }
             info!(
                 "EventBus: restart triggered for {} (sub_state={:?}, exit_kind={:?})",
                 unit_name, status.sub_state, exit_kind
@@ -326,6 +350,9 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
     #[cfg(test)]
     mod tests {
         use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::state::CachedUnitState;
 
         use super::*;
 
@@ -396,5 +423,58 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         let all = WorkerEventForwarder::new("system-s-2", tx2, true, vec![], allocator);
         assert!(all.matches(&unit_event("anything.service")));
+    }
+
+    #[test]
+    fn live_instance_detected_for_active_states() {
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        for (name, active_state, pid) in
+            [("a.service", "active", 42u32), ("b.service", "activating", 0u32)]
+        {
+            alloc.write().unit_states.insert(
+                name.to_string(),
+                CachedUnitState {
+                    active_state: active_state.to_string(),
+                    sub_state: String::new(),
+                    main_pid: pid,
+                    invocation_id: String::new(),
+                    active_enter_timestamp: 0,
+                    inactive_enter_timestamp: 0,
+                    extensions: HashMap::new(),
+                },
+            );
+        }
+        let state = alloc.read();
+        assert!(has_live_instance(&state, "a.service"));
+        assert!(has_live_instance(&state, "b.service"));
+    }
+
+    #[test]
+    fn live_instance_absent_for_failed_and_inactive() {
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        for (name, active_state) in [("a.service", "failed"), ("b.service", "inactive")] {
+            alloc.write().unit_states.insert(
+                name.to_string(),
+                CachedUnitState {
+                    active_state: active_state.to_string(),
+                    sub_state: String::new(),
+                    main_pid: 0,
+                    invocation_id: String::new(),
+                    active_enter_timestamp: 0,
+                    inactive_enter_timestamp: 0,
+                    extensions: HashMap::new(),
+                },
+            );
+        }
+        let state = alloc.read();
+        assert!(!has_live_instance(&state, "a.service"));
+        assert!(!has_live_instance(&state, "b.service"));
+    }
+
+    #[test]
+    fn live_instance_absent_for_unknown_unit() {
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        let state = alloc.read();
+        assert!(!has_live_instance(&state, "missing.service"));
     }
 }

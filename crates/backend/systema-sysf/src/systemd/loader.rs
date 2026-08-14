@@ -22,6 +22,29 @@ pub fn is_known_extension(name: &str) -> bool {
     )
 }
 
+/// If `path` is a symlink to a regular unit file, resolve the canonical unit
+/// name (the basename of the resolved target) and the alias name (the
+/// symlink's own basename).
+///
+/// Returns `None` when `path` is not a symlink, when the symlink is broken or
+/// masks to a non-file (`/dev/null` masking is skipped by `is_file()` before
+/// this is called), or when the resolved target is not a unit file.  A symlink
+/// whose basename already equals the target's basename (e.g. a `.wants/`
+/// enablement link pointing at the same-named unit) is not an alias.
+fn symlink_alias(path: &Path) -> Option<(String, String)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let target = std::fs::canonicalize(path).ok()?;
+    let canonical_name = target.file_name().and_then(|n| n.to_str())?.to_string();
+    let alias_name = path.file_name().and_then(|n| n.to_str())?.to_string();
+    if canonical_name == alias_name || !is_known_extension(&canonical_name) {
+        return None;
+    }
+    Some((canonical_name, alias_name))
+}
+
 /// Discover and parse all systemd unit files from standard search paths.
 pub fn discover_all() -> Result<Vec<UnitFile>> {
     let mut units = Vec::new();
@@ -83,11 +106,25 @@ fn discover_one_in(dirs: &[String], name: &str) -> Result<Option<UnitFile>> {
 }
 
 /// Find and parse a unit file that exists verbatim under `name`.
+///
+/// When `name` is an alias (a symlink pointing at another unit file), the
+/// file is parsed under its canonical name and the alias is recorded, so a
+/// lookup of `display-manager.service` yields the `lightdm.service` unit.
 fn find_exact_in(dirs: &[String], name: &str) -> Result<Option<UnitFile>> {
     for dir in dirs {
         let path = Path::new(dir).join(name);
         if path.exists() {
-            match parse_unit_from_path(&path) {
+            let parsed = match symlink_alias(&path) {
+                Some((canonical, _)) => {
+                    let mut unit = parse_unit_from_path_as(&path, &canonical)?;
+                    if !unit.install.alias.iter().any(|a| a == name) {
+                        unit.install.alias.push(name.to_string());
+                    }
+                    Ok(unit)
+                }
+                None => parse_unit_from_path(&path),
+            };
+            match parsed {
                 Ok(unit) => return Ok(Some(unit)),
                 Err(e) => {
                     warn!("Failed to parse {}: {}", path.display(), e);
@@ -186,7 +223,28 @@ fn load_units_from_dir(
         if !is_known_extension(&name) {
             continue;
         }
-        match parse_unit_from_path(&path) {
+        // A unit-file symlink aliases its resolved target: the canonical unit
+        // name is the target's basename and the symlink's basename becomes an
+        // alias of it.  This mirrors systemd, where `display-manager.service`
+        // -> `lightdm.service` is not a second unit but another name for the
+        // same one.  Masking (-> /dev/null) is already skipped by `is_file()`.
+        let unit = match symlink_alias(&path) {
+            Some((canonical, alias)) => {
+                let mut unit = match parse_unit_from_path_as(&path, &canonical) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        debug!("Skipping {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
+                if !unit.install.alias.iter().any(|a| a == &alias) {
+                    unit.install.alias.push(alias);
+                }
+                Ok(unit)
+            }
+            None => parse_unit_from_path(&path),
+        };
+        match unit {
             Ok(unit) => {
                 if let Some((target, kind)) = ctx {
                     let slot = implicit.entry(target.clone()).or_default();
@@ -353,5 +411,85 @@ mod tests {
         let target = units.iter().find(|u| u.name == "target.service").unwrap();
         assert!(target.unit.requires.contains("dep.service"));
         assert!(!target.unit.wants.contains("dep.service"));
+    }
+
+    #[test]
+    fn symlink_unit_folds_into_canonical_name() {
+        let dir = temp_dir("alias");
+        fs::write(
+            dir.join("lightdm.service"),
+            "[Unit]\nDescription=Display manager\n[Service]\nExecStart=/usr/sbin/lightdm\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.join("lightdm.service"), dir.join("display-manager.service"))
+            .unwrap();
+
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&dir, &mut units, &mut implicit, None).unwrap();
+
+        // The symlink is never its own unit: every entry that came from it
+        // carries the canonical name `lightdm.service` plus the alias.
+        assert!(!units.iter().any(|u| u.name == "display-manager.service"));
+        assert!(units
+            .iter()
+            .any(|u| u.name == "lightdm.service"
+                && u.unit.description == "Display manager"
+                && u.install.alias.iter().any(|a| a == "display-manager.service")));
+        // The symlink basename does not appear as a unit name anywhere.
+        assert!(units.iter().all(|u| u.name != "display-manager.service"));
+    }
+
+    #[test]
+    fn wants_dir_symlink_alias_edges_reference_canonical_name() {
+        let dir = temp_dir("wantsalias");
+        let unit_dir = dir.join("system");
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(
+            unit_dir.join("graphical.target"),
+            "[Unit]\nDescription=Graphical target\n",
+        )
+        .unwrap();
+        fs::write(
+            unit_dir.join("lightdm.service"),
+            "[Unit]\nDescription=Display manager\n[Service]\nExecStart=/usr/sbin/lightdm\n",
+        )
+        .unwrap();
+        // The enablement link uses the alias name; the edge must reference
+        // the canonical unit so the scheduler sees exactly one lightdm.
+        fs::create_dir_all(unit_dir.join("graphical.target.wants")).unwrap();
+        std::os::unix::fs::symlink(
+            unit_dir.join("lightdm.service"),
+            unit_dir.join("graphical.target.wants").join("display-manager.service"),
+        )
+        .unwrap();
+
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&unit_dir, &mut units, &mut implicit, None).unwrap();
+        apply_implicit_deps(&mut units, &implicit);
+
+        let graphical = units.iter().find(|u| u.name == "graphical.target").unwrap();
+        assert!(graphical.unit.wants.contains("lightdm.service"));
+        assert!(!graphical.unit.wants.contains("display-manager.service"));
+    }
+
+    #[test]
+    fn masked_symlink_to_dev_null_is_skipped() {
+        let dir = temp_dir("mask");
+        fs::write(
+            dir.join("iodined.service"),
+            "[Unit]\nDescription=Real service\n[Service]\nExecStart=/usr/sbin/iodined\n",
+        )
+        .unwrap();
+        // Masking a unit means symlinking it to /dev/null.
+        std::os::unix::fs::symlink("/dev/null", dir.join("some-other.service")).unwrap();
+
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&dir, &mut units, &mut implicit, None).unwrap();
+
+        let names: Vec<String> = units.iter().map(|u| u.name.clone()).collect();
+        assert_eq!(names, vec!["iodined.service".to_string()]);
     }
 }

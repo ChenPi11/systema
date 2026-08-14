@@ -195,6 +195,9 @@ pub async fn enqueue_job_type(
     reload_if_possible: bool,
     mode: JobMode,
 ) -> Result<(u64, JobKind)> {
+    // Resolve alias names to their canonical unit before anything else.
+    let resolved = allocator.read().resolve_unit_name(unit_name);
+    let unit_name: &str = &resolved;
     info!(
         "Scheduling {} for {} (mode={:?})",
         job_type.as_str(),
@@ -307,6 +310,10 @@ pub async fn enqueue_job(
     kind: JobKind,
     mode: JobMode,
 ) -> Result<u64> {
+    // Resolve alias names to their canonical unit before anything else, so an
+    // alias (e.g. `display-manager.service`) never schedules a separate job.
+    let resolved = allocator.read().resolve_unit_name(unit_name);
+    let unit_name: &str = &resolved;
     info!("Scheduling {:?} for {} (mode={:?})", kind, unit_name, mode);
 
     // --- Mode/type validation (manager_add_job_full) ---
@@ -491,16 +498,20 @@ pub async fn enqueue_job(
                         ("existing_id", &existing_id.to_string()),
                     ]));
                 }
-                JobMode::Queue => {
+                // systemd merges a job that is already running for the same
+                // unit *and* same type into the existing one (job.c
+                // `job_merge()`: `unit_get_job()` with a matching type),
+                // regardless of job mode — it never re-dispatches it.
+                //
+                // Cancelling and re-spawning here is what turns a
+                // self-recursive `systemctl start` inside a unit's ExecStart
+                // into an infinite spawn loop: SysV init scripts (e.g.
+                // `/etc/init.d/virtualbox-guest-utils`) detect systemd and
+                // delegate to `systemctl start $unit`, which must resolve to
+                // the already-running job instead of starting another copy.
+                _ => {
                     return Ok(existing_id);
                 }
-                JobMode::Replace => {
-                    let mut wstate = allocator.write();
-                    if let Some(job) = wstate.jobs.get_mut(&existing_id) {
-                        job.status = JobStatus::Cancelled;
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -917,6 +928,71 @@ fn emit_job_new_after_lock(
 }
 
 /// Update unit runtime state from a task result received from a worker.
+/// Compute which units should receive a propagated `Start` because
+/// `unit_name` (a dependency they `BindsTo`) just started successfully.
+///
+/// Propagation is gated on two conditions:
+///   A. `unit_name` must be cached as `active` — a spawn-only success is
+///      not enough to trust the binding (systemd only considers the
+///      dependency satisfied once the unit is actually active);
+///   B. a candidate must not already have an in-flight Start/Restart job,
+///      and must not already be cached as `active`/`activating` — this
+///      prevents "one more start on top of an in-flight start".
+fn binds_to_start_propagation(
+    state: &AllocatorState,
+    unit_name: &str,
+    success: bool,
+    kind: JobKind,
+) -> Vec<String> {
+    if !success || !matches!(kind, JobKind::Start | JobKind::Restart) {
+        return Vec::new();
+    }
+
+    // Gate A: only propagate when the dependency is genuinely active.
+    let dep_active = state
+        .unit_states
+        .get(unit_name)
+        .map(|c| c.active_state == "active")
+        .unwrap_or(false);
+    if !dep_active {
+        debug!(
+            "BindsTo start propagation suppressed: dependency {} not cached as active",
+            unit_name
+        );
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    for (other_name, other_unit) in &state.units {
+        if !other_unit.unit.binds_to.contains(unit_name) {
+            continue;
+        }
+
+        // Gate B: skip units that already have a running Start/Restart job
+        // or are already cached as active/activating.
+        let has_running_job = state.jobs.values().any(|j| {
+            j.unit_name == *other_name
+                && matches!(j.kind, JobKind::Start | JobKind::Restart)
+                && matches!(j.status, JobStatus::Running)
+        });
+        let target_active = state
+            .unit_states
+            .get(other_name)
+            .map(|c| matches!(c.active_state.as_str(), "active" | "activating"))
+            .unwrap_or(false);
+        if has_running_job || target_active {
+            debug!(
+                "BindsTo start propagation suppressed: {} already has running job or is active",
+                other_name
+            );
+            continue;
+        }
+
+        targets.push(other_name.clone());
+    }
+    targets
+}
+
 pub fn handle_task_result(
     allocator: AllocatorHandle,
     task_id: u64,
@@ -941,11 +1017,6 @@ pub fn handle_task_result(
         // Clean up invocation_id tracking.
         if !success || kind == JobKind::Stop {
             state.invocation_ids.remove(unit_name);
-        }
-
-        // Reset rate-limit state on successful start.
-        if success && matches!(kind, JobKind::Start | JobKind::Restart) {
-            state.start_limit_state.remove(unit_name);
         }
 
         // Find and update the associated job.
@@ -1010,13 +1081,10 @@ pub fn handle_task_result(
             }
         }
 
-        // --- BindsTo= start propagation (simplified: always propagate) ---
-        if success && matches!(kind, JobKind::Start | JobKind::Restart) {
-            for (other_name, other_unit) in &state.units {
-                if other_unit.unit.binds_to.contains(unit_name) {
-                    post_actions.push(PostAction::Start(other_name.clone()));
-                }
-            }
+        // --- BindsTo= start propagation (gated: dependency active, target
+        // not already in-flight/active) ---
+        for name in binds_to_start_propagation(&state, unit_name, success, kind) {
+            post_actions.push(PostAction::Start(name));
         }
 
         // --- PartOf= start propagation (simplified: always propagate) ---
@@ -2232,6 +2300,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_enqueue_job_merges_identical_running_job() {
+        // Regression: a second Start for a unit that already has a Running
+        // Start job must merge into it (systemd job_merge), never cancel and
+        // re-dispatch. Otherwise a SysV init script that calls
+        // `systemctl start $unit` from inside its own ExecStart (e.g.
+        // /etc/init.d/virtualbox-guest-utils) spawns an infinite loop of
+        // processes.
+        let alloc = alloc_with_state("active");
+        register_service_worker(&mut alloc.write());
+
+        // Prime a Running Start job.
+        let first_id = {
+            let mut state = alloc.write();
+            let jid = next_job_id();
+            state.jobs.insert(
+                jid,
+                Job {
+                    id: jid,
+                    unit_name: "demo.service".to_string(),
+                    kind: JobKind::Start,
+                    status: JobStatus::Running,
+                    timeout_abort: None,
+                },
+            );
+            jid
+        };
+
+        // A second StartUnit-style request with Replace must resolve to the
+        // existing job instead of creating another.
+        let (second_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::Start,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kind, JobKind::Start);
+        assert_eq!(second_id, first_id);
+
+        let state = alloc.read();
+        let running: Vec<_> = state
+            .jobs
+            .values()
+            .filter(|j| {
+                j.unit_name == "demo.service" && matches!(j.status, JobStatus::Running)
+            })
+            .collect();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, first_id);
+    }
+
+    #[tokio::test]
+    async fn test_start_rate_limit_accumulates_across_successful_starts() {
+        // Regression: systemd does NOT reset the start rate limiter on a
+        // successful start — StartLimitIntervalSec/Burst is a sliding window
+        // over start *attempts* (unit_test_start_limit / ratelimit). A SysV
+        // init script that calls `systemctl start $unit` from inside its own
+        // ExecStart (e.g. /etc/init.d/virtualbox-guest-utils) recurses; every
+        // spawn succeeds, so without this accumulation the loop would run
+        // unboundedly. The default 10s/5 limit must trip on the 6th attempt
+        // even though every prior start succeeded.
+        let alloc = alloc_with_state("active");
+        register_service_worker(&mut alloc.write());
+
+        for attempt in 1..=5 {
+            let (job_id, kind) = enqueue_job_type(
+                alloc.clone(),
+                "demo.service",
+                JobType::Start,
+                false,
+                JobMode::Replace,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("start #{attempt} should be allowed: {e}"));
+            assert_eq!(kind, JobKind::Start);
+            // The start completes successfully — this must NOT clear the
+            // accumulated rate-limit state.
+            handle_task_result(alloc.clone(), job_id, true, "ok", "demo.service", JobKind::Start);
+        }
+
+        let err = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::Start,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .expect_err("6th start within the interval must be rate-limited");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rate limit exceeded"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_enqueue_job_type_reload_if_possible_mangles_to_reload() {
         // ReloadOrRestartUnit on an active, reloadable unit → reload.
         let alloc = alloc_with_state("active");
@@ -2495,5 +2662,105 @@ mod tests {
         let completion = rx.try_recv().expect("completion emitted");
         assert_eq!(completion.unit_name, "b.service");
         assert_eq!(completion.result, JobResultKind::Dependency);
+    }
+
+    // =========================================================================
+    // BindsTo start propagation tests
+    // =========================================================================
+
+    fn unit_binds_to(name: &str, dep: &str) -> (String, UnitFile) {
+        let mut u = make_unit(name);
+        u.unit.binds_to.insert(dep.to_string());
+        (name.to_string(), u)
+    }
+
+    fn cached_active(state: &mut AllocatorState, name: &str) {
+        state.unit_states.insert(
+            name.to_string(),
+            CachedUnitState {
+                active_state: "active".to_string(),
+                sub_state: String::new(),
+                main_pid: 0,
+                invocation_id: String::new(),
+                active_enter_timestamp: 0,
+                inactive_enter_timestamp: 0,
+                extensions: HashMap::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn binds_to_start_propagates_when_dependency_active() {
+        let mut state = AllocatorState::new();
+        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        let (cn, c) = unit_binds_to("consumer.service", "dep.service");
+        state.units.insert(cn, c);
+        cached_active(&mut state, "dep.service");
+
+        let targets = binds_to_start_propagation(&state, "dep.service", true, JobKind::Start);
+        assert_eq!(targets, vec!["consumer.service".to_string()]);
+    }
+
+    #[test]
+    fn binds_to_start_propagation_skips_inactive_dependency() {
+        let mut state = AllocatorState::new();
+        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        let (cn, c) = unit_binds_to("consumer.service", "dep.service");
+        state.units.insert(cn, c);
+
+        let targets = binds_to_start_propagation(&state, "dep.service", true, JobKind::Start);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn binds_to_start_propagation_skips_unit_with_running_job() {
+        let mut state = AllocatorState::new();
+        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        let (cn, c) = unit_binds_to("consumer.service", "dep.service");
+        state.units.insert(cn, c);
+        cached_active(&mut state, "dep.service");
+        state_with_job(&mut state, "consumer.service", JobKind::Start);
+
+        let targets = binds_to_start_propagation(&state, "dep.service", true, JobKind::Start);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn binds_to_start_propagation_skips_restart_job_targets() {
+        // An in-flight Restart also counts as running (gate B).
+        let mut state = AllocatorState::new();
+        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        let (cn, c) = unit_binds_to("consumer.service", "dep.service");
+        state.units.insert(cn, c);
+        cached_active(&mut state, "dep.service");
+        state_with_job(&mut state, "consumer.service", JobKind::Restart);
+
+        let targets = binds_to_start_propagation(&state, "dep.service", true, JobKind::Start);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn binds_to_start_propagation_skips_already_active_target() {
+        let mut state = AllocatorState::new();
+        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        let (cn, c) = unit_binds_to("consumer.service", "dep.service");
+        state.units.insert(cn, c);
+        cached_active(&mut state, "dep.service");
+        cached_active(&mut state, "consumer.service");
+
+        let targets = binds_to_start_propagation(&state, "dep.service", true, JobKind::Restart);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn binds_to_start_propagation_ignores_failed_and_stop_jobs() {
+        let mut state = AllocatorState::new();
+        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        let (cn, c) = unit_binds_to("consumer.service", "dep.service");
+        state.units.insert(cn, c);
+        cached_active(&mut state, "dep.service");
+
+        assert!(binds_to_start_propagation(&state, "dep.service", false, JobKind::Start).is_empty());
+        assert!(binds_to_start_propagation(&state, "dep.service", true, JobKind::Stop).is_empty());
     }
 }

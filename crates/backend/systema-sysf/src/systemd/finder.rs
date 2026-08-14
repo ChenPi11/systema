@@ -30,10 +30,9 @@ impl Finder for SystemdFinder {
 
     async fn find_all(&self) -> Result<HashMap<String, UnitIR>> {
         let files = loader::discover_all()?;
-        let mut map = HashMap::new();
+        let mut map: HashMap<String, UnitIR> = HashMap::new();
         for file in files {
-            let ir = convert_unit_file(&file);
-            map.insert(file.name.clone(), ir);
+            merge_unit_ir(&mut map, &file);
         }
         Ok(map)
     }
@@ -41,6 +40,28 @@ impl Finder for SystemdFinder {
     async fn find_one(&self, id: &str) -> Result<Option<UnitIR>> {
         let file = loader::discover_one(id)?;
         Ok(file.as_ref().map(convert_unit_file))
+    }
+}
+
+/// Merge one discovered unit file into the canonical-name map.
+///
+/// The same canonical unit can be discovered more than once (e.g. an `/etc`
+/// symlink alias plus the real file under `/usr/lib`).  Keep the first
+/// (highest-precedence) definition and only merge in any extra aliases it may
+/// have missed.
+fn merge_unit_ir(map: &mut HashMap<String, UnitIR>, file: &UnitFile) {
+    let ir = convert_unit_file(file);
+    match map.get_mut(&file.name) {
+        Some(existing) => {
+            for alias in &ir.aliases {
+                if !existing.aliases.contains(alias) {
+                    existing.aliases.push(alias.clone());
+                }
+            }
+        }
+        None => {
+            map.insert(file.name.clone(), ir);
+        }
     }
 }
 
@@ -62,6 +83,7 @@ fn convert_unit_file(uf: &UnitFile) -> UnitIR {
         asserts: Some(convert_asserts(uf)),
         wanted_by: Some(uf.install.wanted_by.iter().cloned().collect()),
         required_by: Some(uf.install.required_by.iter().cloned().collect()),
+        aliases: uf.install.alias.clone(),
         resource_control: extract_resource_control(uf),
     }
 }
@@ -295,5 +317,49 @@ impl Condition {
 impl SystemdFinder {
     pub fn new() -> Arc<Self> {
         Arc::new(SystemdFinder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit_file(name: &str, aliases: &[&str]) -> UnitFile {
+        let mut uf = UnitFile::new(name);
+        uf.unit.description = format!("desc of {name}");
+        uf.install.alias = aliases.iter().map(|s| s.to_string()).collect();
+        uf
+    }
+
+    #[test]
+    fn convert_unit_file_carries_aliases() {
+        let uf = unit_file("lightdm.service", &["display-manager.service"]);
+        let ir = convert_unit_file(&uf);
+        assert_eq!(ir.id, "lightdm.service");
+        assert_eq!(ir.aliases, vec!["display-manager.service"]);
+    }
+
+    #[test]
+    fn convert_unit_file_no_aliases_is_empty() {
+        let uf = unit_file("sshd.service", &[]);
+        let ir = convert_unit_file(&uf);
+        assert!(ir.aliases.is_empty());
+    }
+
+    #[test]
+    fn find_all_merges_duplicate_canonical_names_and_their_aliases() {
+        let mut map = HashMap::new();
+        merge_unit_ir(&mut map, &unit_file("lightdm.service", &["display-manager.service"]));
+        merge_unit_ir(&mut map, &unit_file("lightdm.service", &["lightdm-extra.service"]));
+        // The first definition is kept; aliases are the union.
+        assert_eq!(map.len(), 1);
+        let merged = map.get("lightdm.service").unwrap();
+        assert_eq!(merged.aliases.len(), 2);
+        assert!(merged
+            .aliases
+            .contains(&"display-manager.service".to_string()));
+        assert!(merged
+            .aliases
+            .contains(&"lightdm-extra.service".to_string()));
     }
 }

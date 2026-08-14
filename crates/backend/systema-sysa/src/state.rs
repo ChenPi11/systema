@@ -279,6 +279,11 @@ pub fn is_valid_staging_name(name: &str) -> bool {
 pub struct AllocatorState {
     /// All loaded unit files.
     pub units: HashMap<String, UnitFile>,
+    /// Alias names → canonical unit names (e.g. `display-manager.service` →
+    /// `lightdm.service`).  Populated on every commit from the units' declared
+    /// aliases; all job dispatch and unit lookups resolve through this map so
+    /// an alias is never treated as a separate unit.
+    pub aliases: HashMap<String, String>,
     /// Desired state for each named unit.
     pub desired: HashMap<String, DesiredState>,
     /// In-flight jobs keyed by job ID.
@@ -360,6 +365,7 @@ impl AllocatorState {
     pub fn new() -> Self {
         AllocatorState {
             units: HashMap::new(),
+            aliases: HashMap::new(),
             desired: HashMap::new(),
             jobs: HashMap::new(),
             workers: HashMap::new(),
@@ -435,9 +441,19 @@ impl AllocatorState {
         if updated > 0 {
             info!("commit_staging(UID={uid}, name={name}): updated {updated} existing unit(s)");
         }
+        self.rebuild_alias_map();
         self.rebuild_ref_counts();
 
         Ok(unit_count)
+    }
+
+    /// Return the canonical name of `name`, resolving aliases to their target
+    /// unit (identity for non-alias names).
+    pub fn resolve_unit_name(&self, name: &str) -> String {
+        self.aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// Create a staging area for a given UID, or merge into an existing one.
@@ -537,6 +553,67 @@ impl AllocatorState {
             .unwrap_or_default()
     }
 
+    /// Rebuild the alias table from every loaded unit's declared aliases and
+    /// rewrite all unit-to-unit references to canonical names.
+    ///
+    /// systemd treats an alias (e.g. `display-manager.service` for
+    /// `lightdm.service`, declared via `[Install] Alias=` or a unit-file
+    /// symlink) as another name for the same unit.  Without alias resolution,
+    /// the same program would be started once per name, racing for the same
+    /// resources.  After every commit we therefore (1) record which names are
+    /// aliases of which canonical unit and (2) rewrite every dependency,
+    /// ordering, and install reference so the scheduler and the reference
+    /// graph only ever deal with canonical names.
+    pub(crate) fn rebuild_alias_map(&mut self) {
+        self.aliases.clear();
+        // Collect declared aliases first to avoid borrow conflicts.
+        let mut declared: Vec<(String, String)> = Vec::new();
+        for (name, unit) in &self.units {
+            for alias in &unit.install.alias {
+                declared.push((alias.clone(), name.clone()));
+            }
+        }
+        for (alias, canonical) in declared {
+            // A real unit's name is not an alias — the real unit wins.
+            if alias == canonical || self.units.contains_key(&alias) {
+                continue;
+            }
+            self.aliases.entry(alias).or_insert(canonical);
+        }
+        // Rewrite every reference from an alias to its canonical name.
+        for unit in self.units.values_mut() {
+            rewrite_alias_refs(&mut unit.unit.after, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.before, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.requires, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.wants, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.conflicts, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.binds_to, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.requisite, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.part_of, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.upholds, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.on_success, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.on_failure, &self.aliases);
+            rewrite_alias_refs(&mut unit.unit.propagates_reload_to, &self.aliases);
+            rewrite_alias_refs(&mut unit.install.wanted_by, &self.aliases);
+            rewrite_alias_refs(&mut unit.install.required_by, &self.aliases);
+            rewrite_alias_refs(&mut unit.install.also, &self.aliases);
+            if let Some(timer) = &mut unit.timer {
+                if !timer.unit.is_empty() {
+                    if let Some(canonical) = self.aliases.get(&timer.unit) {
+                        timer.unit = canonical.clone();
+                    }
+                }
+            }
+            if let Some(path) = &mut unit.path {
+                if !path.unit.is_empty() {
+                    if let Some(canonical) = self.aliases.get(&path.unit) {
+                        path.unit = canonical.clone();
+                    }
+                }
+            }
+        }
+    }
+
     /// Rebuild reference counts from the current unit set.
     ///
     /// Scans every loaded unit's dependency declarations and populates
@@ -570,6 +647,23 @@ impl AllocatorState {
             self.ref_unit(src, dep);
         }
     }
+}
+
+/// Replace every name in `names` that is an alias with its canonical name.
+fn rewrite_alias_refs(names: &mut HashSet<String>, aliases: &HashMap<String, String>) {
+    if names.is_empty() || aliases.is_empty() {
+        return;
+    }
+    let mut rewritten = HashSet::new();
+    for name in names.drain() {
+        rewritten.insert(
+            aliases
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| name.to_string()),
+        );
+    }
+    *names = rewritten;
 }
 
 /// Apply a partial [`UnitIR`] update onto an existing [`UnitFile`].
@@ -610,6 +704,10 @@ fn apply_ir_patch(ir: &UnitIR, uf: &mut UnitFile) {
     }
     if let Some(required) = &ir.required_by {
         uf.install.required_by = required.iter().cloned().collect();
+    }
+    if !ir.aliases.is_empty() {
+        uf.install.alias.clear();
+        uf.install.alias.extend(ir.aliases.iter().cloned());
     }
 
     // Copy section configs when provided.
@@ -967,6 +1065,7 @@ mod tests {
             asserts: None,
             wanted_by: None,
             required_by: None,
+            aliases: Vec::new(),
             resource_control: None,
         }
     }
@@ -1057,6 +1156,69 @@ mod tests {
             state.units.get("tmp.mount").unwrap().mount.as_ref().unwrap().where_,
             "/tmp"
         );
+    }
+
+    #[test]
+    fn commit_builds_alias_table_and_rewrites_dependency_refs() {
+        let mut state = AllocatorState::new();
+        // lightdm.service declares display-manager.service as an alias.
+        let mut lightdm = UnitFile::new("lightdm.service");
+        lightdm
+            .install
+            .alias
+            .push("display-manager.service".to_string());
+        state.units.insert("lightdm.service".to_string(), lightdm);
+        // graphical.target wants the alias — it must be rewritten.
+        let mut graphical = UnitFile::new("graphical.target");
+        graphical
+            .unit
+            .wants
+            .insert("display-manager.service".to_string());
+        state.units.insert("graphical.target".to_string(), graphical);
+
+        // Commit any unit to trigger the alias-table rebuild.
+        stage(&mut state, 7, vec![mount_ir("tmp.mount", "/tmp")]);
+        state.commit_staging(7, "test").unwrap();
+
+        assert_eq!(
+            state.resolve_unit_name("display-manager.service"),
+            "lightdm.service"
+        );
+        assert_eq!(state.resolve_unit_name("lightdm.service"), "lightdm.service");
+        let wants = &state.units.get("graphical.target").unwrap().unit.wants;
+        assert!(wants.contains("lightdm.service"));
+        assert!(!wants.contains("display-manager.service"));
+        // Reference counting only ever sees the canonical unit.
+        assert!(state
+            .get_refs("lightdm.service")
+            .iter()
+            .any(|s| s == "graphical.target"));
+        assert!(!state.ref_counts.contains_key("display-manager.service"));
+    }
+
+    #[test]
+    fn real_unit_name_wins_over_declared_alias() {
+        let mut state = AllocatorState::new();
+        let mut lightdm = UnitFile::new("lightdm.service");
+        lightdm
+            .install
+            .alias
+            .push("display-manager.service".to_string());
+        state.units.insert("lightdm.service".to_string(), lightdm);
+        // A real display-manager.service unit exists too: it must not be
+        // hijacked by the alias mapping.
+        state
+            .units
+            .insert("display-manager.service".to_string(), UnitFile::new("display-manager.service"));
+
+        stage(&mut state, 7, vec![mount_ir("tmp.mount", "/tmp")]);
+        state.commit_staging(7, "test").unwrap();
+
+        assert_eq!(
+            state.resolve_unit_name("display-manager.service"),
+            "display-manager.service"
+        );
+        assert!(state.units.contains_key("display-manager.service"));
     }
 
     #[test]

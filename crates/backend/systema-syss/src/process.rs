@@ -40,6 +40,20 @@ use sysa::proto::UnitConfig;
 
 use crate::state::{ServiceRegistry, ServiceState};
 
+/// Environment variables injected into every spawned process so that
+/// `systemctl`/`systemd` invocations inside a unit talk to the system bus
+/// instead of falling back to offline / `--root` operation.
+///
+/// `SYSTEMCTL_FORCE_BUS=1` is exactly what real systemd passes to its child
+/// processes (it forces `systemctl` to use the bus even when it looks
+/// offline); `SYSTEMD_OFFLINE=0` disables systemd's offline (`--root`)
+/// detection. Both are applied *after* the unit's `Environment=` settings so
+/// a unit cannot override them.
+const FORCED_SERVICE_ENV: &[(&str, &str)] = &[
+    ("SYSTEMCTL_FORCE_BUS", "1"),
+    ("SYSTEMD_OFFLINE", "0"),
+];
+
 /// Launch the service described by `config`.
 /// Returns the PID and the Child handle of the spawned main process.
 /// The caller must keep the Child handle to later collect the exit status.
@@ -121,6 +135,12 @@ pub async fn start_service(
     // Set INVOCATION_ID if provided (systemd compatibility).
     if let Some(ref inv_id) = invocation_id {
         cmd.env("INVOCATION_ID", inv_id);
+    }
+
+    // Force systemctl/systemd in the child to use the live bus (applied last
+    // so it cannot be overridden by the unit's Environment= settings).
+    for (key, val) in FORCED_SERVICE_ENV {
+        cmd.env(key, val);
     }
 
     // TTY stdio: attach the configured TTY as the controlling terminal and
@@ -804,6 +824,10 @@ fn build_env_table(unit_env: &[String]) -> HashMap<String, String> {
         }
     }
 
+    for (key, val) in FORCED_SERVICE_ENV {
+        table.insert(key.to_string(), val.to_string());
+    }
+
     table
 }
 
@@ -1370,5 +1394,25 @@ mod tests {
         assert!(is_tty_force("TTY-FORCE"));
         assert!(!is_tty_force("tty"));
         assert!(!is_tty_force(""));
+    }
+
+    // --- Forced service environment ---
+
+    #[test]
+    fn forced_env_has_bus_variables() {
+        let vars: HashMap<&str, &str> = FORCED_SERVICE_ENV.iter().copied().collect();
+        assert_eq!(vars.get("SYSTEMCTL_FORCE_BUS"), Some(&"1"));
+        assert_eq!(vars.get("SYSTEMD_OFFLINE"), Some(&"0"));
+    }
+
+    #[test]
+    fn forced_env_overrides_unit_environment_in_table() {
+        let unit_env = vec![
+            "SYSTEMCTL_FORCE_BUS=0".to_string(),
+            "SYSTEMD_OFFLINE=1".to_string(),
+        ];
+        let table = build_env_table(&unit_env);
+        assert_eq!(table.get("SYSTEMCTL_FORCE_BUS").map(String::as_str), Some("1"));
+        assert_eq!(table.get("SYSTEMD_OFFLINE").map(String::as_str), Some("0"));
     }
 }

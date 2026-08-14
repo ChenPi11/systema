@@ -211,11 +211,13 @@ impl ManagerInterface {
 
     /// Load `name` from disk if it is not already in memory.
     async fn load_unit_if_needed(&self, name: &str) -> zbus::fdo::Result<()> {
-        if self.allocator.read().units.contains_key(name) {
+        // Resolve alias names to their canonical unit first, so a lookup of
+        // `display-manager.service` never loads a duplicate unit.
+        let name = self.allocator.read().resolve_unit_name(name);
+        if self.allocator.read().units.contains_key(&name) {
             return Ok(());
         }
         let alloc = self.allocator.clone();
-        let name = name.to_string();
         tokio::task::spawn_blocking(move || load_unit_sync(&alloc, &name))
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
@@ -234,7 +236,7 @@ impl ManagerInterface {
         desired: Option<DesiredState>,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         let alloc = self.allocator.clone();
-        let name = name.to_string();
+        let name = self.allocator.read().resolve_unit_name(name);
         self.load_unit_if_needed(&name).await?;
         self.ensure_unit_object(&name).await;
         let job_mode = parse_job_mode(mode)?;
@@ -335,15 +337,16 @@ impl ManagerInterface {
     /// Get the D-Bus object path of a loaded unit.
     async fn get_unit(&self, name: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         debug!("D-Bus GetUnit: name={}", name);
+        let name = self.allocator.read().resolve_unit_name(name);
         let state = self.allocator.read();
-        if state.units.contains_key(name) {
-            Ok(unit_object_path(name))
+        if state.units.contains_key(&name) {
+            Ok(unit_object_path(&name))
         } else {
             // Return UnknownObject so that systemctl recognises the unit as
             // "not in memory" and automatically falls back to LoadUnit.
             Err(zbus::fdo::Error::UnknownObject(l10n::fmt(
                 l10n::t_("Unit {name} is not loaded."),
-                &[("name", name)],
+                &[("name", &name)],
             )))
         }
     }
@@ -351,9 +354,12 @@ impl ManagerInterface {
     /// Load a unit (if not already loaded) and return its object path.
     async fn load_unit(&self, name: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         debug!("D-Bus LoadUnit: name={}", name);
+        // Resolve alias names so the canonical unit is loaded and its object
+        // path returned, never a duplicate.
+        let name = self.allocator.read().resolve_unit_name(name);
         // Try to load from disk.
         let alloc = self.allocator.clone();
-        let name_owned = name.to_string();
+        let name_owned = name.clone();
         match tokio::task::spawn_blocking(move || {
             // Use a synchronous load for the D-Bus context.
             load_unit_sync(&alloc, &name_owned)
@@ -363,8 +369,8 @@ impl ManagerInterface {
             Ok(Ok(_)) => {
                 // Register the unit's D-Bus object synchronously so that
                 // property reads issued by the caller succeed immediately.
-                self.ensure_unit_object(name).await;
-                Ok(unit_object_path(name))
+                self.ensure_unit_object(&name).await;
+                Ok(unit_object_path(&name))
             }
             Ok(Err(e)) => Err(zbus::fdo::Error::Failed(e.to_string())),
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
@@ -380,7 +386,7 @@ impl ManagerInterface {
         info!("D-Bus StartUnit: {} (mode={})", name, mode);
         debug!("D-Bus StartUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
-        let name = name.to_string();
+        let name = self.allocator.read().resolve_unit_name(name);
 
         // Check if unit is loaded — drop the guard before any await.
         let needs_load = !alloc.read().units.contains_key(&name);
@@ -416,7 +422,7 @@ impl ManagerInterface {
         info!("D-Bus StopUnit: {} (mode={})", name, mode);
         debug!("D-Bus StopUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
-        let name = name.to_string();
+        let name = self.allocator.read().resolve_unit_name(name);
 
         let job_mode = parse_job_mode(mode)?;
         let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Stop, job_mode)
@@ -436,7 +442,7 @@ impl ManagerInterface {
         info!("D-Bus RestartUnit: {} (mode={})", name, mode);
         debug!("D-Bus RestartUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
-        let name = name.to_string();
+        let name = self.allocator.read().resolve_unit_name(name);
 
         let job_mode = parse_job_mode(mode)?;
         let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Restart, job_mode)
@@ -456,7 +462,7 @@ impl ManagerInterface {
         info!("D-Bus ReloadUnit: {} (mode={})", name, mode);
         debug!("D-Bus ReloadUnit detail: name={} mode={}", name, mode);
         let alloc = self.allocator.clone();
-        let name = name.to_string();
+        let name = self.allocator.read().resolve_unit_name(name);
 
         let job_mode = parse_job_mode(mode)?;
         let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload, job_mode)
@@ -531,9 +537,9 @@ impl ManagerInterface {
         let mode = parse_job_mode(job_mode)?;
 
         let alloc = self.allocator.clone();
-        let name_owned = name.to_string();
-        self.load_unit_if_needed(name).await?;
-        self.ensure_unit_object(name).await;
+        let name_owned = self.allocator.read().resolve_unit_name(name);
+        self.load_unit_if_needed(&name_owned).await?;
+        self.ensure_unit_object(&name_owned).await;
 
         let (job_id, collapsed) =
             scheduler::enqueue_job_type(alloc.clone(), &name_owned, kind, reload_if_possible, mode)
@@ -753,6 +759,14 @@ impl ManagerInterface {
     /// they are not already in memory.
     async fn list_units_by_names(&self, names: Vec<String>) -> zbus::fdo::Result<Vec<UnitInfo>> {
         debug!("D-Bus ListUnitsByNames: names={:?}", names);
+        // Resolve alias names to their canonical units.
+        let names: Vec<String> = {
+            let state = self.allocator.read();
+            names
+                .into_iter()
+                .map(|n| state.resolve_unit_name(&n))
+                .collect()
+        };
         // Load any units that aren't already in memory.
         let to_load: Vec<String> = {
             let state = self.allocator.read();
@@ -855,19 +869,20 @@ impl ManagerInterface {
     async fn get_unit_file_state(&self, file: &str) -> zbus::fdo::Result<String> {
         debug!("D-Bus GetUnitFileState: file={}", file);
         // Normalise: strip leading path components if the caller passed a full path.
-        let name = std::path::Path::new(file)
+        let base = std::path::Path::new(file)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(file);
+        let name = self.allocator.read().resolve_unit_name(base);
 
         let state = self.allocator.read();
-        if let Some(unit) = state.units.get(name) {
+        if let Some(unit) = state.units.get(&name) {
             let file_state = unit_file_state(&unit.install);
             Ok(file_state.to_string())
         } else {
             // Unit not loaded — try to find it on disk without loading it fully.
             for dir in sysa::paths::instance().unit_search_paths.iter() {
-                let path = std::path::Path::new(dir).join(name);
+                let path = std::path::Path::new(dir).join(&name);
                 if path.exists() {
                     // File exists but isn't loaded; report as "static".
                     return Ok("static".to_string());
@@ -875,7 +890,7 @@ impl ManagerInterface {
             }
             Err(zbus::fdo::Error::Failed(l10n::fmt(
                 l10n::t_("Unit file {name} not found."),
-                &[("name", name)],
+                &[("name", &name)],
             )))
         }
     }
@@ -942,7 +957,8 @@ impl ManagerInterface {
     /// Reset the failed state of a unit.
     async fn reset_failed_unit(&self, name: &str) -> zbus::fdo::Result<()> {
         debug!("D-Bus ResetFailedUnit: name={}", name);
-        self.allocator.write().start_limit_state.remove(name);
+        let name = self.allocator.read().resolve_unit_name(name);
+        self.allocator.write().start_limit_state.remove(&name);
         Ok(())
     }
 
@@ -961,14 +977,15 @@ impl ManagerInterface {
     /// Returns the new reference count.
     async fn ref_unit(&self, name: &str) -> zbus::fdo::Result<u32> {
         debug!("D-Bus RefUnit: name={}", name);
+        let name = self.allocator.read().resolve_unit_name(name);
         let mut state = self.allocator.write();
-        if !state.units.contains_key(name) {
+        if !state.units.contains_key(&name) {
             return Err(zbus::fdo::Error::Failed(l10n::fmt(
                 l10n::t_("Unit {name} is not loaded."),
-                &[("name", name)],
+                &[("name", &name)],
             )));
         }
-        let count = state.n_refs.entry(name.to_string()).or_insert(0);
+        let count = state.n_refs.entry(name.clone()).or_insert(0);
         *count += 1;
         Ok(*count as u32)
     }
@@ -977,14 +994,15 @@ impl ManagerInterface {
     /// Returns the new reference count (or 0 if the unit was not loaded).
     async fn unref_unit(&self, name: &str) -> zbus::fdo::Result<u32> {
         debug!("D-Bus UnrefUnit: name={}", name);
+        let name = self.allocator.read().resolve_unit_name(name);
         let mut state = self.allocator.write();
-        if !state.units.contains_key(name) {
+        if !state.units.contains_key(&name) {
             return Err(zbus::fdo::Error::Failed(l10n::fmt(
                 l10n::t_("Unit {name} is not loaded."),
-                &[("name", name)],
+                &[("name", &name)],
             )));
         }
-        let count = state.n_refs.entry(name.to_string()).or_insert(0);
+        let count = state.n_refs.entry(name.clone()).or_insert(0);
         if *count > 0 {
             *count -= 1;
         }
@@ -1349,14 +1367,17 @@ impl ManagerInterface {
 
 /// Synchronously load a unit into the allocator state (for use from blocking tasks).
 pub(crate) fn load_unit_sync(allocator: &AllocatorHandle, name: &str) -> Result<()> {
-    // Load the unit from disk, instantiating a template (e.g. `getty@.service`
-    // → `getty@tty3.service`) when no exact file exists.
-    let unit = crate::unit::loader::load_unit_flexible(name)?;
+    // Resolve known aliases first; the on-disk loader also canonicalises
+    // symlink aliases, so the returned unit carries the canonical name.
+    let requested = allocator.read().resolve_unit_name(name);
+    let unit = crate::unit::loader::load_unit_flexible(&requested)?;
+    let canonical = unit.name.clone();
     let mut state = allocator.write();
-    state.units.insert(name.to_string(), unit);
+    state.units.insert(canonical.clone(), unit);
+    state.rebuild_alias_map();
     // Notify the D-Bus layer so it can register a per-unit object.
     if let Some(ref tx) = state.unit_loaded_tx {
-        let _ = tx.send(name.to_string());
+        let _ = tx.send(canonical);
     }
     Ok(())
 }

@@ -80,7 +80,8 @@ pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {
     }
 
     info!("Loaded {} unit(s) total", total);
-    inject_default_dependencies(allocator);
+    inject_default_dependencies(allocator.clone());
+    allocator.write().rebuild_alias_map();
     Ok(())
 }
 
@@ -102,7 +103,8 @@ where
         total += load_matching_units_from_dir(dir, allocator.clone(), &predicate).await?;
     }
 
-    inject_default_dependencies(allocator);
+    inject_default_dependencies(allocator.clone());
+    allocator.write().rebuild_alias_map();
 
     Ok(total)
 }
@@ -281,8 +283,43 @@ fn load_unit_flexible_in(dirs: &[String], name: &str) -> Result<UnitFile> {
     ))
 }
 
+/// Load a unit file from disk by name, resolving unit-file symlink aliases
+/// to their canonical unit name.
+///
+/// systemd treats a symlink such as `/etc/systemd/system/display-manager.service
+/// -> /usr/lib/systemd/system/lightdm.service` as an *alias* of the target
+/// unit, not a separate unit.  Loading the symlink under its own basename
+/// would create a duplicate unit that starts a second copy of the same
+/// program.  This helper therefore parses the file under the resolved target's
+/// basename and records the symlink's basename as an alias, exactly like the
+/// full discovery path (`systema-sysf`'s loader).  Masked units (symlinks to
+/// `/dev/null`) fall through to a plain parse, which fails harmlessly.
 fn load_unit_file(path: &Path) -> Result<UnitFile> {
-    super::parser::parse_unit_from_path(path)
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return super::parser::parse_unit_from_path(path);
+    };
+    if !meta.file_type().is_symlink() {
+        return super::parser::parse_unit_from_path(path);
+    }
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return super::parser::parse_unit_from_path(path);
+    };
+    let Some(canonical) = target.file_name().and_then(|n| n.to_str()) else {
+        return super::parser::parse_unit_from_path(path);
+    };
+    let alias = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    if canonical == alias {
+        return super::parser::parse_unit_from_path(path);
+    }
+    let mut unit = super::parser::parse_unit_from_path_as(path, canonical)?;
+    if !unit.install.alias.iter().any(|a| a == &alias) {
+        unit.install.alias.push(alias);
+    }
+    Ok(unit)
 }
 
 // --------------------------------------------------------------------------
@@ -1212,5 +1249,27 @@ mod tests {
         let unit = load_unit_flexible_in(&dirs, "getty@tty3.service").unwrap();
         let svc = unit.service.unwrap();
         assert!(svc.environment.contains(&"EXTRA=1".to_string()));
+    }
+
+    #[test]
+    fn load_flexible_resolves_symlink_alias_to_canonical_name() {
+        let dir = temp_dir("flexsym");
+        std::fs::write(
+            dir.join("lightdm.service"),
+            "[Unit]\nDescription=Display manager\n[Service]\nExecStart=/usr/sbin/lightdm\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.join("lightdm.service"), dir.join("display-manager.service"))
+            .unwrap();
+
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let unit = load_unit_flexible_in(&dirs, "display-manager.service").unwrap();
+        assert_eq!(unit.name, "lightdm.service");
+        assert_eq!(unit.unit.description, "Display manager");
+        assert!(unit
+            .install
+            .alias
+            .iter()
+            .any(|a| a == "display-manager.service"));
     }
 }

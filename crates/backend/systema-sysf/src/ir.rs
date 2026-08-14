@@ -258,6 +258,13 @@ pub struct UnitIR {
     /// The file path this unit was loaded from, if applicable.
     pub source_path: Option<String>,
 
+    /// Alias names that refer to this unit (e.g. `display-manager.service`
+    /// for `lightdm.service`).  Aliases come from `[Install] Alias=` lines
+    /// and from unit-file symlinks (a symlink's basename aliases the
+    /// canonical unit it points at).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+
     /// `[Unit] Slice=` — the parent slice this unit belongs to (e.g.
     /// `"system.slice"`).  `None` when the directive is absent or empty;
     /// consumers default to `system.slice` at apply time.
