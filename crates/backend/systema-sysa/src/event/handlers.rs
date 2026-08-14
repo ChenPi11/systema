@@ -366,6 +366,43 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
             }
         }
 
+    #[test]
+    fn replay_active_units_includes_the_root_slice() {
+        use crate::state::Allocator;
+        use sysa::proto::UnitResourceEvent;
+
+        let allocator = Allocator::handle();
+        // The synthesized root slice is already active; add a service.
+        allocator.write().unit_states.insert(
+            "demo.service".to_string(),
+            CachedUnitState {
+                active_state: "active".to_string(),
+                sub_state: "running".to_string(),
+                main_pid: 42,
+                invocation_id: String::new(),
+                active_enter_timestamp: 0,
+                inactive_enter_timestamp: 0,
+                extensions: HashMap::new(),
+            },
+        );
+        allocator
+            .write()
+            .units
+            .insert("demo.service".to_string(), crate::unit::types::UnitFile::new("demo.service"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        replay_active_units(&allocator, "system-r-1", &tx, true, &std::collections::HashSet::new());
+
+        let mut names = std::collections::HashSet::new();
+        while let Ok(buf) = rx.try_recv() {
+            let env = Envelope::decode(&buf[..]).expect("envelope decodes");
+            let event = UnitResourceEvent::decode(env.payload.as_slice()).expect("event decodes");
+            names.insert(event.unit_name);
+        }
+        assert!(names.contains("-.slice"), "root slice replayed: {names:?}");
+        assert!(names.contains("demo.service"), "service replayed: {names:?}");
+    }
+
     fn status(active: &str, last_exit_code: Option<i32>) -> UnitStatus {
         let mut extensions = HashMap::new();
         if let Some(code) = last_exit_code {

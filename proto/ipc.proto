@@ -451,14 +451,15 @@ message UnitCgroupMetrics {
     // e.g. "MemoryCurrent", "CPUUsageNSec", "TasksCurrent".  System A
     // never interprets the values; it only relays them.
     map<string, uint64> metrics = 4;
-    // Processes directly in the unit's cgroup (for Unit.GetProcesses).
+    // Processes in the unit's cgroup subtree (for Unit.GetProcesses and
+    // Manager.GetUnitProcesses), each tagged with its subpath.
     repeated CgroupProcess processes = 5;
 }
 
 // One process inside a unit's cgroup.
 message CgroupProcess {
     // cgroup subpath relative to the unit's own cgroup ("" = the unit's
-    // own cgroup; unused while only direct processes are sampled).
+    // own cgroup, e.g. "system.slice/sshd.service").
     string subpath = 1;
     uint32 pid = 2;
     // Process comm (from /proc/<pid>/comm), may be empty.

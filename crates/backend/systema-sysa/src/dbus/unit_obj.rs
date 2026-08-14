@@ -269,7 +269,9 @@ impl UnitObject {
 
     #[zbus(property)]
     fn perpetual(&self) -> bool {
-        false
+        // The root slice is a special unit that can never be stopped or
+        // unloaded, exactly like systemd's special units.
+        self.unit_name == crate::state::ROOT_SLICE_NAME
     }
 
     #[zbus(property)]

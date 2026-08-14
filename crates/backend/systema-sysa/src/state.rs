@@ -19,7 +19,13 @@ use uuid::Uuid;
 
 use systema_sysf::ir::UnitIR;
 
-use crate::unit::types::{UnitFile, UnitKind};
+use crate::unit::types::{SliceSection, UnitFile, UnitKind};
+
+/// systemd's root slice unit name (`-.slice`).
+///
+/// Like other special units it is perpetual: it always exists in memory and
+/// is always `active`, wrapping every other unit's cgroup at `/`.
+pub const ROOT_SLICE_NAME: &str = "-.slice";
 
 /// Snapshot of a unit's runtime state, kept up-to-date via `method.result`
 /// responses and `unit.state_update` push events.  Read synchronously by
@@ -363,7 +369,7 @@ pub struct AllocatorState {
 
 impl AllocatorState {
     pub fn new() -> Self {
-        AllocatorState {
+        let mut state = AllocatorState {
             units: HashMap::new(),
             aliases: HashMap::new(),
             desired: HashMap::new(),
@@ -383,7 +389,47 @@ impl AllocatorState {
             unit_states: HashMap::new(),
             unit_owners: HashMap::new(),
             cgroup_metrics: HashMap::new(),
+        };
+        state.ensure_root_slice();
+        state
+    }
+
+    /// Synthesise systemd's implicit root slice (`-.slice`).
+    ///
+    /// systemd keeps `-.slice` as a perpetual special unit that is always
+    /// loaded and always `active` (`unit_load`/`unit_start` never touch it).
+    /// The allocator mirrors that by creating it up front and marking it
+    /// active so that D-Bus lookups (`GetUnit("-.slice")`), per-unit D-Bus
+    /// objects, and the System R active-unit replay all see it — without it,
+    /// `systemctl status` fails on the missing `_2d_2eslice` object and the
+    /// overview's cgroup tree is empty.
+    fn ensure_root_slice(&mut self) {
+        if self.units.contains_key(ROOT_SLICE_NAME) {
+            return;
         }
+        let mut unit = UnitFile::new(ROOT_SLICE_NAME);
+        unit.unit.description = "Root Slice".to_string();
+        unit.slice = Some(SliceSection::default());
+        self.units.insert(ROOT_SLICE_NAME.to_string(), unit);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        self.unit_states.insert(
+            ROOT_SLICE_NAME.to_string(),
+            CachedUnitState {
+                active_state: "active".to_string(),
+                sub_state: "active".to_string(),
+                main_pid: 0,
+                invocation_id: generate_invocation_id(),
+                active_enter_timestamp: now,
+                inactive_enter_timestamp: 0,
+                extensions: HashMap::new(),
+            },
+        );
+        self.desired
+            .insert(ROOT_SLICE_NAME.to_string(), DesiredState::Active);
     }
 
     /// Commit the staging area identified by the (uid, name) pair into the
@@ -1094,6 +1140,40 @@ mod tests {
         let tmp = state.units.get("tmp.mount").unwrap();
         assert_eq!(tmp.kind, UnitKind::Mount);
         assert_eq!(tmp.mount.as_ref().unwrap().where_, "/tmp");
+    }
+
+    #[test]
+    fn root_slice_always_loaded_and_active() {
+        let state = AllocatorState::new();
+        let unit = state
+            .units
+            .get(ROOT_SLICE_NAME)
+            .expect("root slice is synthesized");
+        assert_eq!(unit.kind, UnitKind::Slice);
+        assert_eq!(unit.unit.description, "Root Slice");
+        let cached = state
+            .unit_states
+            .get(ROOT_SLICE_NAME)
+            .expect("root slice runtime state");
+        assert_eq!(cached.active_state, "active");
+        assert_eq!(cached.sub_state, "active");
+        assert!(cached.active_enter_timestamp > 0);
+        assert_eq!(
+            state.desired.get(ROOT_SLICE_NAME),
+            Some(&DesiredState::Active)
+        );
+    }
+
+    #[test]
+    fn root_slice_survives_commits() {
+        let mut state = AllocatorState::new();
+        stage(&mut state, 7, vec![mount_ir("tmp.mount", "/tmp")]);
+        state.commit_staging(7, "test").unwrap();
+        assert!(state.units.contains_key(ROOT_SLICE_NAME));
+        assert_eq!(
+            state.unit_states.get(ROOT_SLICE_NAME).unwrap().active_state,
+            "active"
+        );
     }
 
     #[test]

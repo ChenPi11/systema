@@ -304,27 +304,53 @@ fn collect_io_stat(dir: &Path, metrics: &mut HashMap<String, u64>) {
     metrics.insert("IOWriteOperations".to_string(), write_ops);
 }
 
-/// Read the PIDs directly in `dir`'s `cgroup.procs` and resolve their comm.
+/// Read the PIDs in `dir`'s `cgroup.procs` and resolve their comm, walking
+/// into every descendant cgroup so `systemctl status` can render the whole
+/// subtree.  Each process carries its subpath relative to `dir` (`""` for
+/// processes directly in `dir`, e.g. `system.slice/sshd.service`).
 fn read_processes(dir: &Path) -> Vec<CgroupProcess> {
-    let Ok(s) = read_file(&dir.join("cgroup.procs")) else {
-        return Vec::new();
-    };
     let mut processes = Vec::new();
-    for line in s.lines() {
-        let Ok(pid) = line.trim().parse::<u32>() else {
+    collect_processes(dir, "", &mut processes);
+    processes
+}
+
+/// Recursive half of [`read_processes`]: read `dir`'s own `cgroup.procs`,
+/// then descend into every child cgroup directory.
+fn collect_processes(dir: &Path, subpath: &str, out: &mut Vec<CgroupProcess>) {
+    if let Ok(s) = read_file(&dir.join("cgroup.procs")) {
+        for line in s.lines() {
+            let Ok(pid) = line.trim().parse::<u32>() else {
+                continue;
+            };
+            let name = fs::read_to_string(format!("/proc/{pid}/comm"))
+                .ok()
+                .map(|c| c.trim().to_string())
+                .unwrap_or_default();
+            out.push(CgroupProcess {
+                subpath: subpath.to_string(),
+                pid,
+                name,
+            });
+        }
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
-        let name = fs::read_to_string(format!("/proc/{pid}/comm"))
-            .ok()
-            .map(|c| c.trim().to_string())
-            .unwrap_or_default();
-        processes.push(CgroupProcess {
-            subpath: String::new(),
-            pid,
-            name,
-        });
+        let child_subpath = if subpath.is_empty() {
+            name.clone()
+        } else {
+            format!("{subpath}/{name}")
+        };
+        collect_processes(&path, &child_subpath, out);
     }
-    processes
 }
 
 fn read_file(path: &Path) -> std::io::Result<String> {
@@ -452,6 +478,10 @@ impl ResourceController for CgroupV2Controller {
             return CgroupMetrics::default();
         }
 
+        // Processes from the whole subtree (direct + every descendant),
+        // each tagged with its subpath relative to this cgroup.
+        let processes = read_processes(&full);
+
         let mut metrics = HashMap::new();
         if let Some(v) = read_number(&full.join("memory.current")) {
             metrics.insert("MemoryCurrent".to_string(), v);
@@ -494,7 +524,6 @@ impl ResourceController for CgroupV2Controller {
             }
         };
         let control_group_id = fs::metadata(&full).map(|m| m.ino()).unwrap_or(0);
-        let processes = read_processes(&full);
 
         CgroupMetrics {
             control_group,
@@ -554,6 +583,27 @@ mod tests {
         // The real detection path is filesystem dependent; this exercises the
         // new() constructor only.
         let _ = CgroupV2Controller::new();
+    }
+
+    #[test]
+    fn read_processes_walks_subtree() {
+        let root = std::env::temp_dir().join(format!("sysr-procs-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub.service/deep.scope")).unwrap();
+        let me = std::process::id();
+        std::fs::write(root.join("cgroup.procs"), format!("{me}\n")).unwrap();
+        std::fs::write(root.join("sub.service/cgroup.procs"), format!("{me}\n")).unwrap();
+        std::fs::write(root.join("sub.service/deep.scope/cgroup.procs"), format!("{me}\n"))
+            .unwrap();
+        // A pseudo-file sibling must not be mistaken for a child cgroup.
+        std::fs::write(root.join("memory.current"), "1\n").unwrap();
+
+        let procs = read_processes(&root);
+        let mut subs: Vec<&str> = procs.iter().map(|p| p.subpath.as_str()).collect();
+        subs.sort();
+        assert_eq!(subs, vec!["", "sub.service", "sub.service/deep.scope"]);
+        assert!(procs.iter().all(|p| p.pid == me));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

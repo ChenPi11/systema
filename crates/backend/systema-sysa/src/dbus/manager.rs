@@ -896,8 +896,10 @@ impl ManagerInterface {
     }
 
     /// Return the processes currently running under a unit's control group.
-    /// Each tuple is (cgroup_path, pid, command_line).  Served from the
-    /// `cgroup.metrics` cache pushed by System R.
+    /// Each tuple is (cgroup_path, pid, command_line), where `cgroup_path` is
+    /// each process's own full path (the unit's `control_group` joined with
+    /// its subpath), so `systemctl status` can rebuild the subtree.  Served
+    /// from the `cgroup.metrics` cache pushed by System R.
     async fn get_unit_processes(
         &self,
         unit_name: &str,
@@ -907,11 +909,18 @@ impl ManagerInterface {
         let Some(metrics) = alloc.cgroup_metrics.get(unit_name) else {
             return Ok(Vec::new());
         };
-        let cgroup_path = metrics.control_group.clone();
+        let cgroup_path = metrics.control_group.trim_end_matches('/');
         Ok(metrics
             .processes
             .iter()
-            .map(|p| (cgroup_path.clone(), p.pid, p.name.clone()))
+            .map(|p| {
+                let full = if p.subpath.is_empty() {
+                    cgroup_path.to_string()
+                } else {
+                    format!("{}/{}", cgroup_path, p.subpath)
+                };
+                (full, p.pid, p.name.clone())
+            })
             .collect())
     }
 
@@ -1222,7 +1231,9 @@ impl ManagerInterface {
 
     #[zbus(property)]
     fn control_group(&self) -> &str {
-        ""
+        // The manager (PID 1) lives in the root slice, whose cgroup is the
+        // hierarchy root.
+        "/"
     }
 
     #[zbus(property)]

@@ -9,7 +9,8 @@ use crate::config::ResourceConfig;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CgroupProcess {
     /// cgroup subpath relative to the unit's own cgroup (`""` = the unit's
-    /// own cgroup).  Always empty while only direct processes are sampled.
+    /// own cgroup, e.g. `system.slice/sshd.service` for a process in a
+    /// descendant cgroup of the root slice).
     pub subpath: String,
     pub pid: u32,
     /// Process comm (from `/proc/<pid>/comm`); may be empty.
@@ -30,7 +31,7 @@ pub struct CgroupMetrics {
     pub control_group_id: u64,
     /// Runtime metrics keyed by systemd property name.
     pub metrics: HashMap<String, u64>,
-    /// Processes directly in the unit's cgroup.
+    /// Processes in the unit's cgroup subtree, each tagged with its subpath.
     pub processes: Vec<CgroupProcess>,
 }
 
