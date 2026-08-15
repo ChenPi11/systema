@@ -85,8 +85,7 @@ pub fn is_instance(name: &str) -> bool {
 /// Unescape the `\xNN` sequences used in escaped unit names
 /// (mirrors systemd's `unit_name_unescape`).  Used to expand the `%I`
 /// specifier, which is the instance name with escapes removed.
-pub fn unescape(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
+pub fn unescape(name: &str) -> String {    let mut out = String::with_capacity(name.len());
     let mut chars = name.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -122,6 +121,20 @@ pub fn unescape(name: &str) -> String {
         }
     }
     out
+}
+
+/// Parse the UID out of a per-user slice unit name (`user-<UID>.slice`).
+///
+/// Session scopes are created under `user-<UID>.slice` (via `Slice=`), which
+/// is how logind-style callers tie a login session to its user.  Returns
+/// `None` for anything that is not a `user-<digits>.slice` name.
+pub fn parse_user_slice_uid(slice_name: &str) -> Option<u32> {
+    let stem = slice_name.strip_suffix(".slice")?;
+    let uid_part = stem.strip_prefix("user-")?;
+    if uid_part.is_empty() {
+        return None;
+    }
+    uid_part.parse::<u32>().ok()
 }
 
 #[cfg(test)]
@@ -181,5 +194,21 @@ mod tests {
         assert_eq!(unescape("\\x20"), " ");
         assert_eq!(unescape("a\\x"), "a\\x");
         assert_eq!(unescape("a\\\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn user_slice_uid_parsing() {
+        assert_eq!(parse_user_slice_uid("user-1000.slice"), Some(1000));
+        assert_eq!(parse_user_slice_uid("user-0.slice"), Some(0));
+        assert_eq!(parse_user_slice_uid("user-2147483647.slice"), Some(2147483647));
+        // Not a user slice: plain slices, templates, malformed names.
+        assert_eq!(parse_user_slice_uid("system.slice"), None);
+        assert_eq!(parse_user_slice_uid("user.slice"), None);
+        assert_eq!(parse_user_slice_uid("user-.slice"), None);
+        assert_eq!(parse_user_slice_uid("user-abc.slice"), None);
+        assert_eq!(parse_user_slice_uid("user--1.slice"), None);
+        assert_eq!(parse_user_slice_uid("user-4294967295.slice"), Some(u32::MAX));
+        assert_eq!(parse_user_slice_uid("user-4294967296.slice"), None); // overflows u32
+        assert_eq!(parse_user_slice_uid("user-1000.service"), None);
     }
 }

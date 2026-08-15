@@ -21,8 +21,8 @@ use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
     AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope,
     EventSubscribe, EventUnsubscribe, MethodResult, PathFired, RegisterAck, RegisterUnits,
-    StagingAreaEntry, StagingQuery, StagingQueryResult, TimerFired, UnitRegistrationAck,
-    UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    StagingAreaEntry, StagingQuery, StagingQueryResult, TimerFired, UnitDefineResult,
+    UnitRegistrationAck, UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
@@ -240,6 +240,7 @@ async fn handle_worker_session(
             WorkerEntry {
                 worker_id: worker_id.clone(),
                 unit_types: unit_types.clone(),
+                supports_unit_define: reg.supports_unit_define,
                 envelope_tx,
             },
         );
@@ -365,6 +366,29 @@ async fn handle_worker_session(
                         } else {
                             warn!(
                                 "method.result from worker '{}' with unknown request_id {} — ignoring",
+                                worker_id_recv, qid
+                            );
+                        }
+                        continue;
+                    }
+
+                    if env.method == "unit.define_result" {
+                        let qid = env.request_id;
+                        let result = match UnitDefineResult::decode(env.payload.as_slice()) {
+                            Ok(r) => r,
+                            Err(e) => UnitDefineResult {
+                                success: false,
+                                error: format!("decode failed: {e}"),
+                                units_json: vec![],
+                            },
+                        };
+                        let mut state = alloc_for_recv.write();
+                        if let Some(tx) = state.unit_define_txs.remove(&qid) {
+                            let _ = tx.send(result);
+                        } else {
+                            drop(state);
+                            debug!(
+                                "unit.define_result from worker '{}' with unknown request_id {} — ignoring",
                                 worker_id_recv, qid
                             );
                         }
@@ -1312,6 +1336,30 @@ async fn handle_state_update(
 
         // Notify in-process subscribers on incremental transitions only.
         if !update.full_snapshot {
+            // Login-session accounting: keep the per-UID session set of
+            // `session-*.scope` units (those whose `Slice=` is a
+            // `user-<UID>.slice`) in sync with the reported scope state, and
+            // forward the UID's new session count to System R so each user's
+            // `user-<UID>.slice` follows its sessions.
+            let slice = allocator
+                .read()
+                .units
+                .get(&status.unit_name)
+                .map(|u| u.unit.slice.clone())
+                .unwrap_or_default();
+            let forwarded = {
+                let mut state = allocator.write();
+                crate::state::track_session(
+                    &mut state.user_sessions,
+                    &status.unit_name,
+                    &slice,
+                    status.active_state == "active",
+                )
+            };
+            if let Some((uid, count)) = forwarded {
+                send_user_session_update(allocator.clone(), uid, count).await;
+            }
+
             let mut status_buf = Vec::new();
             let _ = status.encode(&mut status_buf);
             dispatched.push(Event {
@@ -1360,5 +1408,51 @@ async fn handle_state_update(
     for ev in dispatched {
         let bus = allocator.read().event_bus.clone();
         bus.read().await.dispatch(&ev).await;
+    }
+}
+
+/// The System R worker owns the cgroup hierarchy for user slices.
+const SYSTEM_R_WORKER_ID: &str = "system-r-1";
+
+/// Forward a user's absolute login-session count to System R
+/// (`user.sessions`), which creates or releases the user's `user-<UID>.slice`
+/// on the 0 ↔ N transitions.  Fire-and-forget: a missing or disconnected
+/// System R is only logged.
+async fn send_user_session_update(allocator: AllocatorHandle, uid: u32, count: usize) {
+    let env = match make_envelope(
+        next_request_id(),
+        "system-a",
+        SYSTEM_R_WORKER_ID,
+        "user.sessions",
+        sysa::proto::UserSessionEvent {
+            uid,
+            sessions: count as u32,
+        },
+    ) {
+        Ok(env) => env,
+        Err(e) => {
+            warn!("Failed to build user.sessions for uid {uid}: {e}");
+            return;
+        }
+    };
+    let mut buf = bytes::BytesMut::new();
+    if env.encode(&mut buf).is_err() {
+        warn!("Failed to encode user.sessions for uid {uid}");
+        return;
+    }
+    let worker_tx = {
+        let state = allocator.read();
+        state
+            .workers
+            .get(SYSTEM_R_WORKER_ID)
+            .map(|w| w.envelope_tx.clone())
+    };
+    match worker_tx {
+        Some(tx) => {
+            if tx.send(buf.freeze()).await.is_err() {
+                warn!("Failed to send user.sessions to '{SYSTEM_R_WORKER_ID}'");
+            }
+        }
+        None => debug!("System R not connected; user.sessions for uid {uid} dropped"),
     }
 }

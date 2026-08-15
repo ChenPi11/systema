@@ -264,6 +264,49 @@ pub fn load_unit_flexible(name: &str) -> Result<UnitFile> {
     load_unit_flexible_in(&sysa::paths::instance().unit_search_paths, name)
 }
 
+/// Ensure a unit is loaded from disk, if it exists on disk.
+///
+/// Returns `Ok(true)` when a unit file (or a template to instantiate
+/// `name` from) was found and inserted into the allocator, and `Ok(false)`
+/// when `name` has no on-disk definition — a dynamic unit that only a
+/// worker can define.  The pre-plan scan of the `unit.define` protocol
+/// uses this to keep static units on System A's own loader
+/// (docs/user-slice-todo.md, 未决问题 2) instead of asking workers.
+pub async fn ensure_loaded_from_disk(allocator: AllocatorHandle, name: &str) -> Result<bool> {
+    let dirs = sysa::paths::instance().unit_search_paths.clone();
+    ensure_loaded_from_disk_in(allocator, &dirs, name).await
+}
+
+/// [`ensure_loaded_from_disk`] over an explicit search-path list (testable
+/// without touching the global path configuration).
+pub async fn ensure_loaded_from_disk_in(
+    allocator: AllocatorHandle,
+    dirs: &[String],
+    name: &str,
+) -> Result<bool> {
+    let allocator = allocator.clone();
+    let dirs = dirs.to_vec();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let requested = allocator.read().resolve_unit_name(&name);
+        let unit = match load_unit_flexible_in(&dirs, &requested) {
+            Ok(unit) => unit,
+            Err(_) => return Ok(false),
+        };
+        let canonical = unit.name.clone();
+        let mut state = allocator.write();
+        state.units.insert(canonical.clone(), unit);
+        state.rebuild_alias_map();
+        // Notify the D-Bus layer so it can register a per-unit object,
+        // mirroring the other on-demand load paths.
+        if let Some(ref tx) = state.unit_loaded_tx {
+            let _ = tx.send(canonical);
+        }
+        Ok(true)
+    })
+    .await?
+}
+
 /// [`load_unit_flexible`] over an explicit search-path list (testable
 /// without touching the global path configuration).
 fn load_unit_flexible_in(dirs: &[String], name: &str) -> Result<UnitFile> {
@@ -1256,6 +1299,47 @@ mod tests {
         let dirs = vec![dir.to_string_lossy().into_owned()];
         assert!(load_unit_flexible_in(&dirs, "nonexistent.service").is_err());
         assert!(load_unit_flexible_in(&dirs, "getty@tty9.service").is_err());
+    }
+
+    // ensure_loaded_from_disk: the pre-scan keeps static units on System
+    // A's own loader; only units with no on-disk definition reach
+    // unit.define (docs/user-slice-todo.md 未决问题 2).
+
+    #[tokio::test]
+    async fn ensure_loaded_from_disk_loads_existing_units() {
+        let dir = temp_dir("ensure");
+        std::fs::write(
+            dir.join("hello.service"),
+            "[Unit]\nDescription=Hello\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("getty@.service"),
+            "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %i\n",
+        )
+        .unwrap();
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let alloc = Allocator::handle();
+        let state = alloc.read();
+        assert!(!state.units.contains_key("hello.service"));
+        assert!(!state.units.contains_key("getty@tty3.service"));
+        drop(state);
+
+        assert!(ensure_loaded_from_disk_in(alloc.clone(), &dirs, "hello.service")
+            .await
+            .expect("exact file must load"));
+        assert!(ensure_loaded_from_disk_in(alloc.clone(), &dirs, "getty@tty3.service")
+            .await
+            .expect("template instance must load"));
+        assert!(!ensure_loaded_from_disk_in(alloc.clone(), &dirs, "nope.slice")
+            .await
+            .expect("missing unit reports false"));
+
+        let state = alloc.read();
+        assert!(state.units.contains_key("hello.service"));
+        assert_eq!(state.units["hello.service"].unit.description, "Hello");
+        assert!(state.units.contains_key("getty@tty3.service"));
+        assert!(!state.units.contains_key("nope.slice"));
     }
 
     #[test]

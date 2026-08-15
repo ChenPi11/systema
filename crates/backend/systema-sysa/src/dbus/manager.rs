@@ -151,11 +151,14 @@ fn transient_unit_from_properties(
     }
 
     // `Slice=` — scopes/slices live under a slice; mirror the service
-    // loader's `Requires=` + `After=` edge on the parent slice.
+    // loader's `Requires=` + `After=` edge on the parent slice and record
+    // the slice on the unit so job dispatch (ScopeConfig.slice, resource
+    // events) places the unit in the right cgroup.
     if let Some(slice) = get_prop_str(properties, "Slice") {
         if !slice.is_empty() && slice != "root.slice" {
             uf.unit.requires.insert(slice.clone());
-            uf.unit.after.insert(slice);
+            uf.unit.after.insert(slice.clone());
+            uf.unit.slice = slice;
         }
     }
 
@@ -211,6 +214,119 @@ fn get_prop_strs(properties: &[(String, zvariant::OwnedValue)], key: &str) -> Op
 fn get_prop_u32s(properties: &[(String, zvariant::OwnedValue)], key: &str) -> Option<Vec<u32>> {
     let value = &properties.iter().find(|(k, _)| k == key)?.1;
     Vec::<u32>::try_from(value.try_clone().ok()?).ok()
+}
+
+fn prop_u64(value: &zvariant::OwnedValue) -> Option<u64> {
+    u64::try_from(value.try_clone().ok()?).ok()
+}
+
+fn prop_str(value: &zvariant::OwnedValue) -> Option<String> {
+    String::try_from(value.try_clone().ok()?).ok()
+}
+
+/// Store a limit that arrives either as raw bytes (`t`, logind) or as a
+/// unit-file-format string (`"1G"`, `"infinity"`) — the representation
+/// ResourceControl uses is the string form.
+fn set_byte_or_string(dst: &mut String, value: &zvariant::OwnedValue) {
+    if let Some(v) = prop_u64(value) {
+        *dst = v.to_string();
+    } else if let Some(s) = prop_str(value) {
+        *dst = s;
+    }
+}
+
+/// Apply one resource-control property onto a runtime `ResourceControl`.
+///
+/// Mirrors systemd's `bus_set_unit_properties` for the directives logind's
+/// `user_update_slice` (`src/login/logind-user.c`) sends to
+/// `user-<UID>.slice`: byte-based memory limits arrive as `t`, quotas in
+/// µs of CPU time per second (`CPUQuotaPerSecUSec`, 1000000 = 100% of one
+/// CPU), weights and TasksMax as `t`.  Accounting switches are implicit in
+/// System A's model and accepted for compatibility.  Returns whether the
+/// property was recognized; unknown properties are ignored, matching the
+/// convention of the transient-unit path.
+fn apply_resource_property(
+    rc: &mut crate::unit::types::ResourceControl,
+    key: &str,
+    value: &zvariant::OwnedValue,
+) -> bool {
+    match key {
+        "MemoryAccounting" | "CPUAccounting" | "TasksAccounting" | "MemoryPressureAccounting"
+        | "OOMPolicy" | "MemoryPressureThresholdUSec" | "Delegate" => true,
+        "MemoryMin" => {
+            set_byte_or_string(&mut rc.memory_min, value);
+            true
+        }
+        "MemoryLow" => {
+            set_byte_or_string(&mut rc.memory_low, value);
+            true
+        }
+        "MemoryHigh" => {
+            set_byte_or_string(&mut rc.memory_high, value);
+            true
+        }
+        "MemoryMax" => {
+            set_byte_or_string(&mut rc.memory_max, value);
+            true
+        }
+        "MemorySwapMax" => {
+            set_byte_or_string(&mut rc.memory_swap_max, value);
+            true
+        }
+        "CPUWeight" => {
+            if let Some(v) = prop_u64(value) {
+                rc.cpu_weight = v.min(u32::MAX as u64) as u32;
+            }
+            true
+        }
+        "StartupCPUWeight" => {
+            if let Some(v) = prop_u64(value) {
+                rc.startup_cpu_weight = v.min(u32::MAX as u64) as u32;
+            }
+            true
+        }
+        "CPUQuotaPerSecUSec" => {
+            if let Some(us) = prop_u64(value) {
+                rc.cpu_quota = format!("{}%", us / 10_000);
+            }
+            true
+        }
+        "CPUQuotaPeriodUSec" | "CPUQuotaPeriodSec" => {
+            set_byte_or_string(&mut rc.cpu_quota_period, value);
+            true
+        }
+        "IOWeight" => {
+            if let Some(v) = prop_u64(value) {
+                rc.io_weight = v.min(u32::MAX as u64) as u32;
+            }
+            true
+        }
+        "TasksMax" => {
+            if let Some(v) = prop_u64(value) {
+                rc.tasks_max = v.min(u32::MAX as u64) as u32;
+            } else if let Some(s) = prop_str(value) {
+                if s == "infinity" {
+                    rc.tasks_max = u32::MAX;
+                } else if let Ok(v) = s.parse::<u64>() {
+                    rc.tasks_max = v.min(u32::MAX as u64) as u32;
+                }
+            }
+            true
+        }
+        "AllowedCPUs" => {
+            if let Some(s) = prop_str(value) {
+                rc.allowed_cpus = s;
+            }
+            true
+        }
+        "AllowedMemoryNodes" => {
+            if let Some(s) = prop_str(value) {
+                rc.allowed_memory_nodes = s;
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -470,6 +586,22 @@ impl ManagerInterface {
         result: String,
     ) -> zbus::Result<()>;
 
+    /// Emitted when a unit is removed from memory (`UnitRemoved`).
+    /// logind matches this signal to drop its per-user runtime references.
+    /// The `job` path is empty when the removal is not job-driven.
+    #[zbus(signal)]
+    pub async fn unit_removed(
+        ctxt: &zbus::SignalContext<'_>,
+        unit: String,
+        job: OwnedObjectPath,
+    ) -> zbus::Result<()>;
+
+    /// Emitted around unit-file reloads (`Reloading`), before and after.
+    /// No arguments, matching systemd ≥ v240; logind's `match_reloading`
+    /// uses it to hold off unit lookups during the reload.
+    #[zbus(signal)]
+    pub async fn reloading(ctxt: &zbus::SignalContext<'_>) -> zbus::Result<()>;
+
     // ------------------------------------------------------------------
     // Unit lookup methods
     // ------------------------------------------------------------------
@@ -489,6 +621,144 @@ impl ManagerInterface {
                 &[("name", &name)],
             )))
         }
+    }
+
+    /// Get the unit that contains the given PID.
+    ///
+    /// Mirrors systemd's `GetUnitByPID`: scopes know the PIDs they wrap
+    /// (`CachedUnitState.pids`), services their main PID.  logind uses it
+    /// to map a session leader PID back to its unit.
+    async fn get_unit_by_pid(&self, pid: u32) -> zbus::fdo::Result<OwnedObjectPath> {
+        debug!("D-Bus GetUnitByPID: pid={}", pid);
+        let name = self
+            .allocator
+            .read()
+            .unit_states
+            .iter()
+            .find(|(_, c)| c.main_pid == pid || c.pids.contains(&pid))
+            .map(|(n, _)| n.clone());
+        match name {
+            Some(name) => Ok(unit_object_path(&name)),
+            None => Err(zbus::fdo::Error::UnknownObject(l10n::fmt(
+                l10n::t_("No unit found for PID {pid}."),
+                &[("pid", &pid.to_string())],
+            ))),
+        }
+    }
+
+    /// Get the unit that owns the process referred to by a pidfd.
+    ///
+    /// The file descriptor is passed over D-Bus (type `h`); it is resolved
+    /// to a PID and then handled like
+    /// [`get_unit_by_pid`](Self::get_unit_by_pid).  There is no
+    /// `pidfd_getpid` syscall; a pidfd's `Pid:` entry in
+    /// `/proc/self/fdinfo` (kernel ≥ 5.3) carries the target PID, and this
+    /// also rejects descriptors that are not pidfds.
+    async fn get_unit_by_pidfd(&self, fd: zvariant::OwnedFd) -> zbus::fdo::Result<OwnedObjectPath> {
+        use std::os::fd::AsRawFd;
+        debug!("D-Bus GetUnitByPIDFD");
+        let raw = fd.as_raw_fd();
+        let info = match std::fs::read_to_string(format!("/proc/self/fdinfo/{raw}")) {
+            Ok(info) => info,
+            Err(e) => {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "cannot read fdinfo for fd {raw}: {e}"
+                )))
+            }
+        };
+        let pid = info
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:").map(str::trim))
+            .and_then(|pid| pid.parse::<u32>().ok());
+        let Some(pid) = pid else {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "fd {raw} is not a pidfd (no Pid: entry in fdinfo)"
+            )));
+        };
+        self.get_unit_by_pid(pid).await
+    }
+
+    /// Set runtime properties of a unit (`systemctl set-property`).
+    ///
+    /// Only resource-control directives are honoured — the properties
+    /// logind's `user_update_slice` applies to `user-<UID>.slice` on every
+    /// login (memory limits, CPU weight/quota, TasksMax).  The updated
+    /// limits are committed to the allocator and a fresh `UnitResourceEvent`
+    /// is pushed to System R so the cgroup limits converge immediately.
+    async fn set_unit_properties(
+        &self,
+        name: &str,
+        mode: &str,
+        properties: Vec<(String, zvariant::OwnedValue)>,
+    ) -> zbus::fdo::Result<()> {
+        info!("D-Bus SetUnitProperties: {} (mode={})", name, mode);
+        let mode = parse_job_mode(mode)?;
+        if mode != JobMode::Replace {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "SetUnitProperties only supports job mode 'replace' (got {mode:?})"
+            )));
+        }
+        let name = self.allocator.read().resolve_unit_name(name);
+        {
+            let mut state = self.allocator.write();
+            let Some(unit) = state.units.get_mut(&name) else {
+                return Err(zbus::fdo::Error::UnknownObject(l10n::fmt(
+                    l10n::t_("Unit {name} is not loaded."),
+                    &[("name", &name)],
+                )));
+            };
+            let rc = match unit.kind {
+                UnitKind::Service => unit.service.as_mut().map(|s| &mut s.rc),
+                UnitKind::Slice => unit.slice.as_mut().map(|s| &mut s.rc),
+                UnitKind::Scope => unit.scope.as_mut().map(|s| &mut s.rc),
+                _ => None,
+            };
+            let Some(rc) = rc else {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Unit {name} has no resource-control section."
+                )));
+            };
+            for (key, value) in &properties {
+                apply_resource_property(rc, key, value);
+            }
+        }
+        // Push the updated limits to the owning worker through the same
+        // event path as state transitions (the WorkerEventForwarder
+        // re-projects the unit's ResourceControl into a UnitResourceEvent).
+        self.push_resource_update(&name).await;
+        Ok(())
+    }
+
+    /// Re-publish the current runtime state of `name` on the event bus so
+    /// subscribed workers (System R) apply the updated resource limits.
+    async fn push_resource_update(&self, name: &str) {
+        let (event, bus) = {
+            let state = self.allocator.read();
+            let Some(cached) = state.unit_states.get(name) else {
+                debug!("SetUnitProperties: {} has no runtime state yet; limits cached in unit", name);
+                return;
+            };
+            let status = sysa::controller::UnitStatus {
+                unit_name: name.to_string(),
+                active_state: cached.active_state.clone(),
+                sub_state: cached.sub_state.clone(),
+                main_pid: cached.main_pid,
+                invocation_id: cached.invocation_id.clone(),
+                extensions: cached.extensions.clone(),
+            };
+            let data = status.encode_to_vec();
+            (
+                sysa::event_bus::Event {
+                    topic: sysa::event_bus::EventTopic::UnitStateChange,
+                    unit_name: name.to_string(),
+                    worker_id: "system-a".to_string(),
+                    timestamp: tokio::time::Instant::now(),
+                    data: bytes::Bytes::from(data),
+                },
+                state.event_bus.clone(),
+            )
+        };
+        bus.read().await.dispatch(&event).await;
     }
 
     /// Load a unit (if not already loaded) and return its object path.
@@ -1095,7 +1365,11 @@ impl ManagerInterface {
     async fn reload(&self) -> zbus::fdo::Result<()> {
         info!("D-Bus Reload: reloading unit files");
         debug!("D-Bus Reload: triggering full unit file rescan");
+        // systemd emits Reloading twice (before and after the rescan);
+        // logind's match_reloading holds off unit lookups in between.
+        self.emit_reloading().await;
         let alloc = self.allocator.clone();
+        let conn = self.conn.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::unit::loader::load_default_units(alloc.clone()).await {
                 tracing::error!("Reload failed: {}", e);
@@ -1103,8 +1377,25 @@ impl ManagerInterface {
             // Ask every worker for a fresh full snapshot so the runtime
             // state cache reflects the reloaded unit set.
             crate::scheduler::request_all_worker_syncs(alloc).await;
+            if let Some(conn) = conn.get() {
+                if let Ok(signal_ctx) =
+                    zbus::SignalContext::new(conn, "/org/freedesktop/systemd1")
+                {
+                    let _ = ManagerInterface::reloading(&signal_ctx).await;
+                }
+            }
         });
         Ok(())
+    }
+
+    /// Emit the `Reloading` signal on the manager object (best effort).
+    async fn emit_reloading(&self) {
+        let Some(conn) = self.conn.get() else {
+            return;
+        };
+        if let Ok(signal_ctx) = zbus::SignalContext::new(conn, "/org/freedesktop/systemd1") {
+            let _ = ManagerInterface::reloading(&signal_ctx).await;
+        }
     }
 
     /// Reset the failed state of a unit.
@@ -1777,6 +2068,38 @@ mod tests {
     }
 
     #[test]
+    fn transient_scope_slice_is_recorded_on_unit() {
+        // logind-style session call: session scopes carry their user's
+        // `user-<UID>.slice` in `Slice=`, which must land on the unit so
+        // job dispatch (ScopeConfig.slice / resource events) places the
+        // scope in the right cgroup.
+        let p = props_with_slice("user-1000.slice");
+        let uf = transient_unit_from_properties("session-7.scope", &p, None);
+        assert_eq!(uf.unit.slice, "user-1000.slice");
+        assert!(uf.unit.after.contains("user-1000.slice"));
+        assert!(uf.unit.requires.contains("user-1000.slice"));
+    }
+
+    #[test]
+    fn transient_slices_do_not_self_slice() {
+        // A transient slice does not inherit itself as its slice.
+        let p = props_with_slice("root.slice");
+        let uf = transient_unit_from_properties("app.slice", &p, None);
+        assert!(uf.unit.slice.is_empty());
+        assert!(!uf.unit.after.contains("root.slice"));
+        assert!(!uf.unit.requires.contains("root.slice"));
+    }
+
+    /// `props()` with the `Slice=` entry replaced by `slice`.
+    fn props_with_slice(slice: &str) -> Vec<(String, zvariant::OwnedValue)> {
+        props()
+            .into_iter()
+            .filter(|(k, _)| k != "Slice")
+            .chain(std::iter::once(("Slice".to_string(), sv(slice))))
+            .collect()
+    }
+
+    #[test]
     fn transient_unit_defaults_without_properties() {
         let uf = transient_unit_from_properties("x.slice", &[], None);
         assert!(uf.transient);
@@ -1800,5 +2123,146 @@ mod tests {
         assert_eq!(get_prop_bool(&p, "Flag"), Some(true));
         assert_eq!(get_prop_strs(&p, "List"), Some(vec!["a".to_string(), "b".to_string()]));
         assert_eq!(get_prop_u32s(&p, "Pids"), Some(vec![1, 2]));
+    }
+
+    // =========================================================================
+    // SetUnitProperties / GetUnitByPID(FD) (M2)
+    // =========================================================================
+
+    fn tv(v: u64) -> zvariant::OwnedValue {
+        zvariant::OwnedValue::try_from(zvariant::Value::new(v)).unwrap()
+    }
+
+    fn manager_for_test(alloc: AllocatorHandle) -> ManagerInterface {
+        ManagerInterface {
+            allocator: alloc,
+            conn: Arc::new(once_cell::sync::OnceCell::new()),
+        }
+    }
+
+    #[test]
+    fn apply_resource_property_handles_logind_slice_limits() {
+        // The exact directive set logind's user_update_slice sends to
+        // `user-<UID>.slice` on every login (logind-user.c).
+        let mut rc = crate::unit::types::ResourceControl::default();
+        assert!(apply_resource_property(&mut rc, "MemoryAccounting", &bv(true)));
+        assert!(apply_resource_property(&mut rc, "CPUAccounting", &bv(true)));
+        assert!(apply_resource_property(&mut rc, "TasksAccounting", &bv(true)));
+        // Byte-based memory limits arrive as `t`.
+        assert!(apply_resource_property(&mut rc, "MemoryHigh", &tv(1 << 30)));
+        assert_eq!(rc.memory_high, "1073741824");
+        assert!(apply_resource_property(&mut rc, "MemoryMax", &tv(2 << 30)));
+        assert_eq!(rc.memory_max, "2147483648");
+        assert!(apply_resource_property(&mut rc, "MemorySwapMax", &sv("infinity")));
+        assert_eq!(rc.memory_swap_max, "infinity");
+        // CPU quota in µs of CPU time per second: 250000 → 25% of one CPU.
+        assert!(apply_resource_property(&mut rc, "CPUQuotaPerSecUSec", &tv(250_000)));
+        assert_eq!(rc.cpu_quota, "25%");
+        assert!(apply_resource_property(&mut rc, "CPUWeight", &tv(50)));
+        assert_eq!(rc.cpu_weight, 50);
+        assert!(apply_resource_property(&mut rc, "TasksMax", &tv(100)));
+        assert_eq!(rc.tasks_max, 100);
+        assert!(apply_resource_property(&mut rc, "TasksMax", &sv("infinity")));
+        assert_eq!(rc.tasks_max, u32::MAX);
+        assert!(apply_resource_property(&mut rc, "OOMPolicy", &sv("continue")));
+        assert!(apply_resource_property(&mut rc, "AllowedCPUs", &sv("0-1")));
+        assert_eq!(rc.allowed_cpus, "0-1");
+        // Unknown properties are ignored, like the transient path.
+        assert!(!apply_resource_property(&mut rc, "Bogus", &sv("x")));
+    }
+
+    #[tokio::test]
+    async fn set_unit_properties_updates_slice_resource_control() {
+        let alloc = Arc::new(parking_lot::RwLock::new(crate::state::AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            let mut uf = crate::unit::types::UnitFile::new("user-1000.slice");
+            uf.slice = Some(crate::unit::types::SliceSection::default());
+            state.units.insert("user-1000.slice".to_string(), uf);
+        }
+        let mgr = manager_for_test(alloc.clone());
+        mgr.set_unit_properties(
+            "user-1000.slice",
+            "replace",
+            vec![
+                ("MemoryMax".to_string(), tv(1 << 30)),
+                ("CPUQuotaPerSecUSec".to_string(), tv(500_000)),
+                ("TasksMax".to_string(), sv("infinity")),
+            ],
+        )
+        .await
+        .expect("replace mode with loaded slice applies");
+        let state = alloc.read();
+        let rc = &state.units["user-1000.slice"].slice.as_ref().unwrap().rc;
+        assert_eq!(rc.memory_max, "1073741824");
+        assert_eq!(rc.cpu_quota, "50%");
+        assert_eq!(rc.tasks_max, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn set_unit_properties_rejects_non_replace_mode_and_unknown_units() {
+        let alloc = Arc::new(parking_lot::RwLock::new(crate::state::AllocatorState::new()));
+        let mgr = manager_for_test(alloc.clone());
+        let err = mgr
+            .set_unit_properties("user-1000.slice", "fail", vec![])
+            .await
+            .expect_err("non-replace mode must be rejected");
+        assert!(err.to_string().contains("replace"), "{}", err);
+        let err = mgr
+            .set_unit_properties("user-1000.slice", "replace", vec![])
+            .await
+            .expect_err("unknown unit must fail");
+        assert!(err.to_string().contains("not loaded"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn get_unit_by_pid_finds_scope_pids_and_main_pid() {
+        let alloc = Arc::new(parking_lot::RwLock::new(crate::state::AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            state.unit_states.insert(
+                "session-1.scope".to_string(),
+                crate::state::CachedUnitState {
+                    pids: vec![42],
+                    ..Default::default()
+                },
+            );
+            state.unit_states.insert(
+                "nginx.service".to_string(),
+                crate::state::CachedUnitState {
+                    main_pid: 7,
+                    ..Default::default()
+                },
+            );
+        }
+        let mgr = manager_for_test(alloc);
+        let path = mgr.get_unit_by_pid(42).await.expect("scope pid resolves");
+        assert_eq!(path.as_str(), "/org/freedesktop/systemd1/unit/session_2d1_2escope");
+        let path = mgr.get_unit_by_pid(7).await.expect("main pid resolves");
+        assert_eq!(path.as_str(), "/org/freedesktop/systemd1/unit/nginx_2eservice");
+        assert!(mgr.get_unit_by_pid(9999).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_unit_by_pidfd_resolves_real_pidfd() {
+        use std::os::fd::FromRawFd;
+        // Open a pidfd for our own process (kernel ≥ 5.3).  When the
+        // environment lacks pidfd support the test is skipped.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+        if raw < 0 {
+            return;
+        }
+        let alloc = Arc::new(parking_lot::RwLock::new(crate::state::AllocatorState::new()));
+        alloc.write().unit_states.insert(
+            "session-1.scope".to_string(),
+            crate::state::CachedUnitState {
+                pids: vec![std::process::id()],
+                ..Default::default()
+            },
+        );
+        let mgr = manager_for_test(alloc);
+        let fd = zvariant::OwnedFd::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) });
+        let path = mgr.get_unit_by_pidfd(fd).await.expect("pidfd resolves");
+        assert_eq!(path.as_str(), "/org/freedesktop/systemd1/unit/session_2d1_2escope");
     }
 }

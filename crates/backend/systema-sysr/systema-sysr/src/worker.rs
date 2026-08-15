@@ -11,6 +11,11 @@
 //! entry (leaving the cgroup in place so sibling cgroups are never torn
 //! down).  All filesystem work is delegated to the controller so this module
 //! stays platform-neutral.
+//!
+//! User slices mirror systemd-logind: the static `user.slice` root is
+//! ensured when the worker comes up, and [`UserSessionEvent`]s carrying the
+//! absolute login-session count per UID create and release each user's
+//! `user-<UID>.slice` (nested under `user.slice`) as users log in and out.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -19,14 +24,20 @@ use std::time::Duration;
 use anyhow::Result;
 use systema_sysr_common::{
     CgroupMetrics, ResourceConfig, ResourceController, slice_cgroup_path, unit_cgroup_path,
+    user_slice_cgroup_path, user_slice_name, user_slice_root_path,
 };
 use sysa::controller::{UnitController, UnitStatus};
-use sysa::proto::{CgroupMetricsUpdate, CgroupProcess, UnitCgroupMetrics, UnitResourceEvent};
+use sysa::proto::{CgroupMetricsUpdate, CgroupProcess, UnitCgroupMetrics, UnitResourceEvent, UserSessionEvent};
 use sysa::worker_ipc::EventPublisher;
 use tracing::{debug, info, warn};
 
 /// The default parent slice for services that do not set `[Unit] Slice=`.
 pub const DEFAULT_SLICE: &str = "system.slice";
+
+/// The top-level container of all per-user slices.  Always present once
+/// System R is up (mirrors systemd's static `user.slice`); per-user slices
+/// `user-<UID>.slice` are created inside it as users log in.
+pub const USER_SLICE: &str = "user.slice";
 
 /// A unit whose cgroup System R manages.
 #[derive(Debug, Clone)]
@@ -49,6 +60,16 @@ pub fn new_registry() -> ResourceRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Shared map of uid → number of live login sessions for that user
+/// (systemd-logind semantics).  A positive count keeps the user's
+/// `user-<UID>.slice` alive; zero releases it.
+pub type UserSessionMap = Arc<Mutex<HashMap<u32, usize>>>;
+
+/// Create an empty user-session map.
+pub fn new_user_sessions() -> UserSessionMap {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 /// The System R worker: a [`sysa::controller::UnitController`] backed by a
 /// [`ResourceController`].  Resource control is applied from
 /// [`UnitResourceEvent`]s pushed by System A; direct method calls only
@@ -57,6 +78,7 @@ pub fn new_registry() -> ResourceRegistry {
 pub struct ResourceWorker {
     controller: Arc<dyn ResourceController>,
     registry: ResourceRegistry,
+    sessions: UserSessionMap,
     event_pub: EventPublisher,
 }
 
@@ -65,20 +87,26 @@ impl ResourceWorker {
     pub fn new(
         controller: Arc<dyn ResourceController>,
         registry: ResourceRegistry,
+        sessions: UserSessionMap,
         event_pub: EventPublisher,
     ) -> Self {
         ResourceWorker {
             controller,
             registry,
+            sessions,
             event_pub,
         }
     }
 
     /// Build a worker using the platform's default controller.
     /// Requires [`sysa::paths::init`] to have been called.
-    pub fn with_defaults(registry: ResourceRegistry, event_pub: EventPublisher) -> Self {
+    pub fn with_defaults(
+        registry: ResourceRegistry,
+        sessions: UserSessionMap,
+        event_pub: EventPublisher,
+    ) -> Self {
         let controller = systema_sysr_linux::linux_controller();
-        Self::new(controller, registry, event_pub)
+        Self::new(controller, registry, sessions, event_pub)
     }
 
     /// Whether resource control is actually enforced by the backend.
@@ -172,6 +200,124 @@ impl ResourceWorker {
     /// are never torn down.
     fn release_unit(&self, unit_name: &str) {
         self.registry.lock().unwrap().remove(unit_name);
+    }
+
+/// Apply a [`UserSessionEvent`] whose slice units were already committed to
+/// System A (see [`Self::handle_user_session_event`] for the semantics; this
+/// wrapper first makes sure System A knows the `user-<UID>.slice` unit, so
+/// the state published below is never reported for an unknown unit).
+pub async fn handle_user_session_event_registered(&self, event: &UserSessionEvent) {
+    let slice_name = user_slice_name(event.uid);
+    if let Err(e) = crate::register::commit_slice(
+        &slice_name,
+        &crate::register::user_slice_description(event.uid),
+    )
+    .await
+    {
+        warn!("Cannot register {slice_name} with System A: {e}");
+    }
+    self.handle_user_session_event(event);
+}
+
+/// Ensure the `user.slice` root cgroup exists (idempotent).  It is the
+/// container of every per-user slice and, like systemd's static
+/// `user.slice`, is present from the moment System R is up.
+    pub fn ensure_user_slice_root(&self) {
+        let path = user_slice_root_path();
+        if let Err(e) = self.controller.ensure(&path, &ResourceConfig::default()) {
+            warn!("Cannot prepare {path}: {e}");
+            return;
+        }
+        debug!("User slice root {path} is in place");
+    }
+
+/// The UIDs that currently have at least one live login session.
+pub fn active_user_slice_uids(&self) -> Vec<u32> {
+    self.sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, &n)| n > 0)
+        .map(|(&uid, _)| uid)
+        .collect()
+}
+
+/// Apply a [`UserSessionEvent`]: track the absolute number of live login
+/// sessions per UID and keep the user's `user-<UID>.slice` alive as long
+/// as at least one session is logged in (systemd-logind semantics).
+    ///
+    /// On the 0 → N transition the slice cgroup hierarchy is ensured and the
+    /// `user.slice` root plus the user's slice are reported active to System
+    /// A (so they become visible and manageable units); on the N → 0
+    /// transition both are released and the (empty) cgroup directories are
+    /// removed best-effort.  Best-effort overall: failures are logged, never
+    /// propagated.
+    pub fn handle_user_session_event(&self, event: &UserSessionEvent) {
+        let uid = event.uid;
+        let count = event.sessions as usize;
+        let slice_name = user_slice_name(uid);
+
+        let prev = {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.insert(uid, count)
+        };
+        let was_active = prev.is_some_and(|n| n > 0);
+
+        if count > 0 {
+            if !was_active {
+                info!("User {uid} logged in ({count} sessions) — creating {slice_name}");
+                self.ensure_user_slice_root();
+                if let Err(e) = self
+                    .controller
+                    .ensure(&user_slice_cgroup_path(uid), &ResourceConfig::default())
+                {
+                    warn!("Cannot prepare user slice for uid {uid}: {e}");
+                    return;
+                }
+                let root_path = user_slice_root_path();
+                self.registry.lock().unwrap().insert(
+                    USER_SLICE.to_string(),
+                    ManagedUnit {
+                        config: ResourceConfig::default(),
+                        cgroup_path: root_path,
+                        parent_slice: USER_SLICE.to_string(),
+                        main_pid: 0,
+                    },
+                );
+                self.registry.lock().unwrap().insert(
+                    slice_name.clone(),
+                    ManagedUnit {
+                        config: ResourceConfig::default(),
+                        cgroup_path: user_slice_cgroup_path(uid),
+                        parent_slice: USER_SLICE.to_string(),
+                        main_pid: 0,
+                    },
+                );
+                self.publish_state(USER_SLICE, true);
+                self.publish_state(&slice_name, true);
+            } else {
+                debug!("User {uid} sessions now {count}");
+            }
+        } else if was_active {
+            info!("User {uid} logged out — releasing {slice_name}");
+            self.sessions.lock().unwrap().remove(&uid);
+            self.release_unit(&slice_name);
+            if self.sessions.lock().unwrap().is_empty() {
+                self.release_unit(USER_SLICE);
+                self.publish_state(USER_SLICE, false);
+            }
+            self.publish_state(&slice_name, false);
+            // Tear the cgroup directories down best-effort.  A session
+            // scope or lingering process under the slice makes removal fail
+            // (NotEmpty); the empty directories are then simply left for
+            // the kernel cgroup reaper / a later login to reuse.
+            let uid_path = user_slice_cgroup_path(uid);
+            let manager_path = systema_sysr_common::user_manager_cgroup_path(uid);
+            let _ = self.controller.remove(&manager_path);
+            if let Err(e) = self.controller.remove(&uid_path) {
+                debug!("User slice {uid_path} kept in place: {e}");
+            }
+        }
     }
 
     /// Whether the unit is currently managed (authoritative for status under
@@ -365,6 +511,7 @@ mod tests {
         ResourceWorker::new(
             Arc::new(NoopController),
             new_registry(),
+            new_user_sessions(),
             dummy_publisher(),
         )
     }
@@ -506,5 +653,56 @@ mod tests {
         // The same snapshot returns: it must be treated as new again.
         let changed = diff_metrics(vec![sample_unit("a.service", 10)], &mut last);
         assert_eq!(changed.len(), 1);
+    }
+
+    fn session_event(uid: u32, sessions: u32) -> UserSessionEvent {
+        UserSessionEvent { uid, sessions }
+    }
+
+    #[tokio::test]
+    async fn first_session_creates_user_slices() {
+        let w = worker();
+        w.handle_user_session_event(&session_event(1000, 1));
+        let reg = w.registry.lock().unwrap();
+        assert!(reg.contains_key("user.slice"));
+        let user_slice = reg.get("user-1000.slice").cloned().unwrap();
+        assert_eq!(user_slice.cgroup_path, "/sys/fs/cgroup/user.slice/1000.slice");
+        assert_eq!(user_slice.parent_slice, "user.slice");
+        assert_eq!(*w.sessions.lock().unwrap().get(&1000).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn additional_sessions_keep_the_slice() {
+        let w = worker();
+        w.handle_user_session_event(&session_event(1000, 1));
+        w.handle_user_session_event(&session_event(1000, 3));
+        let reg = w.registry.lock().unwrap();
+        assert!(reg.contains_key("user.slice"));
+        assert!(reg.contains_key("user-1000.slice"));
+        assert_eq!(*w.sessions.lock().unwrap().get(&1000).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn last_session_releases_user_slices() {
+        let w = worker();
+        w.handle_user_session_event(&session_event(1000, 2));
+        w.handle_user_session_event(&session_event(1000, 0));
+        let reg = w.registry.lock().unwrap();
+        assert!(!reg.contains_key("user-1000.slice"));
+        // user.slice stays released once no user has sessions left.
+        assert!(!reg.contains_key("user.slice"));
+        assert!(!w.sessions.lock().unwrap().contains_key(&1000));
+    }
+
+    #[tokio::test]
+    async fn logout_of_one_user_keeps_others_slices_alive() {
+        let w = worker();
+        w.handle_user_session_event(&session_event(1000, 1));
+        w.handle_user_session_event(&session_event(2000, 1));
+        w.handle_user_session_event(&session_event(1000, 0));
+        let reg = w.registry.lock().unwrap();
+        assert!(!reg.contains_key("user-1000.slice"));
+        assert!(reg.contains_key("user-2000.slice"));
+        assert!(reg.contains_key("user.slice"));
     }
 }

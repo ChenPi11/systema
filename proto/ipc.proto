@@ -23,6 +23,11 @@ message WorkerRegistration {
     string worker_id = 1;
     // Unit types this worker manages, e.g. ["service"].
     repeated string unit_types = 2;
+    // True when this worker implements the `unit.define` protocol and can
+    // synthesize definitions for dynamic units of its types on request
+    // (System R: slice parent chains).  Workers without this flag are never
+    // asked for definitions.
+    bool supports_unit_define = 3;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -186,6 +191,26 @@ message UnitRegistrationAck {
     bool success = 1;
     string message = 2;
     uint32 unit_count = 3;
+}
+
+// Sent by System A to a worker (e.g. System R) to request the on-demand
+// definition of units that are referenced (e.g. via Requires=/Slice=) but
+// not loaded — the `unit.define` materialization protocol.  The worker that
+// owns the unit type synthesizes the definitions from its domain knowledge
+// (System R: slice parent chains) instead of the disk.
+message UnitDefineRequest {
+    // Unit names whose definitions are requested (e.g. "user-0.slice").
+    repeated string unit_names = 1;
+}
+
+// Reply to a UnitDefineRequest, echoed on the same request_id.
+message UnitDefineResult {
+    bool success = 1;
+    // Human-readable error message (empty on success).
+    string error = 2;
+    // JSON-serialized map of unit_id → UnitIR (same format as the finder
+    // staging area) with the synthesized definitions; empty on failure.
+    bytes units_json = 3;
 }
 
 // --- Staging area administration (root / systema-uid only) ---
@@ -477,6 +502,20 @@ message CgroupProcess {
 // processes themselves are left running.
 message ScopeAbandon {
     string unit_name = 1;
+}
+
+// Sent to the System R worker to report the number of active login sessions
+// for one user (systemd-logind semantics: `user-<UID>.slice` exists as long
+// as at least one session of that user is logged in).
+//
+// The count is absolute and idempotent: the slice's cgroup hierarchy
+// (`user.slice/<UID>.slice`) is created on the 0 → N transition and
+// released best-effort on the N → 0 transition.  The `user.slice` root is
+// always present once System R is up.
+message UserSessionEvent {
+    uint32 uid = 1;
+    // Absolute number of live sessions for this user.
+    uint32 sessions = 2;
 }
 
 // Minimal unit configuration sent from System A to System Workers.

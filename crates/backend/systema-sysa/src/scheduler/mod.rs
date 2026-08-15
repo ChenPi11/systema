@@ -18,20 +18,20 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    generate_invocation_id, next_job_id, next_task_id, AllocatorHandle, AllocatorState,
-    DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo, JobResultKind, JobStatus,
-    StartLimitState,
+    generate_invocation_id, next_job_id, next_request_id, next_task_id, AllocatorHandle,
+    AllocatorState, DesiredState, Job, JobCompletion, JobKind, JobMode, JobNewInfo, JobResultKind,
+    JobStatus, StartLimitState,
 };
 use crate::unit::types::{
     ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitKind, UnitSection,
 };
 use sysa::proto::{
     AutomountConfig, MountConfig, PathConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig,
-    DeviceConfig, UnitConfig, ScopeConfig,
+    DeviceConfig, UnitConfig, ScopeConfig, UnitDefineRequest, UnitDefineResult,
 };
 
 use crate::scheduler::job_type::{job_type_collapse, JobType, UnitActiveState};
-use crate::scheduler::transaction::{build_plan, PlannerMode};
+use crate::scheduler::transaction::{build_plan, PlanError, PlannerMode};
 
 /// Map a transaction job type onto the public job kind used for worker
 /// dispatch. `Nop` and `VerifyActive` steps need no worker interaction:
@@ -316,6 +316,208 @@ pub async fn enqueue_job_type(
     }
 }
 
+// ---------------------------------------------------------------------------
+// On-demand unit materialization (unit.define)
+// ---------------------------------------------------------------------------
+
+/// How long System A waits for a worker's `unit.define_result` before
+/// failing the request.  The reply is a local Unix-socket roundtrip; the
+/// bound is aligned with the job-timeout scale (docs/user-slice-todo.md
+/// section 4.1 suggests consistency with job timeouts).
+const UNIT_DEFINE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Walk the dependency closure the planner will expand and collect the
+/// names of units that are referenced but not loaded — the pre-plan scan
+/// of the `unit.define` protocol.
+///
+/// Mirrors the edge set of `transaction.rs`'s `add_job_and_dependencies`
+/// for Start jobs (requires/binds_to/wants/upholds/requisite/conflicts),
+/// plus the implicit `[Unit] Slice=` parent edge, so every unit that could
+/// make `build_plan` fail with `UnitNotFound` is found up front.
+pub fn collect_missing_units(units: &HashMap<String, UnitFile>, root: &str) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<String> = vec![root.to_string()];
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(uf) = units.get(&name) else {
+            missing.push(name);
+            continue;
+        };
+        let section = &uf.unit;
+        for dep in section
+            .requires
+            .iter()
+            .chain(section.binds_to.iter())
+            .chain(section.wants.iter())
+            .chain(section.upholds.iter())
+            .chain(section.requisite.iter())
+            .chain(section.conflicts.iter())
+        {
+            stack.push(dep.clone());
+        }
+        // The implicit Slice= edge: a unit's parent slice must be loaded
+        // for the plan to mirror systemd's IN_SLICE dependency.
+        if !section.slice.is_empty() && section.slice != crate::state::ROOT_SLICE_NAME {
+            stack.push(section.slice.clone());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// Request definitions for the given missing units from the workers that
+/// own their unit types (`unit.define` protocol), then commit the returned
+/// definitions into the allocator through the same idempotent merge as the
+/// finder path.
+///
+/// Batching: units of the same type go in one request envelope to one
+/// worker.  Fails — keeping the caller's hard-error semantics — when no
+/// worker handles a unit's type, or the worker refuses / does not answer
+/// within [`UNIT_DEFINE_TIMEOUT`].
+pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[String]) -> Result<()> {
+    // 1. Static loader first: units that exist on disk (or can be
+    //    instantiated from a template) are System A's own on-demand load.
+    //    The unit.define protocol is only for dynamic units (slices etc.)
+    //    that no unit file covers (docs/user-slice-todo.md, 未决问题 2).
+    let mut dynamic: Vec<String> = Vec::new();
+    for name in missing {
+        if !crate::unit::loader::ensure_loaded_from_disk(allocator.clone(), name).await? {
+            dynamic.push(name.clone());
+        }
+    }
+    if dynamic.is_empty() {
+        return Ok(());
+    }
+
+    // 2. Group the remaining (dynamic) units by the worker that owns their
+    // unit type.  Only workers that declared `unit.define` support
+    // (WorkerRegistration.supports_unit_define) are asked; a worker that
+    // owns a type without implementing the protocol is skipped, leaving
+    // the unit missing so the plan fails with UnitNotFound as before the
+    // protocol existed.
+    let targets: Vec<(String, Vec<String>)> = {
+        let state = allocator.read();
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for name in &dynamic {
+            let unit_type = UnitKind::from_extension(name).worker_type().to_string();
+            grouped.entry(unit_type).or_default().push(name.clone());
+        }
+        let mut targets: Vec<(String, Vec<String>)> = Vec::new();
+        for (unit_type, names) in grouped {
+            let worker = state
+                .workers
+                .values()
+                .find(|w| w.unit_types.contains(&unit_type) && w.supports_unit_define);
+            match worker {
+                Some(w) => targets.push((w.worker_id.clone(), names)),
+                None => {
+                    let known = state
+                        .workers
+                        .values()
+                        .any(|w| w.unit_types.contains(&unit_type));
+                    if known {
+                        // A worker owns the type but does not implement the
+                        // definition protocol: the unit stays missing and
+                        // the plan reports UnitNotFound (pre-protocol
+                        // semantics).
+                        debug!(
+                            "Skipping unit.define for {:?}: no worker for type '{unit_type}' supports the protocol",
+                            names
+                        );
+                    } else {
+                        bail!(
+                            "No worker available for unit type '{unit_type}' (units: {names:?}); unit.define attempt failed. Is the corresponding System Worker running?"
+                        )
+                    }
+                }
+            }
+        }
+        targets
+    };
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    for (worker_id, names) in targets {
+        let request_id = next_request_id();
+        let (tx, rx) = tokio::sync::oneshot::channel::<UnitDefineResult>();
+        {
+            let mut state = allocator.write();
+            state.unit_define_txs.insert(request_id, tx);
+        }
+
+        let req = UnitDefineRequest {
+            unit_names: names.clone(),
+        };
+        let env = sysa::ipc::make_envelope(request_id, "system-a", &worker_id, "unit.define", req)?;
+        let mut buf = bytes::BytesMut::new();
+        env.encode(&mut buf)?;
+
+        let worker_tx = {
+            let state = allocator.read();
+            state.workers.get(&worker_id).map(|w| w.envelope_tx.clone())
+        };
+        let Some(worker_tx) = worker_tx else {
+            // The worker disconnected between grouping and send.
+            let mut state = allocator.write();
+            state.unit_define_txs.remove(&request_id);
+            bail!(
+                "Worker '{worker_id}' disconnected during unit.define (units: {names:?})"
+            );
+        };
+        if worker_tx.send(buf.freeze()).await.is_err() {
+            let mut state = allocator.write();
+            state.unit_define_txs.remove(&request_id);
+            bail!("Worker '{worker_id}' disconnected during unit.define (units: {names:?})");
+        }
+
+        let result = match tokio::time::timeout(UNIT_DEFINE_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                let mut state = allocator.write();
+                state.unit_define_txs.remove(&request_id);
+                bail!("unit.define reply channel closed for '{worker_id}' (units: {names:?})");
+            }
+            Err(_) => {
+                let mut state = allocator.write();
+                state.unit_define_txs.remove(&request_id);
+                bail!(
+                    "unit.define timed out for '{worker_id}' after {UNIT_DEFINE_TIMEOUT:?} (units: {names:?})"
+                );
+            }
+        };
+        if !result.success {
+            bail!(
+                "Worker '{worker_id}' refused unit.define (units: {names:?}): {}",
+                result.error
+            );
+        }
+
+        // Commit the synthesized definitions through the same idempotent
+        // merge as the finder path (`state.merge_units`).
+        let units: HashMap<String, systema_sysf::ir::UnitIR> =
+            serde_json::from_slice(&result.units_json).map_err(|e| {
+                anyhow::anyhow!("Failed to deserialize unit.define result from '{worker_id}': {e}")
+            })?;
+        let (created, updated) = {
+            let mut state = allocator.write();
+            state
+                .merge_units(&units)
+                .map_err(anyhow::Error::msg)?
+        };
+        info!(
+            "unit.define from {worker_id}: committed {created} new, {updated} updated unit(s)"
+        );
+    }
+
+    Ok(())
+}
+
 /// Core job enqueueing logic.
 pub async fn enqueue_job(
     allocator: AllocatorHandle,
@@ -364,9 +566,12 @@ pub async fn enqueue_job(
     {
         let state = allocator.read();
         let unit = state.units.get(unit_name);
+        // For units that are not loaded yet the type is derived from the
+        // name extension (e.g. `user-0.slice` → "slice"), so the check
+        // below never falls back to "service" for a slice/scope root.
         let unit_type = unit
             .map(|u| u.kind.worker_type().to_string())
-            .unwrap_or_else(|| "service".to_string());
+            .unwrap_or_else(|| UnitKind::from_extension(unit_name).worker_type().to_string());
         let has_worker = state
             .workers
             .values()
@@ -554,7 +759,34 @@ pub async fn enqueue_job(
     // dependency atoms (Requires/Wants/Requisite/BindsTo/Upholds/Conflicts/
     // PartOf/PropagatesReloadTo), merged to one job per unit, ordered by the
     // After=/Before= ordering graph, with ordering cycles broken.
+    //
+    // On-demand materialization (unit.define): before planning, the
+    // dependency closure is walked and every referenced-but-missing unit
+    // (e.g. a scope's `Slice=user-<UID>.slice` that System R has not
+    // committed yet) is requested from the worker that owns its unit type,
+    // which synthesizes a definition (System R: slice parent chains).  The
+    // definitions are committed through the same idempotent merge as the
+    // finder path before the plan is built — the systemd counterpart is
+    // `unit_add_dependency_by_name()` loading the parent slice on demand.
+    // A second `UnitNotFound` after the pre-scan gets one more definition
+    // round for the exact missing unit (bounded retry); if it still fails,
+    // the plan error is reported as before.
     let plan = {
+        let missing = {
+            let state = allocator.read();
+            let units: HashMap<String, UnitFile> = state.units.clone();
+            collect_missing_units(&units, unit_name)
+        };
+
+        if !missing.is_empty() {
+            info!(
+                "Pre-plan scan: {} referenced-but-missing unit(s) ({:?}); requesting definitions via unit.define",
+                missing.len(),
+                missing
+            );
+            request_unit_definition(allocator.clone(), &missing).await?;
+        }
+
         let state = allocator.read();
         let units: HashMap<String, UnitFile> = state.units.clone();
         let states: HashMap<String, UnitActiveState> = state
@@ -584,6 +816,48 @@ pub async fn enqueue_job(
     };
     let plan = match plan {
         Ok(plan) => plan,
+        Err(PlanError::UnitNotFound(name)) => {
+            // Bounded retry: the pre-scan walk mirrors the planner's edge
+            // expansion but may miss an edge it only discovers later; ask
+            // for the exact missing unit once more before giving up.
+            warn!(
+                "Transaction for {} failed with missing unit {name} after pre-scan; one unit.define retry",
+                unit_name
+            );
+            request_unit_definition(allocator.clone(), &[name.clone()]).await?;
+            let state = allocator.read();
+            let units: HashMap<String, UnitFile> = state.units.clone();
+            let states: HashMap<String, UnitActiveState> = state
+                .unit_states
+                .iter()
+                .map(|(n, c)| {
+                    (
+                        n.clone(),
+                        UnitActiveState::from_active_state_str(&c.active_state),
+                    )
+                })
+                .collect();
+            let installed: HashMap<String, JobType> = state
+                .jobs
+                .values()
+                .filter(|j| matches!(j.status, JobStatus::Running))
+                .map(|j| (j.unit_name.clone(), JobType::from_job_kind(j.kind)))
+                .collect();
+            match build_plan(
+                &units,
+                &states,
+                &installed,
+                unit_name,
+                JobType::from_job_kind(kind),
+                PlannerMode::from_job_mode(mode),
+            ) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    warn!("Transaction for {} ({kind:?}, mode={mode:?}) failed: {e}", unit_name);
+                    bail!("{}", e);
+                }
+            }
+        }
         Err(e) => {
             warn!("Transaction for {} ({kind:?}, mode={mode:?}) failed: {e}", unit_name);
             bail!("{}", e);
@@ -1861,6 +2135,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+    use sysa::proto::{Envelope, UnitDefineRequest, UnitDefineResult};
+    use systema_sysf::ir::{DependencySet, UnitIR, UnitType};
 
     // =========================================================================
     // JobMode tests
@@ -2218,6 +2494,7 @@ mod tests {
             WorkerEntry {
                 worker_id: "test-worker".to_string(),
                 unit_types: vec!["service".to_string()],
+                    supports_unit_define: false,
                 envelope_tx: tx,
             },
         );
@@ -2291,6 +2568,7 @@ mod tests {
                 WorkerEntry {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
+                    supports_unit_define: false,
                     envelope_tx: tx,
                 },
             );
@@ -2875,5 +3153,525 @@ mod tests {
 
         assert!(binds_to_start_propagation(&state, "dep.service", false, JobKind::Start).is_empty());
         assert!(binds_to_start_propagation(&state, "dep.service", true, JobKind::Stop).is_empty());
+    }
+
+    // =========================================================================
+    // unit.define (M1): pre-plan scan + on-demand definition requests
+    // =========================================================================
+
+    /// Build the UnitIR of a slice, mirroring System R's synthesis rules.
+    /// `with_parent_dep` controls the Requires=/After= edge on the parent
+    /// (present in real definitions; omitted to simulate a partial worker).
+    fn make_slice_ir(id: &str, parent: &str, with_parent_dep: bool) -> UnitIR {
+        UnitIR {
+            id: id.to_string(),
+            unit_type: Some(UnitType::Slice),
+            description: None,
+            source_format: Some("dynamic".to_string()),
+            source_path: None,
+            aliases: Vec::new(),
+            slice: Some(parent.to_string()),
+            dependencies: if with_parent_dep {
+                Some(DependencySet {
+                    requires: std::collections::HashSet::from([parent.to_string()]),
+                    after: std::collections::HashSet::from([parent.to_string()]),
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+            service: None,
+            mount: None,
+            automount: None,
+            timer: None,
+            socket: None,
+            resource_control: None,
+            conditions: None,
+            asserts: None,
+            wanted_by: None,
+            required_by: None,
+        }
+    }
+
+    /// A scope like the one `StartTransientUnit` produces: it carries the
+    /// `Slice=` mirroring (Requires= + After= + slice field on the unit) but
+    /// the parent slice is not loaded yet.
+    fn make_scope_with_slice(name: &str, slice: &str) -> (String, UnitFile) {
+        let mut u = make_unit(name);
+        u.transient = true;
+        u.unit.slice = slice.to_string();
+        u.unit.requires.insert(slice.to_string());
+        u.unit.after.insert(slice.to_string());
+        (name.to_string(), u)
+    }
+
+    /// Complete a dispatched `method.call` task as successful, the way the
+    /// IPC server's `method.result` handling does.  Required to advance the
+    /// serial-mode chain: Replace mode chains every task on its predecessor
+    /// (`serial_completion_txs`), so a fake worker that never replies would
+    /// stall `enqueue_job` at the next task's chain await.
+    fn fake_worker_complete_call(alloc: &AllocatorHandle, env: &Envelope) {
+        let call = sysa::proto::MethodCall::decode(env.payload.as_slice()).expect("valid call");
+        let kind = match call.method.as_str() {
+            "start" => JobKind::Start,
+            "stop" => JobKind::Stop,
+            "restart" => JobKind::Restart,
+            "reload" => JobKind::Reload,
+            other => panic!("unexpected method {other}"),
+        };
+        handle_task_result(alloc.clone(), env.request_id, true, "ok", &call.unit_name, kind);
+    }
+
+    #[test]
+    fn collect_missing_units_walks_requires_edges() {
+        let mut units: HashMap<String, UnitFile> = HashMap::new();
+        let (n, b) = unit_requires("b.service", &["a.service"]);
+        units.insert(n, b);
+        let (n, c) = unit_requires("c.service", &["b.service"]);
+        units.insert(n, c);
+        units.insert("a.service".to_string(), make_unit("a.service"));
+
+        // Everything present → nothing missing.
+        assert!(collect_missing_units(&units, "c.service").is_empty());
+        // Drop a.service → walk reports it once.
+        units.remove("a.service");
+        assert_eq!(collect_missing_units(&units, "c.service"), vec!["a.service"]);
+    }
+
+    #[test]
+    fn collect_missing_units_reports_slice_parent_but_skips_root() {
+        let mut units: HashMap<String, UnitFile> = HashMap::new();
+        let (n, scope) = make_scope_with_slice("session-1.scope", "user-1000.slice");
+        units.insert(n, scope);
+
+        assert_eq!(
+            collect_missing_units(&units, "session-1.scope"),
+            vec!["user-1000.slice"]
+        );
+
+        // A unit under the root slice does not require loading anything.
+        let mut u = make_unit("x.service");
+        u.unit.slice = crate::state::ROOT_SLICE_NAME.to_string();
+        units.insert("x.service".to_string(), u);
+        let missing: Vec<String> = collect_missing_units(&units, "x.service");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn collect_missing_units_dedups_and_sorts() {
+        let mut units: HashMap<String, UnitFile> = HashMap::new();
+        let mut u = make_unit("root.scope");
+        u.unit.requires.insert("b.slice".to_string());
+        u.unit.wants.insert("a.slice".to_string());
+        u.unit.conflicts.insert("b.slice".to_string());
+        u.unit.slice = "c.slice".to_string();
+        units.insert("root.scope".to_string(), u);
+
+        // b.slice requested twice (requires + conflicts), sorted output.
+        assert_eq!(
+            collect_missing_units(&units, "root.scope"),
+            vec!["a.slice", "b.slice", "c.slice"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_pre_scan_requests_and_commits_slice_chain() {
+        // The happy path of M1: starting a transient scope whose parent
+        // slice is missing triggers unit.define against the slice worker;
+        // the synthesized chain (user-1000.slice → user.slice) is committed
+        // and the replanned transaction contains Start jobs for the whole
+        // chain alongside the scope.
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            let (n, scope) = make_scope_with_slice("session-1.scope", "user-1000.slice");
+            state.units.insert(n, scope);
+            // The scope itself is dispatched to the scope worker; slices go
+            // to the slice worker.
+            let (scope_tx, mut scope_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move { while scope_rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-e-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-e-1".to_string(),
+                    unit_types: vec!["scope".to_string()],
+                    supports_unit_define: false,
+                    envelope_tx: scope_tx,
+                },
+            );
+            let (slice_tx, _slice_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            state.workers.insert(
+                "system-r-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-r-1".to_string(),
+                    unit_types: vec!["slice".to_string()],
+                    supports_unit_define: true,
+                    envelope_tx: slice_tx,
+                },
+            );
+        }
+
+        // Fake slice worker: answer the unit.define request by completing
+        // the pending oneshot (as ipc/server.rs's unit.define_result branch
+        // would), then drain the dispatch envelopes.
+        let (slice_tx, mut slice_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        {
+            let mut state = alloc.write();
+            state.workers.insert(
+                "system-r-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-r-1".to_string(),
+                    unit_types: vec!["slice".to_string()],
+                    supports_unit_define: true,
+                    envelope_tx: slice_tx,
+                },
+            );
+        }
+        let alloc_fake_loop = alloc.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = slice_rx.recv().await {
+                let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
+                match env.method.as_str() {
+                    "unit.define" => {
+                        let req =
+                            UnitDefineRequest::decode(env.payload.as_slice()).expect("valid request");
+                        assert_eq!(req.unit_names, vec!["user-1000.slice"]);
+                        let units: HashMap<String, UnitIR> = HashMap::from([
+                            (
+                                "user-1000.slice".to_string(),
+                                make_slice_ir("user-1000.slice", "user.slice", true),
+                            ),
+                            (
+                                "user.slice".to_string(),
+                                make_slice_ir("user.slice", crate::state::ROOT_SLICE_NAME, false),
+                            ),
+                        ]);
+                        let tx = alloc_fake_loop
+                            .write()
+                            .unit_define_txs
+                            .remove(&env.request_id)
+                            .expect("pending unit.define oneshot");
+                        let _ = tx.send(UnitDefineResult {
+                            success: true,
+                            error: String::new(),
+                            units_json: serde_json::to_vec(&units).unwrap(),
+                        });
+                    }
+                    "method.call" => fake_worker_complete_call(&alloc_fake_loop, &env),
+                    other => panic!("unexpected method {other}"),
+                }
+            }
+        });
+
+        enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
+            .await
+            .expect("scope with synthesized slice chain must enqueue");
+
+        let state = alloc.read();
+        // The chain is committed.
+        assert!(state.units.contains_key("user-1000.slice"));
+        assert!(state.units.contains_key("user.slice"));
+        assert_eq!(state.units["user-1000.slice"].unit.slice, "user.slice");
+        // The transaction contains jobs for the scope and the whole chain.
+        let mut job_units: Vec<&str> = state.jobs.values().map(|j| j.unit_name.as_str()).collect();
+        job_units.sort();
+        assert_eq!(job_units, vec!["session-1.scope", "user-1000.slice", "user.slice"]);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_unit_define_bounded_retry_for_partial_definition() {
+        // A worker answering only the requested unit (no parent chain)
+        // forces the planner into UnitNotFound on the parent; the bounded
+        // retry sends a second unit.define for the exact missing unit.
+        // Synthetic slice names keep the test independent of the host's
+        // unit files: a real distro ships `user.slice` on disk, which the
+        // pre-scan would statically load instead of asking the worker.
+        const CHILD: &str = "zzztest-1000.slice";
+        const PARENT: &str = "zzztest.slice";
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            let (n, scope) = make_scope_with_slice("session-1.scope", CHILD);
+            state.units.insert(n, scope);
+            let (scope_tx, mut scope_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move { while scope_rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-e-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-e-1".to_string(),
+                    unit_types: vec!["scope".to_string()],
+                    supports_unit_define: false,
+                    envelope_tx: scope_tx,
+                },
+            );
+        }
+
+        let (slice_tx, mut slice_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        {
+            let mut state = alloc.write();
+            state.workers.insert(
+                "system-r-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-r-1".to_string(),
+                    unit_types: vec!["slice".to_string()],
+                    supports_unit_define: true,
+                    envelope_tx: slice_tx,
+                },
+            );
+        }
+
+        let answered: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let alloc_fake = alloc.clone();
+        let answered_fake = answered.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = slice_rx.recv().await {
+                let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
+                match env.method.as_str() {
+                    "unit.define" => {
+                        let req =
+                            UnitDefineRequest::decode(env.payload.as_slice()).expect("valid request");
+                        answered_fake.lock().unwrap().push(req.unit_names.clone());
+                        let units: HashMap<String, UnitIR> = match req.unit_names[0].as_str() {
+                            CHILD => HashMap::from([(
+                                CHILD.to_string(),
+                                make_slice_ir(CHILD, PARENT, true),
+                            )]),
+                            PARENT => HashMap::from([(
+                                PARENT.to_string(),
+                                make_slice_ir(PARENT, crate::state::ROOT_SLICE_NAME, false),
+                            )]),
+                            other => panic!("unexpected unit.define for {other:?}"),
+                        };
+                        let tx = alloc_fake
+                            .write()
+                            .unit_define_txs
+                            .remove(&env.request_id)
+                            .expect("pending unit.define oneshot");
+                        let _ = tx.send(UnitDefineResult {
+                            success: true,
+                            error: String::new(),
+                            units_json: serde_json::to_vec(&units).unwrap(),
+                        });
+                    }
+                    "method.call" => fake_worker_complete_call(&alloc_fake, &env),
+                    other => panic!("unexpected method {other}"),
+                }
+            }
+        });
+
+        enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
+            .await
+            .expect("bounded retry must recover the missing parent");
+
+        // Exactly two unit.define rounds: the pre-scan for the parent, and
+        // the bounded retry for the parent's parent discovered only during
+        // plan expansion.
+        assert_eq!(
+            answered.lock().unwrap().as_slice(),
+            &[vec![CHILD.to_string()], vec![PARENT.to_string()]]
+        );
+        let state = alloc.read();
+        assert!(state.units.contains_key(CHILD));
+        assert!(state.units.contains_key(PARENT));
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_unit_define_refusal_keeps_hard_error() {
+        // A worker that refuses the request keeps the caller's hard-error
+        // semantics: the transaction fails, nothing is committed.
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            let (n, scope) = make_scope_with_slice("session-1.scope", "user-1000.slice");
+            state.units.insert(n, scope);
+            let (scope_tx, mut scope_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move { while scope_rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-e-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-e-1".to_string(),
+                    unit_types: vec!["scope".to_string()],
+                    supports_unit_define: false,
+                    envelope_tx: scope_tx,
+                },
+            );
+        }
+        let (slice_tx, mut slice_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        {
+            let mut state = alloc.write();
+            state.workers.insert(
+                "system-r-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-r-1".to_string(),
+                    unit_types: vec!["slice".to_string()],
+                    supports_unit_define: true,
+                    envelope_tx: slice_tx,
+                },
+            );
+        }
+        let alloc_fake = alloc.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = slice_rx.recv().await {
+                let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
+                assert_eq!(env.method, "unit.define", "refused request happens before dispatch");
+                let tx = alloc_fake
+                    .write()
+                    .unit_define_txs
+                    .remove(&env.request_id)
+                    .expect("pending unit.define oneshot");
+                let _ = tx.send(UnitDefineResult {
+                    success: false,
+                    error: "cannot synthesize definitions for non-slice units: [x.service]".to_string(),
+                    units_json: vec![],
+                });
+            }
+        });
+
+        let err = enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
+            .await
+            .expect_err("refused unit.define must fail the transaction");
+        assert!(err.to_string().contains("refused"), "{}", err);
+        let state = alloc.read();
+        assert!(!state.units.contains_key("user-1000.slice"));
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_missing_unit_without_worker_fails() {
+        // No worker owns the "slice" type → the pre-scan fails fast with a
+        // descriptive error instead of silently proceeding (the plan would
+        // otherwise fail on UnitNotFound with a less actionable message).
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            let (n, scope) = make_scope_with_slice("session-1.scope", "user-1000.slice");
+            state.units.insert(n, scope);
+            // The root scope is dispatched to a scope worker; only the slice
+            // type is unowned here.
+            let (scope_tx, mut scope_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move { while scope_rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-e-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-e-1".to_string(),
+                    unit_types: vec!["scope".to_string()],
+                    supports_unit_define: false,
+                    envelope_tx: scope_tx,
+                },
+            );
+        }
+
+        let err = enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
+            .await
+            .expect_err("missing slice with no slice worker must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("No worker available for unit type 'slice'"), "{msg}");
+        assert!(msg.contains("user-1000.slice"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_pre_scan_noop_when_everything_loaded() {
+        // When the parent slice is already loaded no unit.define is sent:
+        // the pre-scan finds nothing missing and the plan is built directly.
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            let (n, scope) = make_scope_with_slice("session-1.scope", "user-1000.slice");
+            state.units.insert(n, scope);
+            state.units.insert("user-1000.slice".to_string(), make_unit("user-1000.slice"));
+            let (scope_tx, mut scope_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move { while scope_rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-e-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-e-1".to_string(),
+                    unit_types: vec!["scope".to_string()],
+                    supports_unit_define: false,
+                    envelope_tx: scope_tx,
+                },
+            );
+        }
+        let (slice_tx, mut slice_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        {
+            let mut state = alloc.write();
+            state.workers.insert(
+                "system-r-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-r-1".to_string(),
+                    unit_types: vec!["slice".to_string()],
+                    supports_unit_define: true,
+                    envelope_tx: slice_tx,
+                },
+            );
+        }
+        let alloc_fake = alloc.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = slice_rx.recv().await {
+                let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
+                assert_ne!(env.method, "unit.define", "no unit.define when nothing is missing");
+                fake_worker_complete_call(&alloc_fake, &env);
+            }
+        });
+
+        enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
+            .await
+            .expect("fully loaded transaction must enqueue");
+        let state = alloc.read();
+        assert_eq!(state.unit_define_txs.len(), 0, "no pending unit.define requests");
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_job_skips_unit_define_for_types_without_capable_worker() {
+        // The pre-scan must not send unit.define to a worker that does not
+        // implement the protocol (a service worker here): the request would
+        // go unanswered and time out.  A unit with no on-disk definition
+        // and no unit.define provider stays missing, so the plan fails
+        // with UnitNotFound — the pre-protocol semantics.
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = alloc.write();
+            let mut scope = make_unit("session-1.scope");
+            scope.transient = true;
+            scope
+                .unit
+                .requires
+                .insert("no-such-unit-42.service".to_string());
+            state.units.insert("session-1.scope".to_string(), scope);
+            let (scope_tx, mut scope_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move { while scope_rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-e-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-e-1".to_string(),
+                    unit_types: vec!["scope".to_string()],
+                    supports_unit_define: false,
+                    envelope_tx: scope_tx,
+                },
+            );
+            // A service worker exists but did not declare unit.define
+            // support (WorkerRegistration.supports_unit_define = false).
+            let (service_tx, mut service_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move { while service_rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "system-s-1".to_string(),
+                WorkerEntry {
+                    worker_id: "system-s-1".to_string(),
+                    unit_types: vec!["service".to_string()],
+                    supports_unit_define: false,
+                    envelope_tx: service_tx,
+                },
+            );
+        }
+
+        let err = enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
+            .await
+            .expect_err("missing unit without a unit.define provider must fail");
+        assert!(err.to_string().contains("no-such-unit-42.service"), "{}", err);
+        let state = alloc.read();
+        assert!(
+            state.unit_define_txs.is_empty(),
+            "no unit.define request may be pending"
+        );
+        assert!(!state.units.contains_key("no-such-unit-42.service"));
     }
 }

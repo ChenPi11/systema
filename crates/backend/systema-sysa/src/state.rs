@@ -260,6 +260,9 @@ pub struct WorkerEntry {
     pub worker_id: String,
     /// Unit types this worker handles, e.g. ["service"].
     pub unit_types: Vec<String>,
+    /// Whether the worker implements the `unit.define` protocol and may be
+    /// asked to synthesize definitions for dynamic units of its types.
+    pub supports_unit_define: bool,
     /// Channel to send pre-encoded envelopes (method calls, etc.).
     pub envelope_tx: mpsc::Sender<bytes::Bytes>,
 }
@@ -311,6 +314,10 @@ pub struct AllocatorState {
     /// Channel to notify the D-Bus layer when a new unit is loaded so it can
     /// register a per-unit D-Bus object.  Set by the D-Bus server at startup.
     pub unit_loaded_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Channel to notify the D-Bus layer when a unit is removed from memory
+    /// so it can emit the `UnitRemoved` signal.  Set by the D-Bus server at
+    /// startup; no producer exists yet (units are never unloaded today).
+    pub unit_removed_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Channel to notify the D-Bus layer when a new job is created so it can
     /// emit the `JobNew` signal.
     pub job_new_tx: Option<tokio::sync::mpsc::UnboundedSender<JobNewInfo>>,
@@ -318,6 +325,11 @@ pub struct AllocatorState {
     /// When a task completes, `handle_task_result` sends `()` through the
     /// corresponding channel so the next task in the serial chain proceeds.
     pub serial_completion_txs: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
+    /// Completion senders for pending `unit.define` requests — keyed by the
+    /// request_id of the envelope sent to the worker.  The IPC receiver
+    /// completes the channel when the worker's `unit.define_result` arrives.
+    pub unit_define_txs:
+        HashMap<u64, tokio::sync::oneshot::Sender<sysa::proto::UnitDefineResult>>,
     /// Restart rate-limiting state, keyed by unit name.
     pub start_limit_state: HashMap<String, StartLimitState>,
     /// In-process event bus for pub/sub event distribution.
@@ -371,6 +383,14 @@ pub struct AllocatorState {
     /// interprets them, it only relays them to the systemd-compatible D-Bus
     /// properties.  Not subject to the unit ownership table (informational).
     pub cgroup_metrics: HashMap<String, sysa::proto::UnitCgroupMetrics>,
+
+    /// Active login sessions per UID, keyed by the session scope's unit
+    /// name (systemd-logind semantics).  A session appears when its
+    /// `session-<id>.scope` becomes active (scopes whose `Slice=` is a
+    /// `user-<UID>.slice`) and disappears when the scope dies.  The per-UID
+    /// count is forwarded to System R (`user.sessions`) on every change so
+    /// the user's `user-<UID>.slice` follows its sessions.
+    pub user_sessions: HashMap<u32, HashSet<String>>,
 }
 
 impl AllocatorState {
@@ -384,8 +404,10 @@ impl AllocatorState {
             task_kinds: HashMap::new(),
             job_completion_tx: None,
             unit_loaded_tx: None,
+            unit_removed_tx: None,
             job_new_tx: None,
             serial_completion_txs: HashMap::new(),
+            unit_define_txs: HashMap::new(),
             start_limit_state: HashMap::new(),
             event_bus: Arc::new(TokioRwLock::new(EventBus::new())),
             staging_areas: HashMap::new(),
@@ -395,6 +417,7 @@ impl AllocatorState {
             unit_states: HashMap::new(),
             unit_owners: HashMap::new(),
             cgroup_metrics: HashMap::new(),
+            user_sessions: HashMap::new(),
         };
         state.ensure_root_slice();
         state
@@ -463,29 +486,10 @@ impl AllocatorState {
         let unit_count = area.units.len() as u32;
         info!("commit_staging(UID={uid}, name={name}): merging {unit_count} units");
 
-        // Phase 1 (plan): build every new UnitFile up front so a missing
-        // required field aborts the commit before anything is mutated.
-        let mut new_units: Vec<(String, UnitFile)> = Vec::with_capacity(unit_count as usize);
-        for ir in area.units.values() {
-            if !self.units.contains_key(&ir.id) {
-                new_units.push(unit_file_from_ir(ir)?);
-            }
-        }
-
-        // Phase 2 (apply): patch existing units and insert new ones.  All
-        // steps are infallible, so a failure cannot happen mid-way.
-        let mut created = 0usize;
-        let mut updated = 0usize;
-        for ir in area.units.values() {
-            if let Some(existing) = self.units.get_mut(&ir.id) {
-                apply_ir_patch(ir, existing);
-                updated += 1;
-            }
-        }
-        for (unit_name, unit) in new_units {
-            self.units.insert(unit_name, unit);
-            created += 1;
-        }
+        let (created, updated) = {
+            let units: HashMap<String, UnitIR> = area.units.clone();
+            self.merge_units(&units)?
+        };
 
         // Phase 3 (finalize): consume the staging area.
         self.staging_areas.remove(&(uid, name.to_string()));
@@ -495,10 +499,64 @@ impl AllocatorState {
         if updated > 0 {
             info!("commit_staging(UID={uid}, name={name}): updated {updated} existing unit(s)");
         }
+
+        Ok(unit_count)
+    }
+
+    /// Merge a set of [`UnitIR`] definitions into the active unit set.
+    ///
+    /// This is the shared core of `commit_staging()` (the finder path used
+    /// by System D / System R / System F) and the `unit.define` on-demand
+    /// materialization path: the same idempotent merge-over-existing
+    /// semantics apply to both.
+    ///
+    /// The merge is atomic:
+    ///
+    /// - Every `UnitIR` is validated (new units require `unit_type`) before
+    ///   anything is mutated; a validation failure aborts the merge and
+    ///   leaves `self.units` untouched.
+    /// - Existing units are *merged* (only the entries provided in the IR are
+    ///   overwritten); new units are created from the IR.
+    ///
+    /// Returns the number of created and updated units.
+    pub fn merge_units(
+        &mut self,
+        units: &HashMap<String, UnitIR>,
+    ) -> Result<(usize, usize), String> {
+        // Phase 1 (plan): build every new UnitFile up front so a missing
+        // required field aborts the commit before anything is mutated.
+        let mut new_units: Vec<(String, UnitFile)> = Vec::with_capacity(units.len());
+        for ir in units.values() {
+            if !self.units.contains_key(&ir.id) {
+                new_units.push(unit_file_from_ir(ir)?);
+            }
+        }
+
+        // Phase 2 (apply): patch existing units and insert new ones.  All
+        // steps are infallible, so a failure cannot happen mid-way.
+        let mut created = 0usize;
+        let mut updated = 0usize;
+        for ir in units.values() {
+            if let Some(existing) = self.units.get_mut(&ir.id) {
+                apply_ir_patch(ir, existing);
+                updated += 1;
+            }
+        }
+        for (unit_name, unit) in new_units {
+            self.units.insert(unit_name.clone(), unit);
+            created += 1;
+            // Notify the D-Bus layer so it can register a per-unit object
+            // (same channel the on-disk load paths use); the merge funnel
+            // covers finder commits (System F/D/R) and unit.define.
+            if let Some(ref tx) = self.unit_loaded_tx {
+                let _ = tx.send(unit_name);
+            }
+        }
+
         self.rebuild_alias_map();
         self.rebuild_ref_counts();
 
-        Ok(unit_count)
+        Ok((created, updated))
     }
 
     /// Return the canonical name of `name`, resolving aliases to their target
@@ -945,6 +1003,42 @@ fn mount_config_to_section(
     }
 }
 
+// --------------------------------------------------------------------------
+// Login-session accounting
+// --------------------------------------------------------------------------
+
+/// Update the login-session accounting for one unit state report.
+///
+/// Only `*.scope` units whose `Slice=` is a `user-<UID>.slice` count as
+/// login sessions (systemd-logind semantics): `active` adds the scope to
+/// the UID's session set, anything else removes it.  Returns
+/// `Some((uid, count))` when the UID's session count *changed*, so the
+/// caller can forward the new absolute count to System R; `None` when the
+/// unit is not a user session or the count is unchanged.
+pub fn track_session(
+    sessions: &mut HashMap<u32, HashSet<String>>,
+    unit_name: &str,
+    slice: &str,
+    active: bool,
+) -> Option<(u32, usize)> {
+    if !unit_name.ends_with(".scope") {
+        return None;
+    }
+    let uid = sysa::unit_name::parse_user_slice_uid(slice)?;
+    let set = sessions.entry(uid).or_default();
+    let before = set.len();
+    if active {
+        set.insert(unit_name.to_string());
+    } else {
+        set.remove(unit_name);
+    }
+    let after = set.len();
+    if set.is_empty() {
+        sessions.remove(&uid);
+    }
+    (before != after).then_some((uid, after))
+}
+
 fn automount_config_to_section(
     cfg: &systema_sysf::ir::AutomountConfig,
 ) -> crate::unit::types::AutomountSection {
@@ -1148,6 +1242,28 @@ mod tests {
         let tmp = state.units.get("tmp.mount").unwrap();
         assert_eq!(tmp.kind, UnitKind::Mount);
         assert_eq!(tmp.mount.as_ref().unwrap().where_, "/tmp");
+    }
+
+    #[test]
+    fn merge_committed_units_notify_the_dbus_layer() {
+        // Every unit that enters the allocator through the merge funnel
+        // (finder commits and unit.define) must reach the D-Bus layer so a
+        // per-unit object can be registered; a unit that only gets updated
+        // is already registered.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut state = AllocatorState::new();
+        state.unit_loaded_tx = Some(tx);
+        let ir = mount_ir("tmp.mount", "/tmp");
+        let units: HashMap<String, UnitIR> = HashMap::from([(ir.id.clone(), ir)]);
+
+        let (created, updated) = state.merge_units(&units).unwrap();
+        assert_eq!((created, updated), (1, 0));
+        assert_eq!(rx.blocking_recv().as_deref(), Some("tmp.mount"));
+
+        // Re-commit an update: no new unit → no duplicate notification.
+        let (created, updated) = state.merge_units(&units).unwrap();
+        assert_eq!((created, updated), (0, 1));
+        assert!(rx.try_recv().is_err(), "updates must not re-notify");
     }
 
     #[test]
@@ -1428,5 +1544,107 @@ mod tests {
         assert!(err.contains("no staging area"), "unexpected error: {err}");
         assert_eq!(state.commit_staging(7, "systema-sysd/discovery").unwrap(), 0);
         assert!(state.get_staging_area(8, "systema-sysd/discovery").is_some());
+    }
+
+    #[test]
+    fn session_scope_login_sends_count() {
+        let mut sessions = HashMap::new();
+        // First session of user 1000: count goes 0 → 1.
+        assert_eq!(
+            track_session(
+                &mut sessions,
+                "session-1.scope",
+                "user-1000.slice",
+                true
+            ),
+            Some((1000, 1))
+        );
+        // A second session of the same user: 1 → 2.
+        assert_eq!(
+            track_session(
+                &mut sessions,
+                "session-2.scope",
+                "user-1000.slice",
+                true
+            ),
+            Some((1000, 2))
+        );
+        // Re-reported active (e.g. resource re-apply): no change.
+        assert_eq!(
+            track_session(
+                &mut sessions,
+                "session-1.scope",
+                "user-1000.slice",
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_scope_logout_releases_count() {
+        let mut sessions = HashMap::new();
+        track_session(&mut sessions, "session-1.scope", "user-1000.slice", true);
+        track_session(&mut sessions, "session-2.scope", "user-1000.slice", true);
+
+        assert_eq!(
+            track_session(
+                &mut sessions,
+                "session-1.scope",
+                "user-1000.slice",
+                false
+            ),
+            Some((1000, 1))
+        );
+        assert_eq!(
+            track_session(
+                &mut sessions,
+                "session-2.scope",
+                "user-1000.slice",
+                false
+            ),
+            Some((1000, 0))
+        );
+        assert!(!sessions.contains_key(&1000));
+    }
+
+    #[test]
+    fn session_tracking_ignores_non_user_units() {
+        let mut sessions = HashMap::new();
+        // Non-scope unit.
+        assert_eq!(
+            track_session(&mut sessions, "user@1000.service", "user-1000.slice", true),
+            None
+        );
+        // Scope not living under a user slice.
+        assert_eq!(
+            track_session(&mut sessions, "session-1.scope", "system.slice", true),
+            None
+        );
+        // Scope under a malformed user slice name.
+        assert_eq!(
+            track_session(&mut sessions, "session-1.scope", "user-abc.slice", true),
+            None
+        );
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn users_tracked_independently() {
+        let mut sessions = HashMap::new();
+        track_session(&mut sessions, "session-1.scope", "user-1000.slice", true);
+        track_session(&mut sessions, "session-1.scope", "user-2000.slice", true);
+
+        // User 1000 logs out; user 2000 is untouched.
+        assert_eq!(
+            track_session(
+                &mut sessions,
+                "session-1.scope",
+                "user-1000.slice",
+                false
+            ),
+            Some((1000, 0))
+        );
+        assert_eq!(sessions.get(&2000).map(|s| s.len()), Some(1));
     }
 }

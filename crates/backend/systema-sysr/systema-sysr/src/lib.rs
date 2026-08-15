@@ -6,6 +6,7 @@
 //! `main.rs`.
 
 pub mod ipc;
+pub mod register;
 pub mod worker;
 
 pub use worker::{ManagedUnit, ResourceRegistry, ResourceWorker, new_registry, DEFAULT_SLICE};

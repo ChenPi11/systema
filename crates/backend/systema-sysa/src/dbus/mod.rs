@@ -295,11 +295,14 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
         tokio::sync::mpsc::unbounded_channel::<crate::state::JobNewInfo>();
     // unit-loaded → register per-unit object
     let (unit_loaded_tx, mut unit_loaded_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // unit-removed → UnitRemoved signal
+    let (unit_removed_tx, mut unit_removed_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     {
         let mut state = allocator.write();
         state.job_completion_tx = Some(completion_tx);
         state.job_new_tx = Some(job_new_tx);
         state.unit_loaded_tx = Some(unit_loaded_tx);
+        state.unit_removed_tx = Some(unit_removed_tx);
     }
 
     // Spawn task: emit JobRemoved when a job finishes.
@@ -359,6 +362,29 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
     tokio::spawn(async move {
         while let Some(unit_name) = unit_loaded_rx.recv().await {
             register_unit_object(&conn_for_units, alloc_for_units.clone(), &unit_name).await;
+        }
+    });
+
+    // Spawn task: emit UnitRemoved when a unit is removed from memory.
+    let conn_for_removed = conn.clone();
+    tokio::spawn(async move {
+        while let Some(unit_name) = unit_removed_rx.recv().await {
+            match zbus::SignalContext::new(&conn_for_removed, "/org/freedesktop/systemd1") {
+                Ok(signal_ctx) => {
+                    if let Err(e) = manager::ManagerInterface::unit_removed(
+                        &signal_ctx,
+                        unit_name,
+                        manager::job_object_path(0),
+                    )
+                    .await
+                    {
+                        warn!("Failed to emit UnitRemoved signal: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create signal context for UnitRemoved: {}", e);
+                }
+            }
         }
     });
 

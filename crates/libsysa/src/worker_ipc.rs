@@ -154,6 +154,37 @@ impl EventPublisher {
         });
     }
 
+    /// Send a reply envelope echoing an incoming `request_id` (e.g. the
+    /// `unit.define_result` answer to a System A `unit.define` request).
+    /// Fire-and-forget from the caller's perspective.
+    pub fn send_reply<P>(&self, request_id: u64, method: &str, payload: P)
+    where
+        P: ProstMessage + Send + 'static,
+    {
+        let publisher = self.clone();
+        let method = method.to_string();
+        tokio::spawn(async move {
+            let env = match make_envelope(
+                request_id,
+                &publisher.worker_id,
+                "system-a",
+                &method,
+                payload,
+            )
+            .and_then(encode_envelope)
+            {
+                Ok(env) => env,
+                Err(e) => {
+                    error!("Failed to encode {method} envelope: {}", e);
+                    return;
+                }
+            };
+            if publisher.tx.send(env).is_err() {
+                warn!("Outgoing channel closed; cannot send {method} reply");
+            }
+        });
+    }
+
     /// Subscribe to `event.publish` notifications for specific units.
     /// An empty list subscribes to updates for *all* units.  Additive.
     pub fn subscribe_units(&self, unit_names: &[String]) {
@@ -192,6 +223,7 @@ fn encode_envelope(env: Envelope) -> Result<bytes::Bytes> {
 pub struct WorkerIpc {
     worker_id: String,
     unit_types: Vec<String>,
+    supports_unit_define: bool,
 }
 
 impl WorkerIpc {
@@ -203,7 +235,16 @@ impl WorkerIpc {
         WorkerIpc {
             worker_id: worker_id.to_string(),
             unit_types: unit_types.iter().map(|s| s.to_string()).collect(),
+            supports_unit_define: false,
         }
+    }
+
+    /// Declare support for the `unit.define` protocol: System A may ask this
+    /// worker to synthesize definitions for dynamic units of its types (e.g.
+    /// System R answers slice-name requests with the parent-slice chain).
+    pub fn supports_unit_define(mut self) -> Self {
+        self.supports_unit_define = true;
+        self
     }
 
     /// Run the worker IPC loop with automatic reconnection.
@@ -291,6 +332,7 @@ impl WorkerIpc {
         let reg = WorkerRegistration {
             worker_id: self.worker_id.clone(),
             unit_types: self.unit_types.clone(),
+            supports_unit_define: self.supports_unit_define,
         };
         let env = make_envelope(0, &self.worker_id, "system-a", "worker.register", reg)?;
         send_envelope(&mut framed, &env).await?;

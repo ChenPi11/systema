@@ -13,6 +13,34 @@ pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The root slice unit name (systemd's `-.slice`).
 pub const ROOT_SLICE_NAME: &str = "-.slice";
 
+/// The top-level container of all per-user slices (systemd's `user.slice`).
+/// It is a static, always-present slice: it exists from boot even before
+/// any user logs in, and every `user-<UID>.slice` lives inside it.
+pub const USER_SLICE_NAME: &str = "user.slice";
+
+/// The slice unit name of a user's session container (`user-<UID>.slice`).
+pub fn user_slice_name(uid: u32) -> String {
+    format!("user-{uid}.slice")
+}
+
+/// cgroup path of the `user.slice` root (`/sys/fs/cgroup/user.slice`).
+pub fn user_slice_root_path() -> String {
+    slice_cgroup_path(USER_SLICE_NAME)
+}
+
+/// cgroup path of a user's slice.  Per the slice naming rule the leaf is
+/// named after the last component only, so `user-1000.slice` lives at
+/// `/sys/fs/cgroup/user.slice/1000.slice`.
+pub fn user_slice_cgroup_path(uid: u32) -> String {
+    slice_cgroup_path(&user_slice_name(uid))
+}
+
+/// cgroup path of a user's manager service instance `user@<UID>.service`,
+/// which systemd places inside the user's own slice.
+pub fn user_manager_cgroup_path(uid: u32) -> String {
+    unit_cgroup_path(&user_slice_name(uid), &format!("user@{uid}.service"))
+}
+
 /// Split a slice unit name into its hierarchy components.
 ///
 /// `"system.slice"` → `["system"]`, `"foo-bar.slice"` → `["foo", "bar"]`,
@@ -204,6 +232,22 @@ mod tests {
         assert_eq!(
             unit_cgroup_path("system-foo.slice", "sshd.service"),
             "/sys/fs/cgroup/system.slice/foo.slice/sshd.service"
+        );
+    }
+
+    #[test]
+    fn user_slice_paths() {
+        assert_eq!(user_slice_name(1000), "user-1000.slice");
+        assert_eq!(user_slice_root_path(), "/sys/fs/cgroup/user.slice");
+        // user-<UID>.slice is a nested slice under user.slice: the leaf is
+        // named after the UID component only.
+        assert_eq!(
+            user_slice_cgroup_path(1000),
+            "/sys/fs/cgroup/user.slice/1000.slice"
+        );
+        assert_eq!(
+            user_manager_cgroup_path(1000),
+            "/sys/fs/cgroup/user.slice/1000.slice/user@1000.service"
         );
     }
 
