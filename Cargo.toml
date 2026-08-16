@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/libsysa",
+    "crates/backend/systema-sysi",
     "crates/backend/systema-sysf",
     "crates/backend/systema-sysa",
     "crates/backend/systema-syss",

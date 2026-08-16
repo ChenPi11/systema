@@ -1513,6 +1513,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "systema-sysi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix",
+ "sysa",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "systema-sysk"
 version = "0.1.0"
 dependencies = [

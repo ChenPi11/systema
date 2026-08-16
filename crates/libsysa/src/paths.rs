@@ -15,6 +15,11 @@ pub struct Paths {
     pub locale_dir: &'static str,
     pub unit_search_paths: Vec<String>,
     pub generator_search_paths: Vec<String>,
+    pub systema_bin_search_paths: Vec<String>,
+    /// Directory holding the notify listener sockets (SysAInit, boot
+    /// animation, ...).  System A broadcasts every boot/unit event to all
+    /// sockets found in this directory.
+    pub notify_dir: String,
 }
 
 fn resolve(env: &str, default: &'static str) -> &'static str {
@@ -55,6 +60,11 @@ fn compute_paths() -> Paths {
             "SYSTEMA_GENERATOR_PATH",
             builtin::GENERATOR_SEARCH_PATHS,
         ),
+        systema_bin_search_paths: resolve_list(
+            "SYSTEMA_BIN_PATH",
+            builtin::SYSTEMA_BIN_SEARCH_PATHS,
+        ),
+        notify_dir: resolve("SYSTEMA_NOTIFY_DIR", builtin::NOTIFY_DIR).to_string(),
     }
 }
 

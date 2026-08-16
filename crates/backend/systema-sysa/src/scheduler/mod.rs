@@ -542,6 +542,17 @@ pub async fn enqueue_job(
         check_mode_constraints(mode, kind, unit_name, allow_isolate)?;
     }
 
+    // Announce the job intent on the notify channel (bootlog / animation).
+    match kind {
+        JobKind::Start | JobKind::Restart => {
+            sysa::notify::broadcast(&[("UNIT_STARTING", unit_name)]);
+        }
+        JobKind::Stop => {
+            sysa::notify::broadcast(&[("UNIT_STOPPING", unit_name)]);
+        }
+        JobKind::Reload | JobKind::Nop => {}
+    }
+
     // --- Non-transient scopes are refused (systemd scope_start) ---
     //
     // Scopes wrap externally-created processes and exist only as transient
@@ -2495,6 +2506,7 @@ mod tests {
                 worker_id: "test-worker".to_string(),
                 unit_types: vec!["service".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                 envelope_tx: tx,
             },
         );
@@ -2569,6 +2581,7 @@ mod tests {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: tx,
                 },
             );
@@ -3296,6 +3309,7 @@ mod tests {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: scope_tx,
                 },
             );
@@ -3306,6 +3320,7 @@ mod tests {
                     worker_id: "system-r-1".to_string(),
                     unit_types: vec!["slice".to_string()],
                     supports_unit_define: true,
+                    ready: false,
                     envelope_tx: slice_tx,
                 },
             );
@@ -3323,6 +3338,7 @@ mod tests {
                     worker_id: "system-r-1".to_string(),
                     unit_types: vec!["slice".to_string()],
                     supports_unit_define: true,
+                    ready: false,
                     envelope_tx: slice_tx,
                 },
             );
@@ -3401,6 +3417,7 @@ mod tests {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: scope_tx,
                 },
             );
@@ -3415,6 +3432,7 @@ mod tests {
                     worker_id: "system-r-1".to_string(),
                     unit_types: vec!["slice".to_string()],
                     supports_unit_define: true,
+                    ready: false,
                     envelope_tx: slice_tx,
                 },
             );
@@ -3493,6 +3511,7 @@ mod tests {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: scope_tx,
                 },
             );
@@ -3506,6 +3525,7 @@ mod tests {
                     worker_id: "system-r-1".to_string(),
                     unit_types: vec!["slice".to_string()],
                     supports_unit_define: true,
+                    ready: false,
                     envelope_tx: slice_tx,
                 },
             );
@@ -3556,6 +3576,7 @@ mod tests {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: scope_tx,
                 },
             );
@@ -3587,6 +3608,7 @@ mod tests {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: scope_tx,
                 },
             );
@@ -3600,6 +3622,7 @@ mod tests {
                     worker_id: "system-r-1".to_string(),
                     unit_types: vec!["slice".to_string()],
                     supports_unit_define: true,
+                    ready: false,
                     envelope_tx: slice_tx,
                 },
             );
@@ -3645,6 +3668,7 @@ mod tests {
                     worker_id: "system-e-1".to_string(),
                     unit_types: vec!["scope".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: scope_tx,
                 },
             );
@@ -3658,6 +3682,7 @@ mod tests {
                     worker_id: "system-s-1".to_string(),
                     unit_types: vec!["service".to_string()],
                     supports_unit_define: false,
+                    ready: false,
                     envelope_tx: service_tx,
                 },
             );

@@ -274,6 +274,7 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
     let _ = DBUS_CONNECTION.set(conn.clone());
 
     info!("D-Bus server running");
+    sysa::notify::broadcast(&[("MANAGER_READY", "1"), ("STATUS", "dbus-acquired")]);
 
     // ----------------------------------------------------------------
     // Register per-unit objects for all units already loaded.

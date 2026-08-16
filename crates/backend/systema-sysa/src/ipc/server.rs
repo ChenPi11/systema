@@ -68,6 +68,10 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         sysa::paths::instance().systema_fdpass_sock
     );
 
+    // IPC channels are up — announce allocator readiness on the notify
+    // channel so SysAInit can proceed past the first startup phase.
+    sysa::notify::broadcast(&[("MANAGER_READY", "1"), ("STATUS", "ipc-ready")]);
+
     let fdpass_map: FdPassMap = Arc::new(Mutex::new(HashMap::new()));
 
     let fpm = fdpass_map.clone();
@@ -241,6 +245,7 @@ async fn handle_worker_session(
                 worker_id: worker_id.clone(),
                 unit_types: unit_types.clone(),
                 supports_unit_define: reg.supports_unit_define,
+                ready: false,
                 envelope_tx,
             },
         );
@@ -653,6 +658,25 @@ async fn handle_worker_session(
                             sub_id,
                         )
                         .await;
+                        continue;
+                    }
+
+                    if env.method == "worker.ready" {
+                        let ready_worker = worker_id_recv.clone();
+                        let mut state = alloc_for_recv.write();
+                        if let Some(entry) = state.workers.get_mut(&ready_worker) {
+                            entry.ready = true;
+                        }
+                        let ready_count = state.workers.values().filter(|w| w.ready).count();
+                        drop(state);
+                        info!(
+                            "Worker '{ready_worker}' is ready ({ready_count} worker(s) ready)"
+                        );
+                        sysa::notify::broadcast(&[("WORKER_READY", &ready_worker)]);
+                        sysa::notify::broadcast(&[(
+                            "STATUS",
+                            &format!("workers-ready={ready_count}"),
+                        )]);
                         continue;
                     }
 

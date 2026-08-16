@@ -1,3 +1,3 @@
 mod handlers;
 
-pub use handlers::{RestartHandler, WorkerEventForwarder, replay_active_units};
+pub use handlers::{NotifyBroadcaster, RestartHandler, WorkerEventForwarder, replay_active_units};

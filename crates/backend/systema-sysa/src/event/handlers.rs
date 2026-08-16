@@ -100,6 +100,68 @@ impl EventSubscriber for RestartHandler {
 }
 
 // ---------------------------------------------------------------------------
+// NotifyBroadcaster
+// ---------------------------------------------------------------------------
+
+/// Forwards unit state changes to the notify channel for the bootlog and
+/// the boot animation.
+///
+/// Each `unit.state_update` that reaches the event bus becomes one notify
+/// event.  Transitions are derived from the new state alone — no previous
+/// state is needed: `active` is a successful start, `failed` is a failed
+/// start, `inactive` is a completed stop.  The "about to start / stop"
+/// events come from the job-enqueue hooks in the scheduler.
+#[derive(Default)]
+pub struct NotifyBroadcaster {}
+
+impl NotifyBroadcaster {
+    pub fn new() -> Self {
+        NotifyBroadcaster {}
+    }
+}
+
+#[async_trait]
+impl EventSubscriber for NotifyBroadcaster {
+    fn topics(&self) -> Vec<EventTopic> {
+        vec![EventTopic::UnitStateChange]
+    }
+
+    async fn on_event(&self, event: &Event) {
+        if event.topic != EventTopic::UnitStateChange {
+            return;
+        }
+        let Some(status) = UnitStatus::decode_from(&event.data) else {
+            warn!(
+                "NotifyBroadcaster: failed to decode UnitStatus for {}",
+                event.unit_name
+            );
+            return;
+        };
+        match status.active_state.as_str() {
+            "active" => {
+                sysa::notify::broadcast(&[
+                    ("UNIT_STARTED", &status.unit_name),
+                    ("RESULT", "success"),
+                ]);
+            }
+            "failed" => {
+                sysa::notify::broadcast(&[
+                    ("UNIT_STARTED", &status.unit_name),
+                    ("RESULT", "failed"),
+                ]);
+            }
+            "inactive" => {
+                sysa::notify::broadcast(&[
+                    ("UNIT_STOPPED", &status.unit_name),
+                    ("RESULT", "success"),
+                ]);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WorkerEventForwarder
 // ---------------------------------------------------------------------------
 

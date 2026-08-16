@@ -388,6 +388,29 @@ impl WorkerIpc {
                 event_publisher.publish_unit_state_update(units, true);
             }
 
+            // Declare readiness: registration accepted and the initial full
+            // snapshot sent.  System A marks the worker ready and broadcasts
+            // `WORKER_READY=<worker_id>` on the notify channel (re-sent on
+            // every reconnect, idempotent on the allocator side).
+            match make_envelope(
+                0,
+                &self.worker_id,
+                "system-a",
+                "worker.ready",
+                WorkerReady {},
+            )
+            .and_then(encode_envelope)
+            {
+                Ok(env) => {
+                    if out_tx.send(env).is_err() {
+                        warn!("Outgoing channel closed; cannot send worker.ready");
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to encode worker.ready: {}", e);
+                }
+            }
+
             loop {
                 let bytes = match reader.next().await {
                     None => {

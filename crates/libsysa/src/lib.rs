@@ -10,6 +10,7 @@ pub mod event_bus;
 pub mod finder;
 pub mod ipc;
 pub mod l10n;
+pub mod notify;
 pub mod paths;
 pub mod staging_admin;
 pub mod unit_name;

@@ -89,6 +89,14 @@ message RegisterAck {
     string message = 2;
 }
 
+// Sent by a System Worker once its registration is accepted and its initial
+// full state snapshot has been published.  Fire-and-forget (no ACK): System A
+// marks the worker ready and broadcasts `WORKER_READY=<worker_id>` on the
+// notify channel so SysAInit can advance its serial startup sequence.
+message WorkerReady {
+    // Empty — the worker's identity is the envelope's source field.
+}
+
 // Sent by a Worker to System A to report runtime state changes for one or
 // more units.  This is the unified state-update channel.
 message UnitStateUpdate {

@@ -263,6 +263,8 @@ pub struct WorkerEntry {
     /// Whether the worker implements the `unit.define` protocol and may be
     /// asked to synthesize definitions for dynamic units of its types.
     pub supports_unit_define: bool,
+    /// Whether the worker declared itself ready (`worker.ready` envelope).
+    pub ready: bool,
     /// Channel to send pre-encoded envelopes (method calls, etc.).
     pub envelope_tx: mpsc::Sender<bytes::Bytes>,
 }

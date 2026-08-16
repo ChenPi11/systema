@@ -64,6 +64,8 @@ pub const SYSTEMD_MACHINE_ID_FILE: &str = "/etc/machine-id";
 pub const IPC_SOCKET_PATH: &str = "/run/system-alphabet/allocator.sock";
 pub const SYSTEMA_FDPASS_SOCK: &str = "/run/system-alphabet/fdpass.sock";
 
+pub const NOTIFY_DIR: &str = "/run/system-alphabet/notify";
+
 pub const SYSTEMA_SHELL_PATH: &str = "/bin/sh";
 pub const SYSTEMA_SOCKET_HANDLER_PATH: &str = "/usr/lib/system-alphabet/socket-handler";
 
@@ -86,6 +88,23 @@ pub const GENERATOR_SEARCH_PATHS: &[&str] = &[
     "/usr/local/lib/systemd/system-generators",
     "/usr/lib/systemd/system-generators",
     "/lib/systemd/system-generators",
+];
+
+pub const SYSTEMA_BIN_SEARCH_PATHS: &[&str] = &[
+    "/",
+    "/bin",
+    "/sbin",
+    "/lib/systema",
+    "/libexec/systema",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib/systema",
+    "/usr/libexec/systema",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/local/lib/systema",
+    "/usr/local/libexec/systema",
+    "/opt/systema",
 ];
 "#;
 
