@@ -1,6 +1,7 @@
 # System Allocator (System A) 功能实现 TODO 列表
 
-> 根据软件工程设计图与问题陈述整理，对照当前 `crates/system-a` 代码的实际实现状态。
+> 根据软件工程设计图与问题陈述整理，对照当前 `crates/backend/systema-sysa` 代码的实际实现状态。
+> （最后核对：2026-08-16，M1/M2 完成后）
 >
 > **状态说明：**
 > - ✅ **完全实现**：功能与设计目标完全一致
@@ -11,7 +12,7 @@
 
 ## 一、Unit 加载器（Unit Loader）
 
-**实现文件：** `crates/system-a/src/unit/`
+**实现文件：** `crates/backend/systema-sysa/src/unit/`
 
 ### 1.1 Unit 文件解析
 
@@ -54,7 +55,7 @@
 
 ## 二、依赖图构建（Dependency Graph）
 
-**实现文件：** `crates/system-a/src/graph/mod.rs`
+**实现文件：** `crates/backend/systema-sysa/src/graph/mod.rs`
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
@@ -77,7 +78,7 @@
 
 ## 三、拓扑排序与任务生成（Task Generator）
 
-**实现文件：** `crates/system-a/src/scheduler/mod.rs`
+**实现文件：** `crates/backend/systema-sysa/src/scheduler/mod.rs`
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
@@ -106,7 +107,7 @@
 
 ## 四、期望状态管理（Desired State Manager）
 
-**实现文件：** `crates/system-a/src/state.rs`
+**实现文件：** `crates/backend/systema-sysa/src/state.rs`
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
@@ -128,7 +129,7 @@
 
 ## 五、IPC 服务器（内部通信）
 
-**实现文件：** `crates/system-a/src/ipc/server.rs`
+**实现文件：** `crates/backend/systema-sysa/src/ipc/server.rs`
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
@@ -141,17 +142,17 @@
 | 任务结果接收（`task.result`） | ✅ 完全实现 | |
 | 事件接收（`event.publish`：`process.exit`、`service.started`、`service.failed`） | ✅ 完全实现 | |
 | Worker 断线检测与清理 | ✅ 完全实现 | |
-| Worker 断线后自动重新连接（System A 视角） | ❌ 未实现 | Worker 断线后仅注销，不尝试重新连接 |
+| Worker 断线后自动重新连接 | ✅ 完全实现 | 重连由 Worker 客户端侧实现（`libsysa/src/worker_ipc.rs:250`，退避重试）；System A 侧接受重新注册 |
 | 多个同类型 Worker 负载均衡 | ❌ 未实现 | 仅取第一个匹配的 Worker |
-| 事件总线 Pub/Sub 机制（任意订阅者） | ❌ 未实现 | 当前仅 System A 处理事件，无通用发布订阅 |
+| 事件总线 Pub/Sub 机制 | ✅ 完全实现 | `AllocatorState.event_bus`（`state.rs:338`，`EventBus`）；事件经 `dispatch` 分发给订阅者（`server.rs:1410`），用于 UnitStateChange 推送（D-Bus 信号 + WorkerEventForwarder 资源事件转发） |
 | `SOCK_SEQPACKET` 传输层（当前为 `SOCK_STREAM`） | ❌ 未实现 | 当前使用 `UnixListener`（SOCK_STREAM）而非设计中的 SEQPACKET |
-| 反压控制（背压机制） | ❌ 未实现 | 任务通道满时直接丢弃 |
+| 反压控制（背压机制） | ⚠️ 部分实现 | 每 worker 有界通道（容量 64，`server.rs:230`）；发送端 `await` 阻塞即天然背压（`scheduler/mod.rs:1144`），但无显式的降级/丢弃策略 |
 
 ---
 
 ## 六、D-Bus 服务器（外部兼容层）
 
-**实现文件：** `crates/system-a/src/dbus/`
+**实现文件：** `crates/backend/systema-sysa/src/dbus/`
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
@@ -159,11 +160,11 @@
 | `org.freedesktop.systemd1.Manager` 接口注册（`/org/freedesktop/systemd1`） | ✅ 完全实现 | |
 | 核心管理方法（Start/Stop/Restart/Reload/ListUnits 等） | ⚠️ 部分实现 | 详见 `dbus-todo.md` |
 | 管理器属性（Version/Architecture/NNames 等） | ⚠️ 部分实现 | 大量属性为固定值，详见 `dbus-todo.md` |
-| 每单元 D-Bus 对象动态注册（`Unit`/`Service`/`Target` 接口） | ⚠️ 部分实现 | 已动态注册基础 `Unit` 与 `Service`；`Target` 专有接口尚未注册 |
+| 每单元 D-Bus 对象动态注册（`Unit`/`Service`/`Scope`/`Slice`/`Mount`/`Socket` 接口） | ⚠️ 部分实现 | 上述接口均已注册（`dbus/mod.rs` `register_unit_object`）；`Target`/`Timer`/`Path`/`Device`/`Swap`/`Automount` 专有接口未注册；详见 `dbus-todo.md` |
 | 每作业 D-Bus 对象动态注册（`Job` 接口） | ❌ 未实现 | 管理方法会返回 `job/<id>` 路径，但该路径未注册 `Job` 对象 |
-| D-Bus 信号（`UnitNew`/`UnitRemoved`/`JobNew`/`JobRemoved`/`StartupFinished`） | ⚠️ 部分实现 | 已发出 `JobRemoved`，其余信号未实现 |
+| D-Bus 信号（`UnitNew`/`UnitRemoved`/`JobNew`/`JobRemoved`/`StartupFinished`/`Reloading`） | ⚠️ 部分实现 | 已发出 `JobNew`/`JobRemoved`/`UnitRemoved`/`Reloading`；`UnitNew`/`StartupFinished`/`UnitFilesChanged` 未实现 |
 | polkit 权限检查 | ❌ 未实现 | 所有方法无访问控制 |
-| `org.freedesktop.DBus.Properties` 标准接口 | ⚠️ 部分实现 | zbus 自动为 Manager 和已注册 Unit/Service 对象提供 |
+| `org.freedesktop.DBus.Properties` 标准接口 | ⚠️ 部分实现 | 自定义实现（`dbus/properties.rs`）替换 zbus 默认分发：覆盖 Unit/Service/Socket/Mount/Slice 接口；**Scope 接口未处理**（`Get`/`GetAll(Scope)` 返回 `UnknownInterface`，见 `dbus-todo.md`） |
 | `org.freedesktop.DBus.Introspectable` 标准接口 | ⚠️ 部分实现 | zbus 自动为 Manager 生成 |
 | `org.freedesktop.DBus.ObjectManager` 接口 | ❌ 未实现 | 无法枚举所有 D-Bus 对象 |
 | `PropertiesChanged` 信号（属性变更通知） | ❌ 未实现 | |
@@ -191,11 +192,18 @@ System A 与以下 Worker 通过 IPC 交互，以下是 System A 侧对各 Worke
 
 | Worker | 状态 | 说明 |
 |--------|------|------|
-| **System S**（Service Worker） | ⚠️ 部分实现 | IPC 通信已实现；System S 已实现基础状态机和进程管理；systemd 兼容的 ExecStart 解析（前缀、分词、% 说明符、$VAR 展开、| shell 调用）；重启策略、cgroup、看门狗等未实现 |
-| **System T**（Target Worker） | ⚠️ 部分实现 | Target 内部激活逻辑已内嵌于 System A，无独立 Worker；但不能响应来自 Target 的事件 |
-| **System M**（Mount Worker） | ❌ 未实现 | `crates/system-m` 不存在 |
-| **System C**（Cron/Timer Worker） | ❌ 未实现 | `crates/system-c` 不存在 |
-| **System B**（Boot Worker） | ❌ 未实现 | `crates/system-b` 不存在 |
+| **System S**（Service Worker） | ✅ 已实现 | `crates/backend/systema-syss`：服务状态机与进程管理（`tokio::process` 包装 fork/exec，`process.rs`）；ExecStart 解析（前缀、分词、% 说明符、$VAR 展开、`\|` shell 调用）；重启策略；SIGTERM 等信号用 nix（`Cargo.toml:27-28`）。未实现：命名空间/能力/seccomp 等执行上下文 |
+| **System R**（Resource Worker） | ✅ 已实现 | `crates/backend/systema-sysr`：slice 单元 + cgroup v2 资源控制（memory/CPU/IO/tasks）；`unit.define` 合成 handler（`supports_unit_define`）；`cgroup.metrics` 推送 |
+| **System E**（External Process Worker） | ✅ 已实现 | `crates/backend/systema-syse`：scope 单元（PIDs 包装、cgroup.events、RuntimeMaxSec、Abandon） |
+| **System T**（Target Worker） | ✅ 已实现 | `crates/backend/systema-syst`：独立进程，target 状态跟踪（原内嵌于 System A） |
+| **System C**（Cron/Timer Worker） | ✅ 已实现 | `crates/backend/systema-sysc`：timer 单元（单调 + 日历调度，`timer.fired`） |
+| **System P**（Path Worker） | ✅ 已实现 | `crates/backend/systema-sysp`：path 单元（PathExists/Glob/Changed/Modified、DirectoryNotEmpty，inotify） |
+| **System K**（Socket Worker） | ✅ 已实现 | `crates/backend/systema-sysk`：socket 单元（TCP/Unix 监听、fd 传递）；socket activation 仅 inetd 式（无 LISTEN_FDS/LISTEN_PID 环境、不关联配对 service） |
+| **System D**（Device Worker） | ✅ 已实现 | `crates/backend/systema-sysd`：device 单元（/dev + sysfs 发现、netlink、match 规则） |
+| **System M**（Mount Worker） | ✅ 已实现 | `crates/backend/systema-sysm`（+ `.linux` flavor）：mount / automount 单元 |
+| **System F**（Finder Worker） | ⚠️ 部分实现 | `crates/backend/systema-sysf`：静态单元发现与解析（库 + worker 双形态），经 staging 区提交（`finder.register_units`/`finder.commit_units`） |
+| **System B**（Boot/Power Worker） | ❌ 未实现 | 无 `reboot/poweroff/halt/kexec` 等 D-Bus 方法；仅 `StartLimitAction=` 副作用调用外部 `shutdown` 命令 |
+| **swap 单元** | ❌ 未实现 | 解析支持（`UnitKind::Swap`），但无对应 worker |
 
 ---
 
@@ -216,7 +224,7 @@ System A 与以下 Worker 通过 IPC 交互，以下是 System A 侧对各 Worke
 | Unit 文件解析单元测试（`.service`） | ✅ 完全实现 | |
 | Unit 文件解析单元测试（`.target`） | ✅ 完全实现 | |
 | 依赖图拓扑排序测试 | ✅ 完全实现 | |
-| 任务调度器测试（JobMode、start/stop order、条件检查、限流等） | ✅ 完全实现 | 34 个单元测试覆盖所有调度功能 |
+| 任务调度器测试（JobMode、start/stop order、条件检查、限流等） | ✅ 完全实现 | 数十个单元测试覆盖所有调度功能（当前 sysa 共 246 个测试） |
 | IPC 客户端-服务器集成测试 | ❌ 未实现 | |
 | D-Bus 接口集成测试 | ❌ 未实现 | |
-| 端到端测试（`systemctl start/stop`） | ❌ 未实现 | |
+| 端到端测试（`systemctl start/stop`） | ⚠️ 部分实现 | 自动化脚本未落地；已在 Linux VM 上手动冒烟验证（M3，全链路 + 物化机制） |
