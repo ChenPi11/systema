@@ -4,16 +4,17 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::loader;
-use super::types::{
-    ExecCommand as SdExecCommand, ResourceControl as SdResourceControl,
-    RestartPolicy as SdRestartPolicy, ServiceSection, UnitFile, UnitKind,
-};
-use crate::ir::{
+use systema_sysf::ir::{
     self, AutomountConfig, Condition, DependencySet, ExecCommand, MountConfig, ServiceConfig,
     SocketConfig, TimerConfig, UnitIR, UnitType,
 };
-use crate::Finder;
+use systema_sysf::Finder;
+
+use crate::loader;
+use crate::types::{
+    ExecCommand as SdExecCommand, ResourceControl as SdResourceControl,
+    RestartPolicy as SdRestartPolicy, ServiceSection, UnitFile, UnitKind,
+};
 
 /// Systemd implementation of the [`Finder`] trait.
 ///
@@ -209,7 +210,7 @@ fn convert_service(svc: &ServiceSection) -> ServiceConfig {
     }
 }
 
-fn convert_automount(amt: &super::types::AutomountSection) -> AutomountConfig {
+fn convert_automount(amt: &crate::types::AutomountSection) -> AutomountConfig {
     AutomountConfig {
         where_: amt.where_.clone(),
         extra_options: amt.extra_options.clone(),
@@ -218,7 +219,7 @@ fn convert_automount(amt: &super::types::AutomountSection) -> AutomountConfig {
     }
 }
 
-fn convert_mount(mnt: &super::types::MountSection) -> MountConfig {
+fn convert_mount(mnt: &crate::types::MountSection) -> MountConfig {
     MountConfig {
         what: mnt.what.clone(),
         where_: mnt.where_.clone(),
@@ -228,7 +229,7 @@ fn convert_mount(mnt: &super::types::MountSection) -> MountConfig {
     }
 }
 
-fn convert_timer(tmr: &super::types::TimerSection) -> TimerConfig {
+fn convert_timer(tmr: &crate::types::TimerSection) -> TimerConfig {
     TimerConfig {
         on_active_sec: tmr.on_active_sec,
         on_boot_sec: tmr.on_boot_sec,
@@ -243,7 +244,7 @@ fn convert_timer(tmr: &super::types::TimerSection) -> TimerConfig {
     }
 }
 
-fn convert_socket(sock: &super::types::SocketSection) -> SocketConfig {
+fn convert_socket(sock: &crate::types::SocketSection) -> SocketConfig {
     SocketConfig {
         listen_stream: sock.listen_stream.clone(),
         listen_datagram: sock.listen_datagram.clone(),
@@ -297,21 +298,6 @@ fn convert_asserts(uf: &UnitFile) -> Vec<Condition> {
         conds.push(Condition::from_value("FirstBoot", v));
     }
     conds
-}
-
-impl Condition {
-    fn from_value(kind: &str, value: &str) -> Self {
-        let (negate, val) = if let Some(rest) = value.strip_prefix('!') {
-            (true, rest.to_string())
-        } else {
-            (false, value.to_string())
-        };
-        Condition {
-            kind: kind.to_string(),
-            value: val,
-            negate,
-        }
-    }
 }
 
 impl SystemdFinder {

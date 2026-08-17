@@ -4,7 +4,7 @@
 //! sends a `WorkerRegistration`, then receives dispatched `method.call`
 //! envelopes and sends back `method.result` / `event.publish` envelopes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -20,9 +20,11 @@ use sysa::event_bus::Event;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
     AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope,
-    EventSubscribe, EventUnsubscribe, MethodResult, PathFired, RegisterAck, RegisterUnits,
-    StagingAreaEntry, StagingQuery, StagingQueryResult, TimerFired, UnitDefineResult,
-    UnitRegistrationAck, UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    EventSubscribe, EventUnsubscribe, ListUnitsRequest, ListUnitsResult, MethodResult, PathFired,
+    RegisterAck, RegisterUnits, StagingAreaEntry, StagingQuery, StagingQueryResult,
+    StartUnitsRequest, StartUnitsResult, StopUnitsRequest, StopUnitsResult, TimerFired,
+    UnitDefineResult, UnitInfo, UnitRegistrationAck, UnitStartResult, UnitStateUpdate,
+    UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
@@ -30,7 +32,7 @@ use crate::event::{WorkerEventForwarder, replay_active_units};
 use crate::state::{next_request_id, AllocatorHandle, CachedUnitState, WorkerEntry};
 
 /// Shared fdpass channel map: worker_id → UnixStream (for SCM_RIGHTS).
-pub type FdPassMap = Arc<Mutex<HashMap<String, UnixStream>>>;
+pub type FdPassMap = Arc<Mutex<HashMap<String, Arc<UnixStream>>>>;
 
 /// Run the IPC server — accepts System Worker & Finder connections indefinitely.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
@@ -73,10 +75,16 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     sysa::notify::broadcast(&[("MANAGER_READY", "1"), ("STATUS", "ipc-ready")]);
 
     let fdpass_map: FdPassMap = Arc::new(Mutex::new(HashMap::new()));
+    // Queue of workers waiting for a listener fd: requesters in FIFO order.
+    // A service worker pushes itself before asking the socket worker for an
+    // fd; when the fd arrives over a socket-worker fdpass channel, it is
+    // forwarded to the front of this queue.
+    let pending_fd: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let fpm = fdpass_map.clone();
+    let pf = pending_fd.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_fdpass_acceptor(fdpass_listener, fpm).await {
+        if let Err(e) = run_fdpass_acceptor(fdpass_listener, fpm, pf).await {
             error!("FD-Pass acceptor error: {}", e);
         }
     });
@@ -85,9 +93,9 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let alloc = allocator.clone();
-                let fpm = fdpass_map.clone();
+                let pf = pending_fd.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_worker(stream, alloc, fpm).await {
+                    if let Err(e) = handle_worker(stream, alloc, pf).await {
                         error!("Worker connection error: {}", e);
                     }
                 });
@@ -99,13 +107,19 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     }
 }
 
-async fn run_fdpass_acceptor(listener: UnixListener, fdpass_map: FdPassMap) -> Result<()> {
+async fn run_fdpass_acceptor(
+    listener: UnixListener,
+    fdpass_map: FdPassMap,
+    pending_fd: Arc<Mutex<VecDeque<String>>>,
+) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         let fpm = fdpass_map.clone();
+        let pending = pending_fd.clone();
         tokio::spawn(async move {
+            let mut stream = stream;
             let mut buf = [0u8; 128];
             let n = match stream.read(&mut buf).await {
                 Ok(0) => return,
@@ -120,8 +134,64 @@ async fn run_fdpass_acceptor(listener: UnixListener, fdpass_map: FdPassMap) -> R
                 warn!("fdpass connection with empty worker_id");
                 return;
             }
-            fpm.lock().insert(worker_id.clone(), stream);
+            let shared = Arc::new(stream);
+            fpm.lock().insert(worker_id.clone(), shared.clone());
             info!("fdpass channel registered for '{}'", worker_id);
+
+            // Receive listener fds sent by socket workers (SCM_RIGHTS) and
+            // forward each one to the worker at the front of the pending
+            // request queue (the service worker that asked for it).
+            loop {
+                match sysa::ipc::recv_fd(shared.as_ref()).await {
+                    Ok(fd) => {
+                        let requester = pending.lock().pop_front();
+                        match requester {
+                            Some(requester) => {
+                                let dest = fpm.lock().get(&requester).cloned();
+                                if let Some(dest) = dest {
+                                    if let Err(e) = sysa::ipc::send_fd(dest.as_ref(), fd).await {
+                                        warn!(
+                                            "fdpass: forwarding fd {} to '{}' failed: {}",
+                                            fd, requester, e
+                                        );
+                                    } else {
+                                        info!(
+                                            "fdpass: forwarded fd {} to '{}'",
+                                            fd, requester
+                                        );
+                                    }
+                                    // Our copy of the received fd is no longer
+                                    // needed (the receiver got its own).
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                } else {
+                                    warn!(
+                                        "fdpass: requester '{}' has no fdpass channel; closing fd {}",
+                                        requester, fd
+                                    );
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    "fdpass: received fd {} with no pending request; closing",
+                                    fd
+                                );
+                                unsafe {
+                                    libc::close(fd);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("fdpass: recv error on '{}' channel: {}", worker_id, e);
+                        break;
+                    }
+                }
+            }
         });
     }
 }
@@ -184,7 +254,7 @@ fn system_uid() -> u32 {
 async fn handle_worker(
     stream: tokio::net::UnixStream,
     allocator: AllocatorHandle,
-    _fdpass_map: FdPassMap,
+    pending_fd: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<()> {
     let (_client_pid, client_uid) = peer_cred(&stream).context("failed to get peer credentials")?;
     let mut framed = frame_stream(stream);
@@ -194,14 +264,21 @@ async fn handle_worker(
     })?;
 
     match env.method.as_str() {
-        "worker.register" => handle_worker_session(framed, env, allocator).await,
+        "worker.register" => {
+            handle_worker_session(framed, env, allocator, pending_fd).await
+        }
         "finder.register_units" => handle_finder_register(framed, env, allocator, client_uid).await,
         "finder.commit_units" => handle_finder_commit(framed, env, allocator, client_uid).await,
         "staging.query" => handle_finder_query(framed, env, allocator, client_uid).await,
         "admin.staging" => handle_admin_staging(framed, env, allocator, client_uid).await,
+        "manager.list_units" => handle_manager_list_units(framed, env, allocator, client_uid).await,
+        "manager.start_units" => {
+            handle_manager_start_units(framed, env, allocator, client_uid).await
+        }
+        "manager.stop_units" => handle_manager_stop_units(framed, env, allocator, client_uid).await,
         other => {
             anyhow::bail!(sysa::l10n::fmt(
-                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', or 'admin.staging', got '{method}'"),
+                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', 'manager.list_units', 'manager.start_units', or 'manager.stop_units', got '{method}'"),
                 &[("method", other)],
             ))
         }
@@ -212,6 +289,7 @@ async fn handle_worker_session(
     mut framed: sysa::ipc::EnvelopeFramed,
     env: Envelope,
     allocator: AllocatorHandle,
+    pending_fd: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<()> {
     let reg = WorkerRegistration::decode(env.payload.as_slice())?;
     let worker_id = reg.worker_id.clone();
@@ -272,6 +350,7 @@ async fn handle_worker_session(
     let alloc_for_recv = allocator.clone();
     let worker_id_recv = worker_id.clone();
     let worker_id_send = worker_id.clone();
+    let pending_fd_recv = pending_fd.clone();
 
     // Sender task: reads pre-encoded envelopes from envelope_rx.
     let sender = async move {
@@ -374,6 +453,76 @@ async fn handle_worker_session(
                                 worker_id_recv, qid
                             );
                         }
+                        continue;
+                    }
+
+                    // A service worker asks for the listener fd of a socket
+                    // unit (socket activation). Forward the request to the
+                    // socket worker and remember the requester: the fd that
+                    // arrives over the socket worker's fdpass channel will be
+                    // forwarded to it (FIFO).
+                    if env.method == "socket.request_fd" {
+                        let unit_name = String::from_utf8_lossy(&env.payload).to_string();
+                        let requester = worker_id_recv.clone();
+                        if unit_name.is_empty() {
+                            warn!(
+                                "socket.request_fd from '{}' with empty unit name",
+                                requester
+                            );
+                            continue;
+                        }
+                        let target = {
+                            let state = alloc_for_recv.read();
+                            state
+                                .workers
+                                .values()
+                                .find(|w| w.unit_types.iter().any(|t| t == "socket"))
+                                .map(|w| w.worker_id.clone())
+                        };
+                        let Some(sock_wid) = target else {
+                            warn!(
+                                "socket.request_fd for '{}' from '{}' but no socket worker registered",
+                                unit_name, requester
+                            );
+                            continue;
+                        };
+                        pending_fd_recv.lock().push_back(requester.clone());
+                        let mut buf = bytes::BytesMut::new();
+                        let fwd = Envelope {
+                            request_id: next_request_id(),
+                            source: "system-a".to_string(),
+                            target: sock_wid.clone(),
+                            method: "socket.request_fd".to_string(),
+                            payload: env.payload.clone(),
+                        };
+                        if let Err(e) = fwd.encode(&mut buf) {
+                            warn!(
+                                "Failed to encode socket.request_fd forward for '{}': {}",
+                                unit_name, e
+                            );
+                            pending_fd_recv.lock().pop_back();
+                            continue;
+                        }
+                        let sock_tx = {
+                            let state = alloc_for_recv.read();
+                            state.workers.get(&sock_wid).map(|w| w.envelope_tx.clone())
+                        };
+                        let delivered = match sock_tx {
+                            Some(tx) => tx.send(buf.freeze()).await.is_ok(),
+                            None => false,
+                        };
+                        if !delivered {
+                            warn!(
+                                "Failed to deliver socket.request_fd for '{}' to '{}'",
+                                unit_name, sock_wid
+                            );
+                            pending_fd_recv.lock().pop_back();
+                            continue;
+                        }
+                        info!(
+                            "Forwarded socket.request_fd for '{}' from '{}' to '{}'",
+                            unit_name, requester, sock_wid
+                        );
                         continue;
                     }
 
@@ -1069,6 +1218,248 @@ async fn handle_admin_staging(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Control plane (SysAInit → System A)
+// ---------------------------------------------------------------------------
+
+/// `manager.list_units` — list the units System A has loaded, optionally
+/// filtered to enabled ones.
+async fn handle_manager_list_units(
+    mut framed: sysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<()> {
+    let req = ListUnitsRequest::decode(env.payload.as_slice())?;
+    info!(
+        "Control request from UID={client_uid}: manager.list_units (enabled_only={})",
+        req.enabled_only
+    );
+
+    let enabled = crate::unit::enable::scan_enabled_units(
+        &sysa::paths::instance().unit_search_paths,
+    );
+    let result = {
+        let state = allocator.read();
+        build_list_result(&state, &enabled, req.enabled_only)
+    };
+    info!(
+        "manager.list_units returning {} unit(s) (enabled_only={})",
+        result.units.len(),
+        req.enabled_only
+    );
+
+    let reply = make_envelope(
+        next_request_id(),
+        "system-a",
+        "",
+        "manager.list_units.result",
+        result,
+    )?;
+    send_envelope(&mut framed, &reply).await?;
+    Ok(())
+}
+
+/// Build the `manager.list_units` reply (pure, testable without the global
+/// path config).
+///
+/// `enabled_only` asks for the *boot set*: every enabled unit on disk,
+/// whether or not it is loaded yet (a unit that is not loaded has its type
+/// derived from the file extension).  Otherwise every loaded unit is
+/// returned with its enablement flag.
+fn build_list_result(
+    state: &crate::state::AllocatorState,
+    enabled: &HashSet<String>,
+    enabled_only: bool,
+) -> ListUnitsResult {
+    let mut units: Vec<UnitInfo> = if enabled_only {
+        enabled
+            .iter()
+            .map(|name| {
+                let unit_type = state
+                    .units
+                    .get(name)
+                    .map(|u| u.kind.worker_type().to_string())
+                    .unwrap_or_else(|| {
+                        crate::unit::types::UnitKind::from_extension(name)
+                            .worker_type()
+                            .to_string()
+                    });
+                UnitInfo {
+                    name: name.clone(),
+                    unit_type,
+                    enabled: true,
+                }
+            })
+            .collect()
+    } else {
+        state
+            .units
+            .iter()
+            .map(|(name, unit)| UnitInfo {
+                name: name.clone(),
+                unit_type: unit.kind.worker_type().to_string(),
+                enabled: enabled.contains(name),
+            })
+            .collect()
+    };
+    units.sort_by(|a, b| a.name.cmp(&b.name));
+    ListUnitsResult {
+        success: true,
+        message: String::new(),
+        units,
+    }
+}
+
+/// `manager.start_units` — enqueue a start job for every listed unit.
+///
+/// Each name goes through the normal transaction machinery (dependency
+/// expansion, topological ordering, job merging), mirroring `systemctl
+/// start a b c`.  Unknown or unusable names are reported per-name without
+/// blocking the rest.
+async fn handle_manager_start_units(
+    mut framed: sysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<()> {
+    let req = StartUnitsRequest::decode(env.payload.as_slice())?;
+    info!(
+        "Control request from UID={client_uid}: manager.start_units ({} unit(s))",
+        req.names.len()
+    );
+
+    let mut results = Vec::with_capacity(req.names.len());
+    for name in &req.names {
+        info!("manager.start_units: processing '{name}'");
+        // Materialize on-disk definitions first (idempotent), so enabled
+        // units that were not loaded at startup can still be started.
+        let loaded = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::unit::loader::ensure_loaded_from_disk(allocator.clone(), name),
+        )
+        .await;
+        match loaded {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!("manager.start_units: cannot load '{}': {}", name, e);
+                results.push(UnitStartResult {
+                    name: name.clone(),
+                    success: false,
+                    message: e.to_string(),
+                });
+                continue;
+            }
+            Err(_) => {
+                warn!("manager.start_units: timed out loading '{}'", name);
+                results.push(UnitStartResult {
+                    name: name.clone(),
+                    success: false,
+                    message: "load timed out".to_string(),
+                });
+                continue;
+            }
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            crate::scheduler::enqueue_start_with_mode(
+                allocator.clone(),
+                name,
+                crate::state::JobMode::Replace,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(job_id)) => {
+                info!("manager.start_units: enqueued job {job_id} for '{name}'");
+                results.push(UnitStartResult {
+                    name: name.clone(),
+                    success: true,
+                    message: format!("job {job_id}"),
+                });
+            }
+            Ok(Err(e)) => {
+                warn!("manager.start_units: cannot start '{}': {}", name, e);
+                results.push(UnitStartResult {
+                    name: name.clone(),
+                    success: false,
+                    message: e.to_string(),
+                });
+            }
+            Err(_) => {
+                warn!("manager.start_units: timed out starting '{}'", name);
+                results.push(UnitStartResult {
+                    name: name.clone(),
+                    success: false,
+                    message: "start timed out".to_string(),
+                });
+            }
+        }
+    }
+
+    let success = !results.is_empty() && results.iter().all(|r| r.success);
+    let reply = make_envelope(
+        next_request_id(),
+        "system-a",
+        "",
+        "manager.start_units.result",
+        StartUnitsResult {
+            success,
+            results,
+        },
+    )?;
+    send_envelope(&mut framed, &reply).await?;
+    Ok(())
+}
+
+/// `manager.stop_units` — enqueue a stop job for one unit.
+async fn handle_manager_stop_units(
+    mut framed: sysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<()> {
+    let req = StopUnitsRequest::decode(env.payload.as_slice())?;
+    info!(
+        "Control request from UID={client_uid}: manager.stop_units ('{}')",
+        req.name
+    );
+
+    let result = match crate::scheduler::enqueue_job(
+        allocator.clone(),
+        &req.name,
+        crate::state::JobKind::Stop,
+        crate::state::JobMode::Replace,
+    )
+    .await
+    {
+        Ok(job_id) => {
+            info!("manager.stop_units: enqueued job {job_id} for '{}'", req.name);
+            StopUnitsResult {
+                success: true,
+                message: format!("job {job_id}"),
+            }
+        }
+        Err(e) => {
+            warn!("manager.stop_units: cannot stop '{}': {}", req.name, e);
+            StopUnitsResult {
+                success: false,
+                message: e.to_string(),
+            }
+        }
+    };
+
+    let reply = make_envelope(
+        next_request_id(),
+        "system-a",
+        "",
+        "manager.stop_units.result",
+        result,
+    )?;
+    send_envelope(&mut framed, &reply).await?;
+    Ok(())
+}
+
 fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> AdminStagingResult {
     let state = allocator.read();
     match op.op.as_str() {
@@ -1416,14 +1807,27 @@ async fn handle_state_update(
         warn!("Failed to encode unit.state_update_ack for '{sender}'");
         return;
     }
-    let worker_tx = {
+let worker_tx = {
         let state = allocator.read();
         state.workers.get(sender).map(|w| w.envelope_tx.clone())
     };
     match worker_tx {
         Some(tx) => {
-            if tx.send(buf.freeze()).await.is_err() {
-                warn!("Failed to send unit.state_update_ack to '{sender}'");
+            // Bounded: a worker that stops reading its envelope channel
+            // must not wedge the single-threaded System A runtime forever.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tx.send(buf.freeze()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Failed to send unit.state_update_ack to '{}': {e}", sender);
+                }
+                Err(_) => {
+                    warn!("Timed out sending unit.state_update_ack to '{}'", sender);
+                }
             }
         }
         None => warn!("unit.state_update_ack: worker '{sender}' not registered"),
@@ -1478,5 +1882,198 @@ async fn send_user_session_update(allocator: AllocatorHandle, uid: u32, count: u
             }
         }
         None => debug!("System R not connected; user.sessions for uid {uid} dropped"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::pin::Pin;
+    use tokio::net::UnixStream;
+
+    use futures::StreamExt;
+
+    use sysa::proto::{
+        ListUnitsRequest, ListUnitsResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest,
+        StopUnitsResult,
+    };
+
+    use crate::state::{AllocatorState, WorkerEntry};
+    use crate::unit::types::{UnitFile, UnitSection};
+
+    fn test_allocator() -> AllocatorHandle {
+        let state = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = state.write();
+            let mut foo = UnitFile::new("foo.service");
+            foo.unit = UnitSection::default();
+            state.units.insert("foo.service".to_string(), foo);
+            state
+                .units
+                .insert("default.target".to_string(), UnitFile::new("default.target"));
+        }
+        state
+    }
+
+    fn register_service_worker(state: &AllocatorHandle) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut state = state.write();
+        state.workers.insert(
+            "system-s-1".to_string(),
+            WorkerEntry {
+                worker_id: "system-s-1".to_string(),
+                unit_types: vec!["service".to_string()],
+                supports_unit_define: false,
+                ready: false,
+                envelope_tx: tx,
+            },
+        );
+    }
+
+    /// Drive a handler over a socketpair: send `req_env` in, get the reply
+    /// envelope out.
+    async fn call_handler(
+        allocator: AllocatorHandle,
+        method: &str,
+        req_env: Envelope,
+    ) -> Envelope {
+        let (client, server) = UnixStream::pair().unwrap();
+        let server = frame_stream(server);
+        let mut client = frame_stream(client);
+        send_envelope(&mut client, &req_env).await.unwrap();
+
+        let handler_fut: Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+            match method {
+                "manager.list_units" => Box::pin(handle_manager_list_units(
+                    server, req_env, allocator, 0,
+                )),
+                "manager.start_units" => Box::pin(handle_manager_start_units(
+                    server, req_env, allocator, 0,
+                )),
+                "manager.stop_units" => Box::pin(handle_manager_stop_units(
+                    server, req_env, allocator, 0,
+                )),
+                _ => panic!("unknown method {method}"),
+            };
+        tokio::select! {
+            r = handler_fut => r.unwrap(),
+            e = client.next() => panic!("handler closed without reply: {e:?}"),
+        };
+        recv_envelope(&mut client).await.unwrap().unwrap()
+    }
+
+    fn req_env(method: &str, payload: impl ProstMessage) -> Envelope {
+        make_envelope(7, "system-sysi", "system-a", method, payload).unwrap()
+    }
+
+    #[test]
+    fn build_list_result_filters_enabled() {
+        let state = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state_guard = state.write();
+            state_guard
+                .units
+                .insert("foo.service".to_string(), UnitFile::new("foo.service"));
+            state_guard
+                .units
+                .insert("bar.timer".to_string(), UnitFile::new("bar.timer"));
+        }
+
+        let enabled: HashSet<String> = ["foo.service".to_string()].into_iter().collect();
+        let all = build_list_result(&state.read(), &enabled, false);
+        // "-.slice" (root slice, auto-created) + foo.service + bar.timer.
+        assert_eq!(all.units.len(), 3);
+
+        let only = build_list_result(&state.read(), &enabled, true);
+        assert_eq!(only.units.len(), 1);
+        let unit = &only.units[0];
+        assert_eq!(unit.name, "foo.service");
+        assert!(unit.enabled);
+        assert_eq!(unit.unit_type, "service");
+    }
+
+    #[tokio::test]
+    async fn list_units_returns_sorted_snapshot() {
+        let allocator = test_allocator();
+        let reply = call_handler(
+            allocator,
+            "manager.list_units",
+            req_env("manager.list_units", ListUnitsRequest { enabled_only: false }),
+        )
+        .await;
+        assert_eq!(reply.method, "manager.list_units.result");
+        let result = ListUnitsResult::decode(reply.payload.as_slice()).unwrap();
+        assert!(result.success);
+        let names: Vec<&str> = result.units.iter().map(|u| u.name.as_str()).collect();
+        // "-.slice" (root slice, auto-created), default.target, foo.service — sorted.
+        assert_eq!(names, vec!["-.slice", "default.target", "foo.service"]);
+    }
+
+    #[tokio::test]
+    async fn start_units_enqueues_known_and_rejects_unknown() {
+        let allocator = test_allocator();
+        register_service_worker(&allocator);
+
+        let reply = call_handler(
+            allocator.clone(),
+            "manager.start_units",
+            req_env(
+                "manager.start_units",
+                StartUnitsRequest {
+                    names: vec!["foo.service".to_string(), "nope.service".to_string()],
+                },
+            ),
+        )
+        .await;
+        assert_eq!(reply.method, "manager.start_units.result");
+        let result = StartUnitsResult::decode(reply.payload.as_slice()).unwrap();
+        assert_eq!(result.results.len(), 2);
+
+        let foo = result.results.iter().find(|r| r.name == "foo.service").unwrap();
+        assert!(foo.success, "foo.service should enqueue: {}", foo.message);
+        assert!(foo.message.starts_with("job "));
+
+        let nope = result.results.iter().find(|r| r.name == "nope.service").unwrap();
+        assert!(!nope.success);
+        assert!(!nope.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_units_creates_jobs() {
+        let allocator = test_allocator();
+        register_service_worker(&allocator);
+
+        let _ = call_handler(
+            allocator.clone(),
+            "manager.start_units",
+            req_env(
+                "manager.start_units",
+                StartUnitsRequest { names: vec!["foo.service".to_string()] },
+            ),
+        )
+        .await;
+
+        let state = allocator.read();
+        let has_job = state
+            .jobs
+            .values()
+            .any(|j| j.unit_name == "foo.service");
+        assert!(has_job, "a job for foo.service must exist in state");
+    }
+
+    #[tokio::test]
+    async fn stop_units_unknown_rejected() {
+        let allocator = test_allocator();
+        let reply = call_handler(
+            allocator,
+            "manager.stop_units",
+            req_env("manager.stop_units", StopUnitsRequest { name: "nope.service".to_string() }),
+        )
+        .await;
+        assert_eq!(reply.method, "manager.stop_units.result");
+        let result = StopUnitsResult::decode(reply.payload.as_slice()).unwrap();
+        assert!(!result.success);
+        assert!(!result.message.is_empty());
     }
 }

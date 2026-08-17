@@ -253,6 +253,69 @@ message AdminStagingResult {
     repeated StagingAreaEntry entries = 3;
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Control plane (SysAInit → System A)
+// ──────────────────────────────────────────────────────────────────
+
+// One unit entry returned by "manager.list_units".
+message UnitInfo {
+    // Unit name, e.g. "default.target".
+    string name = 1;
+    // Unit type, e.g. "service", "target", "socket".
+    string unit_type = 2;
+    // True when the unit is enabled (a wants/requires link or a primary
+    // enablement link exists under a system unit directory).
+    bool enabled = 3;
+}
+
+// Request to list the units System A has loaded.
+message ListUnitsRequest {
+    // When true, only enabled units are returned.
+    bool enabled_only = 1;
+}
+
+// Response to ListUnitsRequest.
+message ListUnitsResult {
+    bool success = 1;
+    // Human-readable message (empty on success).
+    string message = 2;
+    repeated UnitInfo units = 3;
+}
+
+// Request to start a batch of units.  Each name is enqueued as an
+// independent start job with dependency expansion (systemd `systemctl
+// start a b c` semantics); unknown names are rejected without blocking
+// the rest.
+message StartUnitsRequest {
+    repeated string names = 1;
+}
+
+// Outcome of starting one unit.
+message UnitStartResult {
+    string name = 1;
+    bool success = 2;
+    // Human-readable message (empty on success; reason on rejection).
+    string message = 3;
+}
+
+// Response to StartUnitsRequest.
+message StartUnitsResult {
+    bool success = 1;
+    repeated UnitStartResult results = 2;
+}
+
+// Request to stop a single unit.
+message StopUnitsRequest {
+    string name = 1;
+}
+
+// Response to StopUnitsRequest.
+message StopUnitsResult {
+    bool success = 1;
+    // Human-readable message (empty on success).
+    string message = 2;
+}
+
 // Configuration for a .socket unit, sent inside UnitConfig.
 message SocketConfig {
     // Addresses to listen on — see SocketAddress below.
@@ -546,6 +609,10 @@ message UnitConfig {
     PathConfig path = 9;
     // For scope units.
     ScopeConfig scope = 10;
+    // Socket units this unit depends on (Requires=/BindsTo= *.socket).
+    // The service worker requests their listener fds (LISTEN_FDS) from the
+    // socket worker when starting the process (socket activation).
+    repeated string socket_units = 11;
 }
 
 message ServiceConfig {

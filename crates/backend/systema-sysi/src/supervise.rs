@@ -8,7 +8,9 @@
 //! 4. Spawn the workers **serially**: each worker is spawned, then
 //!    SysAInit waits for `WORKER_READY=<worker_id>` before spawning the
 //!    next one.
-//! 5. Steady state: reap children, forward signals, and log notify events.
+//! 5. Control phase: ask System A to start the enabled units and
+//!    `default.target` (over the allocator IPC socket — no D-Bus needed).
+//! 6. Steady state: reap children, forward signals, and log notify events.
 //!
 //! Supervision policy (deliberately minimal):
 //! - Processes are spawned once; there are no restarts.
@@ -28,9 +30,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use nix::errno::Errno;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{kill, signal, SigHandler, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use sysa::proto::{ListUnitsRequest, ListUnitsResult, StartUnitsRequest, StartUnitsResult};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -38,6 +41,40 @@ use crate::workers::{ProcessKind, ResolvedProcess};
 
 /// Default notify directory (overridable with `SYSTEMA_NOTIFY_DIR`).
 pub const DEFAULT_NOTIFY_DIR: &str = "/run/system-alphabet/notify";
+
+/// One request-reply exchange over a fresh allocator connection.
+///
+/// The server closes the connection after answering a single envelope, so
+/// every call gets its own connection, like `systemctl`'s one-call-per-
+/// connection model.
+async fn manager_call<Req, Res>(
+    sock_path: &str,
+    request_id: u64,
+    method: &str,
+    req: Req,
+) -> Result<Res>
+where
+    Req: prost::Message,
+    Res: prost::Message + Default,
+{
+    let stream = tokio::net::UnixStream::connect(sock_path).await?;
+    let mut framed = sysa::ipc::frame_stream(stream);
+    let req = sysa::ipc::make_envelope(
+        request_id,
+        "system-sysi",
+        "system-a",
+        method,
+        req,
+    )?;
+    sysa::ipc::send_envelope(&mut framed, &req).await?;
+    let reply = sysa::ipc::recv_envelope(&mut framed)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("System A closed the connection"))?;
+    if reply.method != format!("{method}.result") {
+        anyhow::bail!("unexpected reply '{}' to {method}", reply.method);
+    }
+    Ok(Res::decode(reply.payload.as_slice())?)
+}
 
 struct Spawned {
     name: &'static str,
@@ -86,6 +123,35 @@ fn status_code(status: &WaitStatus) -> i32 {
         WaitStatus::Exited(_, code) => *code,
         _ => 1,
     }
+}
+
+/// Async-signal-safe SIGHUP handler body: log one line and keep running.
+///
+/// A real handler (not `SIG_IGN`) is used so that exec resets it to the
+/// default disposition for spawned children, which must still react to
+/// terminal hangup normally.  Only `write(2)` is called here because it is
+/// the one async-signal-safe way to emit output from a signal handler.
+extern "C" fn handle_sighup(_sig: i32) {
+    let msg = b"systema-sysi: SIGHUP received; ignoring\n";
+    let _ = unsafe {
+        nix::libc::write(
+            nix::libc::STDERR_FILENO,
+            msg.as_ptr().cast(),
+            msg.len(),
+        )
+    };
+    crate::kmsg::write_record(msg);
+}
+
+/// Make SIGHUP non-fatal: a getty taking over the boot console
+/// (`autovt@ttyS0` doing `TIOCSCTTY`) hangs up init's session and delivers
+/// SIGHUP, which must not kill PID 1.
+fn install_sighup_handler() -> Result<()> {
+    // SAFETY: `handle_sighup` is a plain `extern "C"` function calling only
+    // async-signal-safe `write(2)`.
+    unsafe { signal(Signal::SIGHUP, SigHandler::Handler(handle_sighup)) }
+        .map_err(|e| anyhow::anyhow!("cannot install SIGHUP handler: {e}"))?;
+    Ok(())
 }
 
 /// Handle one reaped child.  Returns `Some(code)` when SysAInit must exit
@@ -149,6 +215,7 @@ fn spawn_process(
     procs: &mut Vec<Spawned>,
     debug: bool,
     log_level: &str,
+    log_dir: &std::path::Path,
 ) -> Option<i32> {
     let mut cmd = std::process::Command::new(&rp.path);
     if debug {
@@ -157,6 +224,38 @@ fn spawn_process(
         cmd.arg("--log-level").arg(log_level);
     }
     cmd.args(rp.spec.args);
+
+    // Per-process log file: <log_dir>/<binary>.log (e.g. systema-syss.log).
+    // On failure fall back to inheriting SysAInit's stderr.
+    let log_path = log_dir.join(format!("{}.log", rp.spec.binary));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            let stdout = file.try_clone().ok();
+            cmd.stdout(std::process::Stdio::from(file));
+            cmd.stderr(match stdout {
+                Some(f) => std::process::Stdio::from(f),
+                None => std::process::Stdio::inherit(),
+            });
+            info!(
+                "Redirecting {} logs to {}",
+                rp.spec.name,
+                log_path.display()
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Cannot open log file {} ({}); {} inherits stderr",
+                log_path.display(),
+                e,
+                rp.spec.name
+            );
+        }
+    }
+
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id() as i32;
@@ -237,6 +336,110 @@ async fn wait_ready(
     }
 }
 
+/// Phase 4 — the control plane: ask System A to start every enabled unit,
+/// plus `default.target` if it is not among them.
+///
+/// The exchange goes over the allocator IPC socket (`manager.list_units` /
+/// `manager.start_units`), so no D-Bus bus is required at boot.  Like the
+/// readiness waits this is fail-fast: any error or timeout is fatal
+/// (exit 1), because a boot that cannot start its units is a failed boot.
+async fn control_phase(
+    ctx: &mut WaitCtx,
+    procs: &[Spawned],
+    grace: Duration,
+    ready_timeout: Duration,
+) -> Result<Option<i32>> {
+    if !procs.iter().any(|p| p.name == "sysa") {
+        warn!("System A is not in the process set; skipping control phase");
+        return Ok(None);
+    }
+
+    let deadline = tokio::time::Instant::now() + ready_timeout;
+    let sock_path = sysa::paths::instance().ipc_socket_path.to_string();
+    let mut exchange = Box::pin(async {
+        // One request per connection: the allocator server closes the
+        // connection after replying to a single envelope.
+        let list = manager_call::<ListUnitsRequest, ListUnitsResult>(
+            &sock_path,
+            1,
+            "manager.list_units",
+            ListUnitsRequest { enabled_only: true },
+        )
+        .await?;
+        if !list.success {
+            anyhow::bail!("manager.list_units failed: {}", list.message);
+        }
+
+        let mut names: Vec<String> = list.units.into_iter().map(|u| u.name).collect();
+        if !names.iter().any(|n| n == "default.target") {
+            names.push("default.target".to_string());
+        }
+        info!(
+            "Control phase: starting {} unit(s): {:?}",
+            names.len(),
+            names
+        );
+
+        let start = manager_call::<StartUnitsRequest, StartUnitsResult>(
+            &sock_path,
+            2,
+            "manager.start_units",
+            StartUnitsRequest { names },
+        )
+        .await?;
+        if !start.success {
+            anyhow::bail!("manager.start_units failed");
+        }
+        Ok(start)
+    });
+
+    loop {
+        tokio::select! {
+            _ = ctx.terminate.recv() => {
+                info!("SIGTERM received during control phase; shutting down");
+                return Ok(Some(shutdown(procs, 0, grace).await));
+            }
+            _ = ctx.interrupt.recv() => {
+                info!("SIGINT received during control phase; shutting down");
+                return Ok(Some(shutdown(procs, 0, grace).await));
+            }
+            Some((pid, status)) = ctx.reaper_rx.recv() => {
+                if let Some(code) = handle_reaped(procs, pid, &status) {
+                    return Ok(Some(shutdown(procs, code, grace).await));
+                }
+            }
+            r = exchange.as_mut() => {
+                return match r {
+                    Ok(start) => {
+                        for result in &start.results {
+                            if result.success {
+                                info!(
+                                    "Control phase: enqueued start for '{}' ({})",
+                                    result.name, result.message
+                                );
+                            } else {
+                                error!(
+                                    "Control phase: cannot start '{}': {}",
+                                    result.name, result.message
+                                );
+                            }
+                        }
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        error!("Control phase failed: {e:#}");
+                        Ok(Some(shutdown(procs, 1, grace).await))
+                    }
+                };
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                error!("Control phase timed out after {ready_timeout:?}");
+                return Ok(Some(shutdown(procs, 1, grace).await));
+            }
+        }
+    }
+}
+
 /// Spawn all resolved processes (phased) and supervise them until shutdown.
 pub async fn run(
     resolved: &[ResolvedProcess],
@@ -244,6 +447,7 @@ pub async fn run(
     log_level: &str,
     grace: Duration,
     ready_timeout: Duration,
+    log_dir: &std::path::Path,
 ) -> Result<i32> {
     // Partition the resolved set: the allocator (System A), the one-shot
     // finder chain, and the long-running workers.
@@ -261,8 +465,8 @@ pub async fn run(
     }
 
     // --- Bind the notify listener BEFORE spawning anything. ---
-    let notify_dir = std::env::var("SYSTEMA_NOTIFY_DIR")
-        .unwrap_or_else(|_| DEFAULT_NOTIFY_DIR.to_string());
+    let notify_dir =
+        std::env::var("SYSTEMA_NOTIFY_DIR").unwrap_or_else(|_| DEFAULT_NOTIFY_DIR.to_string());
     let sock_path = PathBuf::from(&notify_dir).join("init.sock");
     if let Err(e) = std::fs::create_dir_all(&notify_dir) {
         error!("Cannot create notify directory {}: {e}", notify_dir);
@@ -295,10 +499,10 @@ pub async fn run(
     let (reaper_tx, reaper_rx) = mpsc::unbounded_channel::<ReaperEvent>();
     let reaper = spawn_reaper(reaper_tx);
 
-    let terminate =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let interrupt =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    install_sighup_handler()?;
 
     let mut ctx = WaitCtx {
         notify_rx,
@@ -312,7 +516,7 @@ pub async fn run(
 
     // --- Phase 1: System A, then wait for MANAGER_READY. ---
     let code = if let Some(rp) = allocator_specs.first() {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level) {
+        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
             Some(shutdown(&procs, code, grace).await)
         } else {
             wait_ready(
@@ -339,7 +543,7 @@ pub async fn run(
 
     // --- Phase 2: one-shot finder chain (spawn only). ---
     for rp in &one_shots {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level) {
+        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
             let code = shutdown(&procs, code, grace).await;
             let _ = std::fs::remove_file(&sock_path);
             drop(notify_thread);
@@ -350,7 +554,7 @@ pub async fn run(
 
     // --- Phase 3: workers, serially, each gated on WORKER_READY. ---
     for rp in &workers {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level) {
+        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
             let code = shutdown(&procs, code, grace).await;
             let _ = std::fs::remove_file(&sock_path);
             drop(notify_thread);
@@ -378,6 +582,14 @@ pub async fn run(
             drop(reaper);
             return Ok(code);
         }
+    }
+
+    // --- Phase 4: control plane (start enabled units + default.target). ---
+    if let Some(code) = control_phase(&mut ctx, &procs, grace, ready_timeout).await? {
+        let _ = std::fs::remove_file(&sock_path);
+        drop(notify_thread);
+        drop(reaper);
+        return Ok(code);
     }
 
     // --- Steady state. ---
@@ -432,7 +644,10 @@ mod tests {
     #[test]
     fn parse_notify_handles_multi_line_events() {
         let kv = parse_notify("UNIT_STARTED=sshd.service\nRESULT=success\n");
-        assert_eq!(kv.get("UNIT_STARTED").map(String::as_str), Some("sshd.service"));
+        assert_eq!(
+            kv.get("UNIT_STARTED").map(String::as_str),
+            Some("sshd.service")
+        );
         assert_eq!(kv.get("RESULT").map(String::as_str), Some("success"));
     }
 
@@ -440,5 +655,13 @@ mod tests {
     fn parse_notify_ignores_blank_lines() {
         let kv = parse_notify("\n\n");
         assert!(kv.is_empty());
+    }
+
+    #[test]
+    fn sighup_does_not_kill_the_process() {
+        install_sighup_handler().unwrap();
+        let pid = Pid::from_raw(std::process::id() as i32);
+        kill(pid, Signal::SIGHUP).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
     }
 }

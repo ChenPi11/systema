@@ -306,6 +306,23 @@ pub struct Condition {
     pub negate: bool,
 }
 
+impl Condition {
+    /// Build a condition from a raw directive value, honoring the `!`
+    /// negation prefix.
+    pub fn from_value(kind: &str, value: &str) -> Self {
+        let (negate, val) = if let Some(rest) = value.strip_prefix('!') {
+            (true, rest.to_string())
+        } else {
+            (false, value.to_string())
+        };
+        Condition {
+            kind: kind.to_string(),
+            value: val,
+            negate,
+        }
+    }
+}
+
 impl DependencySet {
     pub fn is_empty(&self) -> bool {
         self.after.is_empty()

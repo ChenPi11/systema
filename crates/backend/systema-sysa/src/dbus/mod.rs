@@ -12,6 +12,7 @@ pub mod service_obj;
 pub mod slice_obj;
 pub mod socket_obj;
 pub mod unit_obj;
+mod wait;
 
 use std::sync::Arc;
 
@@ -394,15 +395,19 @@ async fn try_run(allocator: AllocatorHandle) -> Result<()> {
     Ok(())
 }
 
-/// Run the D-Bus server, retrying the initial connection with exponential
-/// backoff if the D-Bus system bus is not yet available.
+/// Run the D-Bus server, waiting (inotify or polling) for the system bus
+/// socket to appear before each connection attempt, and retrying the
+/// connection with exponential backoff when it fails.
 ///
-/// This mirrors the reconnection pattern used by [`systema_syss::ipc::run`]
-/// and ensures System A does not crash when D-Bus starts later than
-/// the allocator itself (e.g. during early boot or in containers).
+/// This ensures System A never crashes when D-Bus is absent or starts
+/// later than the allocator itself (e.g. during early boot or in
+/// containers): the rest of the system keeps initializing while the
+/// socket is being watched.
 pub async fn run(allocator: AllocatorHandle) -> Result<()> {
+    let socket_path = wait::system_bus_socket_path();
     let mut backoff = Duration::from_millis(500);
     loop {
+        wait::wait_for_socket(&socket_path).await;
         match try_run(allocator.clone()).await {
             Ok(()) => {
                 info!("D-Bus server exited cleanly");

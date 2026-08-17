@@ -228,6 +228,13 @@ impl ReverseIndex {
 
     /// The normalized `UNIT_ATOM_AFTER` dependency set of `u`: declared
     /// `After=` targets plus the units that declare `Before= u`.
+    ///
+    /// Socket units pulled in through `Requires=`/`BindsTo=` are treated as
+    /// `After=` targets as well: System S requests the listener fds of
+    /// `socket_units` at spawn time, so the socket must be bound before the
+    /// dependent unit starts (systemd relies on sockets.target having
+    /// already activated them; System A has no such early activation, so
+    /// the ordering edge is made explicit here).
     fn after_deps(&self, units: &HashMap<String, UnitFile>, u: &str) -> Vec<String> {
         let mut out: HashSet<String> = units
             .get(u)
@@ -235,6 +242,13 @@ impl ReverseIndex {
             .unwrap_or_default();
         if let Some(v) = self.before.get(u) {
             out.extend(v.iter().cloned());
+        }
+        if let Some(uf) = units.get(u) {
+            for dep in uf.unit.requires.iter().chain(uf.unit.binds_to.iter()) {
+                if dep.ends_with(".socket") {
+                    out.insert(dep.clone());
+                }
+            }
         }
         let mut v: Vec<String> = out.into_iter().collect();
         v.sort();
@@ -1852,6 +1866,35 @@ mod tests {
         // After= edges (b After= a, c After= b) create the wait chain.
         assert!(pos("a.service") < pos("b.service"));
         assert!(pos("b.service") < pos("c.service"));
+    }
+
+    #[test]
+    fn socket_units_start_before_dependent_service() {
+        let units = map(vec![
+            make_unit("svc.socket"),
+            with_requires(make_unit("svc.service"), &["svc.socket"]),
+            with_after(
+                with_requires(make_unit("root.service"), &["svc.service"]),
+                &["svc.service"],
+            ),
+        ]);
+        let s = steps(&units, &HashMap::new(), &HashMap::new(), "root.service", Start, Replace);
+        let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
+        // Requires= does not order, but the socket must be bound before the
+        // service spawns (System S requests listener fds at spawn time).
+        assert!(pos("svc.socket") < pos("svc.service"));
+        assert!(pos("svc.service") < pos("root.service"));
+    }
+
+    #[test]
+    fn binds_to_socket_orders_socket_before_service() {
+        let units = map(vec![
+            make_unit("svc.socket"),
+            with_binds_to(make_unit("svc.service"), &["svc.socket"]),
+        ]);
+        let s = steps(&units, &HashMap::new(), &HashMap::new(), "svc.service", Start, Replace);
+        let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
+        assert!(pos("svc.socket") < pos("svc.service"));
     }
 
     #[test]

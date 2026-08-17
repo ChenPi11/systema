@@ -50,11 +50,7 @@ impl WorkerSpec {
         }
     }
 
-    fn with_args(
-        name: &'static str,
-        binary: &'static str,
-        args: &'static [&'static str],
-    ) -> Self {
+    fn with_args(name: &'static str, binary: &'static str, args: &'static [&'static str]) -> Self {
         Self {
             name,
             binary,
@@ -145,16 +141,14 @@ fn default_workers() -> Vec<WorkerSpec> {
     ]
 }
 
-/// The one-shot finder chain (System F): stage units, then commit them.
+/// The one-shot finder chain (System F).
 ///
-/// System F is not a daemon: `systema-sysf` stages discovered units and
-/// exits; a second invocation (`systema-sysf commit`) commits the staging
-/// area.  Both steps are optional (`--with-finder`) and both are one-shot.
+/// System F is not a daemon: `systema-sysf` scans the finder search paths
+/// for finder executables (e.g. `systema-sysf.systemd`), runs them all
+/// concurrently to stage their units, then commits the staging area.
+/// The whole chain is optional (`--with-finder`) and one-shot.
 fn finder_chain() -> Vec<WorkerSpec> {
-    vec![
-        WorkerSpec::with_args("sysf", "systema-sysf", &[]),
-        WorkerSpec::with_args("sysf", "systema-sysf", &["commit"]),
-    ]
+    vec![WorkerSpec::with_args("sysf", "systema-sysf", &[])]
 }
 
 /// Platform abstraction so tests can simulate non-Linux hosts.
@@ -180,10 +174,7 @@ impl Platform {
 /// (`"systema-sysd"`, `"systema-sysm.linux"`); unknown names are an error.
 /// Skipping `"sysf"` removes the whole finder chain even with
 /// `with_finder` set.  Platform-gated workers are dropped on non-Linux.
-pub fn build_worker_set(
-    skip: &[String],
-    with_finder: bool,
-) -> anyhow::Result<Vec<WorkerSpec>> {
+pub fn build_worker_set(skip: &[String], with_finder: bool) -> anyhow::Result<Vec<WorkerSpec>> {
     build_worker_set_for(Platform::current(), skip, with_finder)
 }
 
@@ -202,7 +193,10 @@ pub fn build_worker_set_for(
         if spec.linux_only && platform != Platform::Linux {
             continue;
         }
-        if skip.iter().any(|s| s.as_str() == spec.name || s.as_str() == spec.binary) {
+        if skip
+            .iter()
+            .any(|s| s.as_str() == spec.name || s.as_str() == spec.binary)
+        {
             continue;
         }
         retained.push(spec);
@@ -313,10 +307,7 @@ mod tests {
         let set = build_worker_set_for(Platform::Linux, &[], false).unwrap();
         assert_eq!(
             names(&set),
-            vec![
-                "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp",
-                "sysd", "sysr", "sysm"
-            ]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm"]
         );
         assert!(set.iter().all(|s| s.kind == ProcessKind::LongRunning));
     }
@@ -326,23 +317,16 @@ mod tests {
         let set = build_worker_set_for(Platform::Other, &[], false).unwrap();
         assert_eq!(
             names(&set),
-            vec![
-                "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp",
-                "sysd", "sysr"
-            ]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr"]
         );
     }
 
     #[test]
     fn skip_accepts_short_names() {
-        let set =
-            build_worker_set_for(Platform::Linux, &skip(&["sysd", "sysc"]), false)
-                .unwrap();
+        let set = build_worker_set_for(Platform::Linux, &skip(&["sysd", "sysc"]), false).unwrap();
         assert_eq!(
             names(&set),
-            vec![
-                "sysa", "syss", "syse", "syst", "sysk", "sysp", "sysr", "sysm"
-            ]
+            vec!["sysa", "syss", "syse", "syst", "sysk", "sysp", "sysr", "sysm"]
         );
     }
 
@@ -356,49 +340,42 @@ mod tests {
         .unwrap();
         assert_eq!(
             names(&set),
-            vec![
-                "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp",
-                "sysr"
-            ]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysr"]
         );
     }
 
     #[test]
     fn skipping_sysa_removes_the_core() {
-        let set = build_worker_set_for(Platform::Linux, &skip(&["sysa"]), false)
-            .unwrap();
+        let set = build_worker_set_for(Platform::Linux, &skip(&["sysa"]), false).unwrap();
         assert!(!names(&set).contains(&"sysa"));
     }
 
     #[test]
     fn with_finder_appends_one_shot_chain() {
         let set = build_worker_set_for(Platform::Linux, &[], true).unwrap();
-        assert_eq!(set.len(), 12);
+        assert_eq!(set.len(), 11);
         let chain = &set[10..];
-        assert!(chain
-            .iter()
-            .all(|s| s.binary == "systema-sysf" && s.kind == ProcessKind::OneShot));
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].binary, "systema-sysf");
+        assert!(chain[0].kind == ProcessKind::OneShot);
     }
 
     #[test]
     fn skipping_sysf_removes_the_whole_chain() {
-        let set =
-            build_worker_set_for(Platform::Linux, &skip(&["sysf"]), true).unwrap();
+        let set = build_worker_set_for(Platform::Linux, &skip(&["sysf"]), true).unwrap();
         assert_eq!(set.len(), 10);
         assert!(!names(&set).contains(&"sysf"));
     }
 
     #[test]
     fn unknown_skip_name_is_an_error() {
-        let err = build_worker_set_for(Platform::Linux, &skip(&["nope"]), false)
-            .unwrap_err();
+        let err = build_worker_set_for(Platform::Linux, &skip(&["nope"]), false).unwrap_err();
         assert!(err.to_string().contains("nope"));
     }
 
     fn shim_dir(tag: &str) -> std::path::PathBuf {
         use std::fs;
-        let dir = std::env::temp_dir()
-            .join(format!("sysa-sysi-unit-{}-{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sysa-sysi-unit-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -410,11 +387,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = shim_dir("bin-dir");
         fs::write(dir.join("systema-sysd"), "#!/bin/sh\n").unwrap();
-        fs::set_permissions(
-            dir.join("systema-sysd"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        fs::set_permissions(dir.join("systema-sysd"), fs::Permissions::from_mode(0o755)).unwrap();
 
         let hit = resolve_binary("systema-sysd", Some(&dir)).unwrap();
         assert_eq!(hit, dir.join("systema-sysd"));
@@ -431,17 +404,10 @@ mod tests {
         let dir = shim_dir("search-in");
         fs::write(dir.join("runme"), "#!/bin/sh\n").unwrap();
         fs::write(dir.join("not-run"), "#!/bin/sh\n").unwrap();
-        fs::set_permissions(
-            dir.join("runme"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        fs::set_permissions(dir.join("runme"), fs::Permissions::from_mode(0o755)).unwrap();
 
         let dirs = vec![dir.clone()];
-        assert_eq!(
-            search_in(&dirs, "runme"),
-            Some(dir.join("runme"))
-        );
+        assert_eq!(search_in(&dirs, "runme"), Some(dir.join("runme")));
         assert!(search_in(&dirs, "not-run").is_none());
         assert!(search_in(&dirs, "absent").is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -453,11 +419,7 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         fs::write(dir.join("systema-sysa"), "#!/bin/sh\n").unwrap();
-        fs::set_permissions(
-            dir.join("systema-sysa"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        fs::set_permissions(dir.join("systema-sysa"), fs::Permissions::from_mode(0o755)).unwrap();
 
         let set = build_worker_set_for(Platform::Linux, &[], false).unwrap();
         let (resolved, missing) = resolve_set(&set, Some(&dir));

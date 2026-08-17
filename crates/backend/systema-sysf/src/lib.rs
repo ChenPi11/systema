@@ -1,5 +1,12 @@
+//! System F common library.
+//!
+//! Format-agnostic finder infrastructure: the unified unit intermediate
+//! representation ([`ir`]) and the [`Finder`] / [`FinderRegistry`]
+//! abstraction.  Format-specific finders (e.g. the systemd finder in the
+//! `systema-sysf-systemd` crate) implement [`Finder`] and are discovered by
+//! the `systema-sysf` executable from the finder search paths.
+
 pub mod ir;
-pub mod systemd;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -93,11 +93,16 @@ pub async fn recv_fd(stream: &UnixStream) -> Result<std::os::unix::io::RawFd> {
 }
 
 /// Synchronous SCM_RIGHTS send using libc::sendmsg.
+/// Retries `EAGAIN` (non-blocking socket, send buffer full).
 fn send_fd_sync(sock_fd: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd) -> Result<()> {
     unsafe {
+        // Linux ignores zero-length sendmsg() on stream sockets entirely
+        // (the SCM_RIGHTS cmsg is dropped with it), so always send one
+        // payload byte alongside the descriptor.
+        let mut pad: u8 = 0;
         let mut iov = libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
+            iov_base: &mut pad as *mut u8 as *mut libc::c_void,
+            iov_len: 1,
         };
         let mut cmsg_buf = [0u8; 24];
         let mut msghdr: libc::msghdr = std::mem::zeroed();
@@ -118,19 +123,30 @@ fn send_fd_sync(sock_fd: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd)
         std::ptr::write(libc::CMSG_DATA(cmsg) as *mut libc::c_int, fd);
         msghdr.msg_controllen = libc::CMSG_SPACE(fd_size as u32) as _;
 
-        let ret = libc::sendmsg(sock_fd, &msghdr, 0);
-        if ret < 0 {
-            let e = std::io::Error::last_os_error();
-            anyhow::bail!(crate::l10n::fmt(
-                crate::l10n::t_("sendmsg (SCM_RIGHTS) failed: {e}."),
-                &[("e", &e.to_string())]
-            ));
-        }
+        let ret = loop {
+            let r = libc::sendmsg(sock_fd, &msghdr, 0);
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                anyhow::bail!(crate::l10n::fmt(
+                    crate::l10n::t_("sendmsg (SCM_RIGHTS) failed: {e}."),
+                    &[("e", &e.to_string())]
+                ));
+            }
+            break r;
+        };
+        debug_assert!(ret >= 0);
     }
     Ok(())
 }
 
 /// Synchronous SCM_RIGHTS receive using libc::recvmsg.
+///
+/// The stream may be non-blocking (tokio UnixStream): `EAGAIN` is retried
+/// with a short sleep until data arrives or the peer closes the connection.
 fn recv_fd_sync(sock_fd: std::os::unix::io::RawFd) -> Result<std::os::unix::io::RawFd> {
     unsafe {
         let mut data: u8 = 0;
@@ -146,12 +162,24 @@ fn recv_fd_sync(sock_fd: std::os::unix::io::RawFd) -> Result<std::os::unix::io::
         msghdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
         msghdr.msg_controllen = cmsg_buf.len() as _;
 
-        let ret = libc::recvmsg(sock_fd, &mut msghdr, 0);
-        if ret < 0 {
-            let e = std::io::Error::last_os_error();
-            anyhow::bail!(crate::l10n::fmt(
-                crate::l10n::t_("recvmsg (SCM_RIGHTS) failed: {e}."),
-                &[("e", &e.to_string())]
+        let ret = loop {
+            let r = libc::recvmsg(sock_fd, &mut msghdr, 0);
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                anyhow::bail!(crate::l10n::fmt(
+                    crate::l10n::t_("recvmsg (SCM_RIGHTS) failed: {e}."),
+                    &[("e", &e.to_string())]
+                ));
+            }
+            break r;
+        };
+        if ret == 0 {
+            anyhow::bail!(crate::l10n::t_(
+                "fdpass connection closed while waiting for a listener fd."
             ));
         }
 
@@ -169,6 +197,31 @@ fn recv_fd_sync(sock_fd: std::os::unix::io::RawFd) -> Result<std::os::unix::io::
         match received_fd {
             Some(fd) => Ok(fd),
             None => anyhow::bail!(crate::l10n::t_("recvmsg did not contain SCM_RIGHTS fd.")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fd_passes_over_stream_with_data() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDONLY) };
+        assert!(fd >= 0);
+
+        let sender = std::thread::spawn(move || send_fd_sync(a.as_raw_fd(), fd).unwrap());
+        let received = recv_fd_sync(b.as_raw_fd()).unwrap();
+        sender.join().unwrap();
+
+        assert_ne!(received, fd);
+        // The received descriptor must be a usable duplicate.
+        let flags = unsafe { libc::fcntl(received, libc::F_GETFD, 0) };
+        assert!(flags >= 0);
+        unsafe {
+            libc::close(fd);
+            libc::close(received);
         }
     }
 }

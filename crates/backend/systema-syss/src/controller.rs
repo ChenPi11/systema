@@ -2,20 +2,79 @@ use crate::process::{start_service, stop_service};
 use crate::state::{ServiceRegistry, ServiceState};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
 use sysa::worker_ipc::EventPublisher;
+use tokio::sync::Mutex;
+use tracing::warn;
 
 pub struct ServiceController {
     registry: ServiceRegistry,
     event_pub: EventPublisher,
+    fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>>,
 }
 
 impl ServiceController {
-    pub fn new(registry: ServiceRegistry, event_pub: EventPublisher) -> Self {
+    pub fn new(
+        registry: ServiceRegistry,
+        event_pub: EventPublisher,
+        fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>>,
+    ) -> Self {
         ServiceController {
             registry,
             event_pub,
+            fdpass,
         }
+    }
+
+    /// Ask the socket worker (via the allocator) for the listener fds of the
+    /// given socket units, in order.  Each request is a `socket.request_fd`
+    /// envelope; the matching fd arrives back on our fdpass channel.
+    #[cfg(unix)]
+    async fn request_listener_fds(&self, socket_units: &[String]) -> Vec<std::os::unix::io::RawFd> {
+        use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+        let stream = {
+            let guard = self.fdpass.lock().await;
+            match guard.as_ref() {
+                Some(s) => {
+                    let dup = nix::unistd::dup(s.as_raw_fd()).ok();
+                    dup.and_then(|fd| {
+                        let std_stream =
+                            unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+                        tokio::net::UnixStream::from_std(std_stream).ok()
+                    })
+                }
+                None => None,
+            }
+        };
+        let Some(stream) = stream else {
+            return Vec::new();
+        };
+        let mut fds: Vec<RawFd> = Vec::new();
+        for unit in socket_units {
+            if unit.is_empty() {
+                continue;
+            }
+            self.event_pub
+                .send_envelope_bytes("socket.request_fd", unit.as_bytes().to_vec());
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sysa::ipc::recv_fd(&stream),
+            )
+            .await
+            {
+                Ok(Ok(fd)) => fds.push(fd),
+                Ok(Err(e)) => {
+                    warn!("recv_fd for '{}' failed: {}", unit, e);
+                    break;
+                }
+                Err(_) => {
+                    warn!("Timed out waiting for listener fd of '{}'", unit);
+                    break;
+                }
+            }
+        }
+        fds
     }
 
     fn status_of(&self, unit_name: &str) -> UnitStatus {
@@ -81,7 +140,12 @@ impl UnitController for ServiceController {
         } else {
             Some(invocation_id.to_string())
         };
-        let (_pid, child) = start_service(self.registry.clone(), &cfg, inv_id).await?;
+        #[cfg(unix)]
+        let listen_fds = self.request_listener_fds(&cfg.socket_units).await;
+        #[cfg(not(unix))]
+        let listen_fds = Vec::new();
+        let (_pid, child) =
+            start_service(self.registry.clone(), &cfg, inv_id, listen_fds).await?;
         {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
@@ -123,7 +187,12 @@ impl UnitController for ServiceController {
         } else {
             Some(invocation_id.to_string())
         };
-        let (_pid, child) = start_service(self.registry.clone(), &cfg, inv_id).await?;
+        #[cfg(unix)]
+        let listen_fds = self.request_listener_fds(&cfg.socket_units).await;
+        #[cfg(not(unix))]
+        let listen_fds = Vec::new();
+        let (_pid, child) =
+            start_service(self.registry.clone(), &cfg, inv_id, listen_fds).await?;
         {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {

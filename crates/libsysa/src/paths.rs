@@ -15,6 +15,10 @@ pub struct Paths {
     pub locale_dir: &'static str,
     pub unit_search_paths: Vec<String>,
     pub generator_search_paths: Vec<String>,
+    /// Search paths for System F finder executables.  The `systema-sysf`
+    /// executable locates format-specific finder binaries (e.g.
+    /// `systema-sysf.systemd`) in these directories.
+    pub finder_search_paths: Vec<String>,
     pub systema_bin_search_paths: Vec<String>,
     /// Directory holding the notify listener sockets (SysAInit, boot
     /// animation, ...).  System A broadcasts every boot/unit event to all
@@ -60,6 +64,7 @@ fn compute_paths() -> Paths {
             "SYSTEMA_GENERATOR_PATH",
             builtin::GENERATOR_SEARCH_PATHS,
         ),
+        finder_search_paths: resolve_list("SYSTEMA_FINDER_PATH", builtin::FINDER_SEARCH_PATHS),
         systema_bin_search_paths: resolve_list(
             "SYSTEMA_BIN_PATH",
             builtin::SYSTEMA_BIN_SEARCH_PATHS,
@@ -172,6 +177,15 @@ mod tests {
                 "/usr/local/lib/systemd/system-generators",
                 "/usr/lib/systemd/system-generators",
                 "/lib/systemd/system-generators",
+            ],
+        );
+        assert_eq!(
+            paths.finder_search_paths,
+            vec![
+                "/etc/systema/finder",
+                "/usr/etc/systema/finder",
+                "/usr/local/etc/systema/finder",
+                "/opt/systema/finder",
             ],
         );
     }

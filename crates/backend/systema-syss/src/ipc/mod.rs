@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use sysa::worker_ipc::{EventPublisher, WorkerIpc};
@@ -11,9 +13,37 @@ const WORKER_UNIT_TYPES: &[&str] = &["service"];
 
 pub async fn run() -> Result<()> {
     let registry = new_registry();
+    let fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>> = Arc::new(Mutex::new(None));
+
+    // Connect to the allocator's fdpass socket (SCM_RIGHTS channel used to
+    // receive listener fds for socket activation). Non-fatal if unavailable:
+    // services are then started without LISTEN_FDS.
+    {
+        use tokio::io::AsyncWriteExt;
+        match tokio::net::UnixStream::connect(sysa::paths::instance().systema_fdpass_sock).await {
+            Ok(mut s) => {
+                let ident = format!("{WORKER_ID}\n");
+                if let Err(e) = s.write_all(ident.as_bytes()).await {
+                    warn!("Failed to send id on fdpass channel: {}", e);
+                }
+                *fdpass.lock().await = Some(s);
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot connect to fdpass socket ({}): {}",
+                    sysa::paths::instance().systema_fdpass_sock,
+                    e,
+                );
+            }
+        }
+    }
+
+    let fdpass_controller = fdpass.clone();
     WorkerIpc::new(WORKER_ID, WORKER_UNIT_TYPES)
         .run(
-            |event_pub| ServiceController::new(registry.clone(), event_pub),
+            move |event_pub| {
+                ServiceController::new(registry.clone(), event_pub, fdpass_controller.clone())
+            },
             |_, _| Ok(false),
         )
         .await

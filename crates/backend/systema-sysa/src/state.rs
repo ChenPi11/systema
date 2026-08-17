@@ -863,7 +863,7 @@ fn apply_ir_patch(ir: &UnitIR, uf: &mut UnitFile) {
 /// Convert a [`UnitIR`] into a brand-new internal [`UnitFile`] for units
 /// that do not exist in the runtime cache yet.
 ///
-/// This is the reverse of the conversion in `systema-sysf::systemd::finder`.
+/// This is the reverse of the conversion in `systema-sysf-systemd`'s finder.
 /// Because every IR entry except `id` is optional, creating a unit requires
 /// `unit_type` to be present; a missing required field is reported as an
 /// error so the worker that submitted the IR receives the failure.

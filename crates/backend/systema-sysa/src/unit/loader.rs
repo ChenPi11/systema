@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::types::UnitFile;
 use crate::state::AllocatorHandle;
@@ -240,6 +240,7 @@ fn is_known_extension(name: &str) -> bool {
         "service"
             | "target"
             | "mount"
+            | "automount"
             | "timer"
             | "socket"
             | "slice"
@@ -287,14 +288,34 @@ pub async fn ensure_loaded_from_disk_in(
     let allocator = allocator.clone();
     let dirs = dirs.to_vec();
     let name = name.to_string();
-    tokio::task::spawn_blocking(move || {
+    let name_err = name.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        trace!("ensure_loaded_from_disk: blocking task started for '{name}'");
         let requested = allocator.read().resolve_unit_name(&name);
-        let unit = match load_unit_flexible_in(&dirs, &requested) {
+        let mut unit = match load_unit_flexible_in(&dirs, &requested) {
             Ok(unit) => unit,
-            Err(_) => return Ok(false),
+            Err(e) => {
+                warn!(
+                    "ensure_loaded_from_disk: no on-disk definition for '{name}' (requested '{requested}'; search paths: {dirs:?}): {e}"
+                );
+                return Ok(false);
+            }
         };
         let canonical = unit.name.clone();
+        trace!("ensure_loaded_from_disk: '{name}' loaded from disk, taking write lock");
         let mut state = allocator.write();
+        // Preserve aliases already declared on an existing entry: the
+        // on-disk file may be the canonical target of unit-file symlinks
+        // whose aliases were recorded by the finder (e.g. `default.target`
+        // -> `graphical.target`).  Re-loading the canonical file must not
+        // erase those aliases, or name resolution breaks for them.
+        if let Some(existing) = state.units.get(&canonical) {
+            for alias in &existing.install.alias {
+                if !unit.install.alias.contains(alias) {
+                    unit.install.alias.push(alias.clone());
+                }
+            }
+        }
         state.units.insert(canonical.clone(), unit);
         state.rebuild_alias_map();
         // Notify the D-Bus layer so it can register a per-unit object,
@@ -302,9 +323,15 @@ pub async fn ensure_loaded_from_disk_in(
         if let Some(ref tx) = state.unit_loaded_tx {
             let _ = tx.send(canonical);
         }
+        trace!("ensure_loaded_from_disk: '{name}' committed");
         Ok(true)
-    })
-    .await?
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("ensure_loaded_from_disk timed out loading '{name_err}'")
+        })?;
+    result?
 }
 
 /// [`load_unit_flexible`] over an explicit search-path list (testable
@@ -931,6 +958,7 @@ mod tests {
         assert!(is_known_extension("sshd.service"));
         assert!(is_known_extension("multi-user.target"));
         assert!(is_known_extension("data.mount"));
+        assert!(is_known_extension("data.automount"));
         assert!(is_known_extension("backup.timer"));
         assert!(is_known_extension("sshd.socket"));
         assert!(is_known_extension("system.slice"));
@@ -1424,5 +1452,28 @@ mod tests {
         assert_eq!(svc.exec_start[0].program, "/sbin/agetty");
         assert_eq!(svc.exec_start[0].args, vec!["tty1"]);
         assert!(unit.install.alias.is_empty());
+    }
+
+    #[test]
+    fn debug_load_guest_default_target() {
+        let dirs = vec!["/mnt/lib/systemd/system".to_string()];
+        let unit = load_unit_flexible_in(&dirs, "default.target");
+        match &unit {
+            Ok(u) => {
+                eprintln!("OK name={} aliases={:?}", u.name, u.install.alias);
+            }
+            Err(e) => {
+                eprintln!("ERR: {e:?}");
+            }
+        }
+        let unit2 = load_unit_flexible_in(&dirs, "graphical.target");
+        match &unit2 {
+            Ok(u) => {
+                eprintln!("OK2 name={} aliases={:?}", u.name, u.install.alias);
+            }
+            Err(e) => {
+                eprintln!("ERR2: {e:?}");
+            }
+        }
     }
 }

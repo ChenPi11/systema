@@ -12,6 +12,7 @@ pub fn is_known_extension(name: &str) -> bool {
         "service"
             | "target"
             | "mount"
+            | "automount"
             | "timer"
             | "socket"
             | "slice"

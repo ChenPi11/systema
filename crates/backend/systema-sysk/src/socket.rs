@@ -234,6 +234,18 @@ fn bind_stream(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
             );
             return Ok(None);
         }
+        // The parent directory (e.g. /run/dbus) may not exist yet — create
+        // it, mirroring systemd's behaviour for socket units.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("Cannot create directory '{}' for socket '{address}'."),
+                        &[("address", address)],
+                    )
+                })?;
+            }
+        }
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| {
             sysa::l10n::fmt(
@@ -360,6 +372,11 @@ fn bind_abstract_unix(address: &str, _backlog: u32) -> Result<BoundSocket> {
 }
 
 fn bind_datagram(address: &str) -> Result<RawFd> {
+    // ListenDatagram= with an abstract ('@') or filesystem ('/') address is a
+    // Unix datagram socket, not a UDP port.
+    if address.starts_with(ABSTRACT_PREFIX) || address.starts_with('/') {
+        return bind_unix_datagram(address);
+    }
     let addr = resolve_tcp_addr(address)?;
     let fd = unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
@@ -407,6 +424,104 @@ fn bind_datagram(address: &str) -> Result<RawFd> {
     Ok(fd)
 }
 
+/// Bind a Unix datagram socket for an abstract ('@') or filesystem ('/')
+/// ListenDatagram= address.
+fn bind_unix_datagram(address: &str) -> Result<RawFd> {
+    let fd = unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("socket(AF_UNIX, SOCK_DGRAM) failed: {e}."),
+                &[("e", &e.to_string())]
+            ));
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFD, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+        fd
+    };
+
+    if address.starts_with(ABSTRACT_PREFIX) {
+        let inner = address.trim_start_matches(ABSTRACT_PREFIX);
+        let sun_path = format!("\0{}", inner);
+        let bytes = sun_path.as_bytes();
+        let path_len = bytes.len().min(107);
+        unsafe {
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                addr.sun_path.as_mut_ptr() as *mut u8,
+                path_len,
+            );
+            let addr_len = std::mem::size_of::<libc::sa_family_t>() + path_len;
+            let ret = libc::bind(
+                fd,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                addr_len as u32,
+            );
+            if ret < 0 {
+                let e = std::io::Error::last_os_error();
+                libc::close(fd);
+                anyhow::bail!(sysa::l10n::fmt(
+                    sysa::l10n::t_("bind abstract datagram '{address}' failed: {e}."),
+                    &[("address", address), ("e", &e.to_string())]
+                ));
+            }
+        }
+        info!("Bound abstract Unix datagram at '{}'", address);
+        Ok(fd)
+    } else {
+        let path = std::path::Path::new(address);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("Cannot create directory '{}' for socket '{address}'."),
+                        &[("address", address)],
+                    )
+                })?;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        let cpath = CString::new(address).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Invalid Unix datagram path '{address}'."),
+                &[("address", address)],
+            )
+        })?;
+        let bytes = cpath.as_bytes();
+        let path_len = bytes.len().min(107);
+        unsafe {
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                addr.sun_path.as_mut_ptr() as *mut u8,
+                path_len,
+            );
+            let addr_len = std::mem::size_of::<libc::sa_family_t>() + path_len;
+            let ret = libc::bind(
+                fd,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                addr_len as u32,
+            );
+            if ret < 0 {
+                let e = std::io::Error::last_os_error();
+                libc::close(fd);
+                anyhow::bail!(sysa::l10n::fmt(
+                    sysa::l10n::t_("bind Unix datagram '{address}' failed: {e}."),
+                    &[("address", address), ("e", &e.to_string())]
+                ));
+            }
+        }
+        info!("Bound Unix datagram at '{}'", address);
+        Ok(fd)
+    }
+}
+
 fn bind_seqpacket(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
     if address.starts_with(ABSTRACT_PREFIX) {
         bind_abstract_unix(address, backlog).map(Some)
@@ -424,6 +539,17 @@ fn create_fifo(path: &str, mode: &str) -> Result<()> {
             &[("path", path)],
         )
     })?;
+    // The parent directory (e.g. /run/foo) may not exist yet.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Cannot create directory '{}' for FIFO '{path}'."),
+                    &[("path", path)],
+                )
+            })?;
+        }
+    }
     let mode_int = if mode.is_empty() {
         0o644
     } else {
@@ -581,6 +707,49 @@ fn try_clone_unix(l: &UnixListener) -> UnixListener {
             let std = std::os::unix::net::UnixListener::from_raw_fd(dup);
             std.set_nonblocking(true).unwrap();
             UnixListener::from_std(std).unwrap()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_datagram_unix_path() {
+        let dir = std::env::temp_dir().join(format!("sysk-dgram-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.socket");
+        let p = path.to_str().unwrap().to_string();
+
+        let fd = bind_datagram(&p).unwrap();
+        assert!(path.exists());
+        // A stale file on the same path must be replaced on re-bind.
+        let fd2 = bind_datagram(&p).unwrap();
+        assert!(path.exists());
+
+        unsafe {
+            libc::close(fd);
+            libc::close(fd2);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bind_datagram_abstract() {
+        let name = format!("@sysk-dgram-test-{}", std::process::id());
+        let fd = bind_datagram(&name).unwrap();
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn bind_datagram_udp_port() {
+        let fd = bind_datagram("0").unwrap();
+        unsafe {
+            libc::close(fd);
         }
     }
 }

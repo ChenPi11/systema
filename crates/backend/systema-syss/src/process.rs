@@ -26,8 +26,6 @@ use std::process::Stdio;
 
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
@@ -60,10 +58,17 @@ const FORCED_SERVICE_ENV: &[(&str, &str)] = &[
 ///
 /// If `invocation_id` is `Some`, the `INVOCATION_ID` environment variable is
 /// set in the spawned process's environment (systemd-compatible behaviour).
+///
+/// If `listen_fds` is non-empty, the fds are handed to the child as
+/// systemd-style socket-activation fds: they are moved to 3..3+N,
+/// `LISTEN_FDS=N` / `LISTEN_PID=<child pid>` are set in the child, and the
+/// original descriptors are closed in the parent after `spawn()`.
+#[cfg(unix)]
 pub async fn start_service(
     registry: ServiceRegistry,
     config: &UnitConfig,
     invocation_id: Option<String>,
+    listen_fds: Vec<RawFd>,
 ) -> Result<(u32, Child)> {
     let unit_name = config.unit_name.clone();
     let svc = config.service.as_ref().ok_or_else(|| {
@@ -144,13 +149,38 @@ pub async fn start_service(
     }
 
     // TTY stdio: attach the configured TTY as the controlling terminal and
-    // redirect the requested standard streams to it.
-    let tty_fd = apply_tty(&mut cmd, svc, &unit_name)?;
+    // redirect the requested standard streams to it.  The pre_exec action is
+    // returned so it can be merged with the socket-activation one below
+    // (std::process only allows a single pre_exec hook).
+    let (tty_fd, tty_pre_exec) = apply_tty(&mut cmd, svc, &unit_name)?;
+
+    // Socket activation: move listener fds to 3..3+N in the child and set
+    // LISTEN_FDS / LISTEN_PID (checked by sd_listen_fds()).
+    let sa_pre_exec = socket_activation_pre_exec(&listen_fds);
+    let merged = match (tty_pre_exec, sa_pre_exec) {
+        (Some(mut a), Some(mut b)) => Some(Box::new(move || {
+            a()?;
+            b()
+        }) as PreExecFn),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if let Some(mut pre) = merged {
+        unsafe {
+            cmd.pre_exec(move || pre());
+        }
+    }
 
     // Spawn the child process. We deliberately do NOT wait here — the child
     // is monitored asynchronously via `monitor_child`.
     let spawn_result = cmd.spawn();
     close_tty_fd(tty_fd);
+    for fd in &listen_fds {
+        unsafe {
+            libc::close(*fd);
+        }
+    }
     let child = spawn_result.with_context(|| {
         sysa::l10n::fmt(
             sysa::l10n::t_("Failed to spawn {program}."),
@@ -177,6 +207,18 @@ pub async fn start_service(
     }
 
     Ok((pid, child))
+}
+
+#[cfg(not(unix))]
+pub async fn start_service(
+    _registry: ServiceRegistry,
+    _config: &UnitConfig,
+    _invocation_id: Option<String>,
+    _listen_fds: Vec<i32>,
+) -> Result<(u32, Child)> {
+    bail!(sysa::l10n::t_(
+        "Starting services is not supported on this platform."
+    ));
 }
 
 /// Stop a running service by sending SIGTERM (then SIGKILL after timeout).
@@ -265,6 +307,73 @@ pub fn is_alive(_pid: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-exec hooks (TTY + socket activation)
+// ---------------------------------------------------------------------------
+
+/// Type-erased `pre_exec` closure (std::process::CommandExt allows only one).
+#[cfg(unix)]
+type PreExecFn = Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>;
+
+/// Build the pre_exec closure that hands `listen_fds` to the child as
+/// systemd-style socket-activation fds: each fd is dup2'ed to 3..3+N with
+/// CLOEXEC cleared, the originals are CLOEXEC-flagged (they must not leak
+/// past exec), and `LISTEN_PID` is set to the child's pid (the value is only
+/// known in the child, and `sd_listen_fds()` verifies it against `getpid()`).
+#[cfg(unix)]
+fn socket_activation_pre_exec(listen_fds: &[RawFd]) -> Option<PreExecFn> {
+    use std::ffi::CString;
+    if listen_fds.is_empty() {
+        return None;
+    }
+    let fds = listen_fds.to_vec();
+    Some(Box::new(move || {
+        for (i, &fd) in fds.iter().enumerate() {
+            let target = 3 + i as RawFd;
+            if fd != target {
+                unsafe {
+                    if libc::dup2(fd, target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+            unsafe {
+                let flags = libc::fcntl(target, libc::F_GETFD, 0);
+                if flags >= 0 {
+                    libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+            }
+        }
+        let key = CString::new("LISTEN_PID").map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_PID")
+        })?;
+        let pid = unsafe { libc::getpid() };
+        let val = CString::new(pid.to_string()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in pid string")
+        })?;
+        unsafe {
+            libc::setenv(key.as_ptr(), val.as_ptr(), 1);
+        }
+        // LISTEN_FDS: sd_listen_fds() returns 0 when this variable is
+        // missing, so the child would ignore the transferred descriptors.
+        let n_fds = CString::new(fds.len().to_string()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_FDS")
+        })?;
+        unsafe {
+            libc::setenv(
+                c"LISTEN_FDS".as_ptr(),
+                n_fds.as_ptr(),
+                1,
+            );
+        }
+        Ok(())
+    }))
+}
+
+#[cfg(not(unix))]
+type PreExecFn = ();
+
+// ---------------------------------------------------------------------------
 // TTY stdio (systemd-compatible StandardInput/Output/Error=tty)
 // ---------------------------------------------------------------------------
 
@@ -315,24 +424,26 @@ fn close_tty_fd(_fd: Option<RawFd>) {}
 /// made a session leader with the TTY as its controlling terminal (so the
 /// TTY delivers terminal signals and job control to the service).
 ///
-/// Returns the raw fd of the opened TTY. The caller must keep it open until
-/// after `spawn()` (it is inherited by the child for `pre_exec`), then close
-/// it with [`close_tty_fd`].
+/// Returns the raw fd of the opened TTY (the caller must keep it open until
+/// after `spawn()`, then close it with [`close_tty_fd`]) and the pre_exec
+/// closure to run in the child (returned — not registered — because
+/// `std::process` only allows a single pre_exec hook that must be merged with
+/// the socket-activation one).
 ///
 /// If the TTY device cannot be opened (e.g. insufficient permissions), a
-/// warning is logged and `Ok(None)` is returned so the service still starts
-/// with its ordinary stdio.
+/// warning is logged and `Ok((None, None))` is returned so the service still
+/// starts with its ordinary stdio.
 #[cfg(unix)]
 fn apply_tty(
     cmd: &mut Command,
     svc: &sysa::proto::ServiceConfig,
     unit_name: &str,
-) -> Result<Option<RawFd>> {
+) -> Result<(Option<RawFd>, Option<PreExecFn>)> {
     let tty_in = is_tty_mode(&svc.standard_input);
     let tty_out = is_tty_mode(&svc.standard_output);
     let tty_err = is_tty_mode(&svc.standard_error);
     if !(tty_in || tty_out || tty_err) {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let path = if svc.tty_path.is_empty() {
@@ -352,7 +463,7 @@ fn apply_tty(
                 "Cannot open TTY {} for {} ({}): ignoring TTYPath",
                 path, unit_name, e
             );
-            return Ok(None);
+            return Ok((None, None));
         }
     };
     let base = file.into_raw_fd();
@@ -386,19 +497,18 @@ fn apply_tty(
     let force = is_tty_force(&svc.standard_input)
         || is_tty_force(&svc.standard_output)
         || is_tty_force(&svc.standard_error);
-    unsafe {
-        cmd.as_std_mut().pre_exec(move || {
+    let pre: PreExecFn = Box::new(move || {
+        unsafe {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             let arg = if force { 1 } else { 0 };
             libc::ioctl(base, libc::TIOCSCTTY, arg);
             libc::close(base);
-            Ok(())
-        });
-    }
-
-    Ok(Some(base))
+        }
+        Ok(())
+    });
+    Ok((Some(base), Some(pre)))
 }
 
 #[cfg(not(unix))]
@@ -406,8 +516,8 @@ fn apply_tty(
     _cmd: &mut Command,
     _svc: &sysa::proto::ServiceConfig,
     _unit_name: &str,
-) -> Result<Option<RawFd>> {
-    Ok(None)
+) -> Result<(Option<i32>, Option<PreExecFn>)> {
+    Ok((None, None))
 }
 
 // ---------------------------------------------------------------------------

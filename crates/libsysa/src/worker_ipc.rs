@@ -154,6 +154,39 @@ impl EventPublisher {
         });
     }
 
+    /// Send a fire-and-forget envelope whose payload is an arbitrary raw byte
+    /// string (NOT prost-encoded).  Use this for messages whose payload is
+    /// plain text/bytes on the wire, e.g. `socket.request_fd` carrying a unit
+    /// name.  Sending such payloads through [`send_envelope`] would prost-
+    /// encode them (length prefix) and corrupt the receiver's parsing.
+    pub fn send_envelope_bytes(&self, method: &str, payload: Vec<u8>) {
+        let publisher = self.clone();
+        let method = method.to_string();
+        tokio::spawn(async move {
+            let request_id = publisher.next_request_id.fetch_add(1, Ordering::Relaxed);
+            if request_id == 0 {
+                return;
+            }
+            let env = Envelope {
+                request_id,
+                source: publisher.worker_id.clone(),
+                target: "system-a".to_string(),
+                method: method.clone(),
+                payload,
+            };
+            let env = match encode_envelope(env) {
+                Ok(env) => env,
+                Err(e) => {
+                    error!("Failed to encode envelope: {}", e);
+                    return;
+                }
+            };
+            if publisher.tx.send(env).is_err() {
+                warn!("Outgoing channel closed; cannot send {method}");
+            }
+        });
+    }
+
     /// Send a reply envelope echoing an incoming `request_id` (e.g. the
     /// `unit.define_result` answer to a System A `unit.define` request).
     /// Fire-and-forget from the caller's perspective.

@@ -201,7 +201,7 @@ System A 与以下 Worker 通过 IPC 交互，以下是 System A 侧对各 Worke
 | **System K**（Socket Worker） | ✅ 已实现 | `crates/backend/systema-sysk`：socket 单元（TCP/Unix 监听、fd 传递）；socket activation 仅 inetd 式（无 LISTEN_FDS/LISTEN_PID 环境、不关联配对 service） |
 | **System D**（Device Worker） | ✅ 已实现 | `crates/backend/systema-sysd`：device 单元（/dev + sysfs 发现、netlink、match 规则） |
 | **System M**（Mount Worker） | ✅ 已实现 | `crates/backend/systema-sysm`（+ `.linux` flavor）：mount / automount 单元 |
-| **System F**（Finder Worker） | ⚠️ 部分实现 | `crates/backend/systema-sysf`：静态单元发现与解析（库 + worker 双形态），经 staging 区提交（`finder.register_units`/`finder.commit_units`） |
+| **System F**（Finder Worker） | ⚠️ 部分实现 | `crates/backend/systema-sysf`：通用 finder worker（staging 区提交/查询）；`crates/backend/systema-sysf/systema-sysf-systemd`：systemd finder 可执行文件（`systema-sysf.systemd`，解析 + 暂存） |
 | **System B**（Boot/Power Worker） | ❌ 未实现 | 无 `reboot/poweroff/halt/kexec` 等 D-Bus 方法；仅 `StartLimitAction=` 副作用调用外部 `shutdown` 命令 |
 | **swap 单元** | ❌ 未实现 | 解析支持（`UnitKind::Swap`），但无对应 worker |
 

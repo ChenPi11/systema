@@ -326,6 +326,13 @@ pub async fn enqueue_job_type(
 /// section 4.1 suggests consistency with job timeouts).
 const UNIT_DEFINE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Upper bound for the per-transaction `unit.define` materialisation
+/// rounds.  Dependency chains can be arbitrarily deep, but each round
+/// loads the exact missing unit, so a handful of rounds covers realistic
+/// graphs; the bound only guards against definition sources that can never
+/// satisfy a missing unit.
+const UNIT_DEFINE_MAX_ROUNDS: u32 = 32;
+
 /// Walk the dependency closure the planner will expand and collect the
 /// names of units that are referenced but not loaded — the pre-plan scan
 /// of the `unit.define` protocol.
@@ -798,62 +805,36 @@ pub async fn enqueue_job(
             request_unit_definition(allocator.clone(), &missing).await?;
         }
 
-        let state = allocator.read();
-        let units: HashMap<String, UnitFile> = state.units.clone();
-        let states: HashMap<String, UnitActiveState> = state
-            .unit_states
-            .iter()
-            .map(|(n, c)| {
+        // Build the plan, materialising on-disk/dynamic definitions one
+        // layer at a time: the pre-plan scan above only expands the
+        // dependency closure one level (missing units' own dependencies are
+        // not yet known), so a chain `a -> b -> c` can still hit
+        // `UnitNotFound` for the second layer.  Loop until the plan builds
+        // or no definition source can satisfy the missing unit.
+        let mut attempts: u32 = 0;
+        loop {
+            let (units, states, installed) = {
+                let state = allocator.read();
                 (
-                    n.clone(),
-                    UnitActiveState::from_active_state_str(&c.active_state),
+                    state.units.clone(),
+                    state
+                        .unit_states
+                        .iter()
+                        .map(|(n, c)| {
+                            (
+                                n.clone(),
+                                UnitActiveState::from_active_state_str(&c.active_state),
+                            )
+                        })
+                        .collect::<HashMap<String, UnitActiveState>>(),
+                    state
+                        .jobs
+                        .values()
+                        .filter(|j| matches!(j.status, JobStatus::Running))
+                        .map(|j| (j.unit_name.clone(), JobType::from_job_kind(j.kind)))
+                        .collect::<HashMap<String, JobType>>(),
                 )
-            })
-            .collect();
-        let installed: HashMap<String, JobType> = state
-            .jobs
-            .values()
-            .filter(|j| matches!(j.status, JobStatus::Running))
-            .map(|j| (j.unit_name.clone(), JobType::from_job_kind(j.kind)))
-            .collect();
-        build_plan(
-            &units,
-            &states,
-            &installed,
-            unit_name,
-            JobType::from_job_kind(kind),
-            PlannerMode::from_job_mode(mode),
-        )
-    };
-    let plan = match plan {
-        Ok(plan) => plan,
-        Err(PlanError::UnitNotFound(name)) => {
-            // Bounded retry: the pre-scan walk mirrors the planner's edge
-            // expansion but may miss an edge it only discovers later; ask
-            // for the exact missing unit once more before giving up.
-            warn!(
-                "Transaction for {} failed with missing unit {name} after pre-scan; one unit.define retry",
-                unit_name
-            );
-            request_unit_definition(allocator.clone(), &[name.clone()]).await?;
-            let state = allocator.read();
-            let units: HashMap<String, UnitFile> = state.units.clone();
-            let states: HashMap<String, UnitActiveState> = state
-                .unit_states
-                .iter()
-                .map(|(n, c)| {
-                    (
-                        n.clone(),
-                        UnitActiveState::from_active_state_str(&c.active_state),
-                    )
-                })
-                .collect();
-            let installed: HashMap<String, JobType> = state
-                .jobs
-                .values()
-                .filter(|j| matches!(j.status, JobStatus::Running))
-                .map(|j| (j.unit_name.clone(), JobType::from_job_kind(j.kind)))
-                .collect();
+            };
             match build_plan(
                 &units,
                 &states,
@@ -862,16 +843,27 @@ pub async fn enqueue_job(
                 JobType::from_job_kind(kind),
                 PlannerMode::from_job_mode(mode),
             ) {
-                Ok(plan) => plan,
+                Ok(plan) => break plan,
+                Err(PlanError::UnitNotFound(name)) if attempts < UNIT_DEFINE_MAX_ROUNDS => {
+                    // Bounded retry: the pre-scan walk mirrors the planner's
+                    // edge expansion but may miss an edge it only discovers
+                    // later; ask for the exact missing unit once more.
+                    warn!(
+                        "Transaction for {} failed with missing unit {name} after pre-scan; one unit.define retry (round {})",
+                        unit_name,
+                        attempts + 1
+                    );
+                    request_unit_definition(allocator.clone(), &[name.clone()]).await?;
+                    attempts += 1;
+                }
                 Err(e) => {
-                    warn!("Transaction for {} ({kind:?}, mode={mode:?}) failed: {e}", unit_name);
+                    warn!(
+                        "Transaction for {} ({kind:?}, mode={mode:?}) failed: {e}",
+                        unit_name
+                    );
                     bail!("{}", e);
                 }
             }
-        }
-        Err(e) => {
-            warn!("Transaction for {} ({kind:?}, mode={mode:?}) failed: {e}", unit_name);
-            bail!("{}", e);
         }
     };
 
@@ -1099,7 +1091,8 @@ pub async fn enqueue_job(
         emit_job_new_after_lock(allocator.clone(), job_id, name, step_kind);
 
         // --- Timeout monitoring ---
-        let abort_handle = spawn_job_timeout(allocator.clone(), job_id, name, step_kind, &unit_file);
+        let abort_handle =
+            spawn_job_timeout(allocator.clone(), task_id, job_id, name, step_kind, &unit_file);
         if let Some(handle) = abort_handle {
             let mut state = allocator.write();
             if let Some(job) = state.jobs.get_mut(&job_id) {
@@ -1140,18 +1133,30 @@ pub async fn enqueue_job(
 
         // In serial mode, wait for the previous task to complete before
         // sending the next one.  The previous task's handle_task_result
-        // will signal through the serial chain channel.
-        if serial_mode && is_root && serial_chain_rx.is_some() {
-            if let Some(rx) = serial_chain_rx.take() {
-                let _ = rx.await;
+        // will signal through the serial chain channel.  Bounded so a
+        // never-completing predecessor cannot wedge the whole dispatch
+        // (the caller of this loop awaits it sequentially).
+        let serial_wait = async {
+            if serial_mode && is_root && serial_chain_rx.is_some() {
+                if let Some(rx) = serial_chain_rx.take() {
+                    let _ = rx.await;
+                }
+            }
+            if serial_mode && !is_root {
+                if let Some(rx) = serial_chain_rx.take() {
+                    let _ = rx.await;
+                }
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(15), serial_wait).await {
+            Ok(()) => {}
+            Err(_) => {
+                warn!(
+                    "Serial chain wait timed out for {} (task {task_id}); dispatching anyway",
+                    name
+                );
             }
         }
-        if serial_mode && !is_root {
-            if let Some(rx) = serial_chain_rx.take() {
-                let _ = rx.await;
-            }
-        }
-
         if worker_envelope_tx.send(buf.freeze()).await.is_err() {
             warn!("Worker channel closed for unit {}", name);
             let mut state = allocator.write();
@@ -1736,6 +1741,19 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         device,
         path,
         scope,
+        socket_units: {
+            let mut deps: Vec<String> = uf
+                .unit
+                .requires
+                .iter()
+                .chain(uf.unit.binds_to.iter())
+                .filter(|d| d.ends_with(".socket"))
+                .cloned()
+                .collect();
+            deps.sort();
+            deps.dedup();
+            deps
+        },
     }
 }
 
@@ -1765,6 +1783,7 @@ fn mount_config_from_section(m: &MountSection) -> MountConfig {
 /// default 60 s timeout.
 fn spawn_job_timeout(
     allocator: AllocatorHandle,
+    task_id: u64,
     job_id: u64,
     name: &str,
     kind: JobKind,
@@ -1802,6 +1821,11 @@ fn spawn_job_timeout(
                         }
                     }
                 }
+                // Advance the serial chain so a dependent step is not
+                // starved by a timed-out predecessor.
+                if let Some(tx) = state.serial_completion_txs.remove(&task_id) {
+                    let _ = tx.send(());
+                }
             })
             .abort_handle();
             Some(handle)
@@ -1834,6 +1858,11 @@ fn spawn_job_timeout(
                         }
                     }
                 }
+                // Advance the serial chain so a dependent step is not
+                // starved by a timed-out predecessor.
+                if let Some(tx) = state.serial_completion_txs.remove(&task_id) {
+                    let _ = tx.send(());
+                }
             })
             .abort_handle();
             Some(handle)
@@ -1857,6 +1886,11 @@ fn spawn_job_timeout(
                             });
                         }
                     }
+                }
+                // Advance the serial chain so a dependent step is not
+                // starved by a timed-out predecessor.
+                if let Some(tx) = state.serial_completion_txs.remove(&task_id) {
+                    let _ = tx.send(());
                 }
             })
             .abort_handle();

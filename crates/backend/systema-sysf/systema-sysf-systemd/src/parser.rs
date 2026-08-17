@@ -206,6 +206,16 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
                 unit.mount = Some(mnt);
             }
         }
+        UnitKind::Automount => {
+            if config.get("automount", "where").is_some()
+                || config.get("automount", "extraoptions").is_some()
+                || config.get("automount", "timeoutidlesec").is_some()
+            {
+                let mut amt = unit.automount.take().unwrap_or_default();
+                parse_automount_section(&config, &mut amt, &unit.name)?;
+                unit.automount = Some(amt);
+            }
+        }
         UnitKind::Timer => {
             if config.get("timer", "oncalendar").is_some()
                 || config.get("timer", "onbootsec").is_some()
@@ -438,6 +448,16 @@ fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
                 )
             })?;
             unit.mount = Some(mnt);
+        }
+        UnitKind::Automount => {
+            let mut amt = AutomountSection::default();
+            parse_automount_section(&config, &mut amt, name).with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Parsing [Automount] section of {name} ..."),
+                    &[("name", name)],
+                )
+            })?;
+            unit.automount = Some(amt);
         }
         UnitKind::Timer => {
             let mut tmr = TimerSection::default();
@@ -1112,6 +1132,14 @@ fn parse_mount_section(config: &Ini, mnt: &mut MountSection, name: &str) -> Resu
     Ok(())
 }
 
+fn parse_automount_section(config: &Ini, amt: &mut AutomountSection, name: &str) -> Result<()> {
+    amt.where_ = expand_specifiers(&get_str(config, "automount", "where"), name);
+    amt.extra_options = expand_specifiers(&get_str(config, "automount", "extraoptions"), name);
+    amt.timeout_idle_sec = get_u32(config, "automount", "timeoutidlesec", 0);
+    amt.directory_mode = get_str(config, "automount", "directorymode");
+    Ok(())
+}
+
 fn parse_timer_section(config: &Ini, tmr: &mut TimerSection, name: &str) -> Result<()> {
     let oas = get_str(config, "timer", "onactivesec");
     tmr.on_active_sec = if oas.is_empty() {
@@ -1532,6 +1560,35 @@ WantedBy=local-fs.target
         assert_eq!(mnt.timeout_sec, 30);
         assert!(mnt.lazy_unmount);
         assert_eq!(mnt.directory_mode, "0755");
+    }
+
+    // -----------------------------------------------------------------------
+    // Automount unit parsing
+    // -----------------------------------------------------------------------
+
+    const AUTOMOUNT_UNIT: &str = r#"
+[Unit]
+Description=Automount /data
+
+[Automount]
+Where=/data
+ExtraOptions=allow_other
+TimeoutIdleSec=5min
+DirectoryMode=0750
+
+[Install]
+WantedBy=local-fs.target
+"#;
+
+    #[test]
+    fn test_parse_automount() {
+        let unit = parse_unit("data.automount", AUTOMOUNT_UNIT).unwrap();
+        assert!(matches!(unit.kind, UnitKind::Automount));
+        let amt = unit.automount.unwrap();
+        assert_eq!(amt.where_, "/data");
+        assert_eq!(amt.extra_options, "allow_other");
+        assert_eq!(amt.timeout_idle_sec, 300);
+        assert_eq!(amt.directory_mode, "0750");
     }
 
     // -----------------------------------------------------------------------

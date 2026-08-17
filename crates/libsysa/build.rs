@@ -90,6 +90,16 @@ pub const GENERATOR_SEARCH_PATHS: &[&str] = &[
     "/lib/systemd/system-generators",
 ];
 
+// Search paths for System F finder executables.  The `systema-sysf`
+// executable locates format-specific finder binaries (e.g.
+// `systema-sysf.systemd`) in these directories.
+pub const FINDER_SEARCH_PATHS: &[&str] = &[
+    "/etc/systema/finder",
+    "/usr/etc/systema/finder",
+    "/usr/local/etc/systema/finder",
+    "/opt/systema/finder",
+];
+
 pub const SYSTEMA_BIN_SEARCH_PATHS: &[&str] = &[
     "/",
     "/bin",

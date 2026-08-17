@@ -16,6 +16,7 @@
 //! Deliberately out of scope: restarts, mounts, hostname, dbus-daemon
 //! (the system bus must be provided externally), journaling.
 
+mod kmsg;
 mod supervise;
 mod workers;
 
@@ -77,6 +78,13 @@ struct Args {
         help = "Time to wait for System A / a worker to report ready before aborting"
     )]
     ready_timeout: u64,
+
+    #[arg(
+        long,
+        default_value = "/var/log",
+        help = "Directory for per-process log files (systema-sysa.log, systema-syss.log, ...)"
+    )]
+    log_dir: PathBuf,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -102,9 +110,7 @@ async fn main() -> Result<()> {
                 ))
             })
             .mut_arg("with_finder", |a| {
-                a.help(sysa::l10n::t_(
-                    "Run the one-shot System F finder chain.",
-                ))
+                a.help(sysa::l10n::t_("Run the one-shot System F finder chain."))
             })
             .mut_arg("bin_dir", |a| {
                 a.help(sysa::l10n::t_(
@@ -125,14 +131,21 @@ async fn main() -> Result<()> {
                 a.help(sysa::l10n::t_(
                     "Time to wait for System A / a worker to report ready before aborting.",
                 ))
+            })
+            .mut_arg("log_dir", |a| {
+                a.help(sysa::l10n::t_(
+                    "Directory for per-process log files (systema-sysa.log, ...).",
+                ))
             });
         Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
+    kmsg::init();
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(kmsg::DualWriter)
         .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
+    info!("Logging to stderr and /dev/kmsg");
 
     if std::process::id() == 1 {
         info!("SysAInit running as PID 1 (reaping orphaned processes)");
@@ -141,11 +154,7 @@ async fn main() -> Result<()> {
     }
 
     let set = workers::build_worker_set(&args.skip_workers, args.with_finder)?;
-    let summary = set
-        .iter()
-        .map(|s| s.name)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let summary = set.iter().map(|s| s.name).collect::<Vec<_>>().join(", ");
     info!(
         "Supervised processes ({count}): {summary}",
         count = set.len()
@@ -179,6 +188,7 @@ async fn main() -> Result<()> {
         &args.log_level,
         Duration::from_secs(args.shutdown_timeout),
         Duration::from_secs(args.ready_timeout),
+        &args.log_dir,
     )
     .await?;
     std::process::exit(code);

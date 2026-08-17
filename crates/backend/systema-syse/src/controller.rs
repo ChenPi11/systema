@@ -299,6 +299,7 @@ mod tests {
             timer: None,
             device: None,
             path: None,
+            socket_units: Vec::new(),
             scope: Some(ScopeConfig {
                 pids,
                 timeout_stop_secs: 90,

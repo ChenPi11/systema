@@ -1424,6 +1424,7 @@ dependencies = [
  "serde_json",
  "sysa",
  "systema-sysf",
+ "systema-sysf-systemd",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1502,10 +1503,26 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "serde",
+ "serde_json",
+ "sysa",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "systema-sysf-systemd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
  "configparser",
  "serde",
  "serde_json",
  "sysa",
+ "systema-sysf",
  "thiserror",
  "tokio",
  "tracing",
@@ -1519,6 +1536,7 @@ dependencies = [
  "anyhow",
  "clap",
  "nix",
+ "prost",
  "sysa",
  "tokio",
  "tracing",
