@@ -13,10 +13,14 @@
 //! fatal; `--no-strict` downgrades that to an ERROR log and skips the
 //! process.
 //!
-//! Deliberately out of scope: restarts, mounts, hostname, dbus-daemon
-//! (the system bus must be provided externally), journaling.
+//! Deliberately out of scope: restarts, hostname, dbus-daemon (the system
+//! bus must be provided externally), journaling.  API filesystem mounts
+//! are a PID 1 duty: SysAInit mounts the cgroup v2 hierarchy itself
+//! (see [`mount_setup`]) like systemd's `mount_setup()` does, and only
+//! when it has the privileges to mount.
 
 mod kmsg;
+mod mount_setup;
 mod supervise;
 mod workers;
 
@@ -24,7 +28,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -85,6 +89,14 @@ struct Args {
 async fn main() -> Result<()> {
     sysa::paths::init();
     sysa::l10n::init();
+
+    // Like systemd's `mount_setup()`, SysAInit mounts the cgroup v2
+    // hierarchy itself before anything else starts.  Skipped without
+    // mount privileges (rootless), and never fatal: resource control
+    // degrades to the no-op controller when cgroup2 is unavailable.
+    if let Err(e) = mount_setup::mount_cgroup2() {
+        warn!("cgroup2 mount failed; resource control will degrade: {e:#}");
+    }
 
     let args = {
         use clap::{CommandFactory, FromArgMatches};
