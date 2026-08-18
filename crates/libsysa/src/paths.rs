@@ -13,6 +13,10 @@ pub struct Paths {
     pub systemd_lib_unit_dir: &'static str,
     pub systemd_first_boot_file: &'static str,
     pub locale_dir: &'static str,
+    /// Base directory for runtime state (e.g. `/run`).  System A creates
+    /// `systemd/system` under this path on startup so that units can
+    /// reference `/run/systemd/system`.
+    pub runstatedir: &'static str,
     pub unit_search_paths: Vec<String>,
     pub generator_search_paths: Vec<String>,
     /// Search paths for System F finder executables.  The `systema-sysf`
@@ -59,6 +63,7 @@ fn compute_paths() -> Paths {
             builtin::SYSTEMD_FIRST_BOOT_FILE,
         ),
         locale_dir: resolve("SYSTEMA_LOCALE_DIR", builtin::LOCALE_DIR),
+        runstatedir: resolve("SYSTEMA_RUNSTATEDIR", builtin::RUNSTATEDIR),
         unit_search_paths: resolve_list("SYSTEMA_UNIT_PATH", builtin::UNIT_SEARCH_PATHS),
         generator_search_paths: resolve_list(
             "SYSTEMA_GENERATOR_PATH",
@@ -156,6 +161,7 @@ mod tests {
         assert_eq!(paths.systemd_lib_unit_dir, "/usr/lib/systemd/system");
         assert_eq!(paths.systemd_first_boot_file, "/run/systemd/first-boot");
         assert_eq!(paths.locale_dir, "/usr/share/locale");
+        assert_eq!(paths.runstatedir, "/run");
         assert_eq!(
             paths.unit_search_paths,
             vec![

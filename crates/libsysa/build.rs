@@ -71,6 +71,8 @@ pub const SYSTEMA_SOCKET_HANDLER_PATH: &str = "/usr/lib/system-alphabet/socket-h
 
 pub const LOCALE_DIR: &str = "/usr/share/locale";
 
+pub const RUNSTATEDIR: &str = "/run";
+
 pub const UNIT_SEARCH_PATHS: &[&str] = &[
     "/etc/system-alphabet",
     "/run/system-alphabet",

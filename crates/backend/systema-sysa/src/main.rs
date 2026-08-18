@@ -60,6 +60,14 @@ async fn main() -> Result<()> {
 
     info!("System A (System Allocator) starting up");
 
+    // Create /run/systemd/system if it doesn't exist.  Many systemd units
+    // expect this directory to be present.
+    let runstatedir = sysa::paths::instance().runstatedir;
+    let systemd_system_dir = format!("{runstatedir}/systemd/system");
+    if let Err(e) = std::fs::create_dir_all(&systemd_system_dir) {
+        tracing::warn!("Failed to create {systemd_system_dir}: {e}");
+    }
+
     // Shared allocator state accessible from both the IPC server and D-Bus server.
     let allocator = state::Allocator::handle();
 
