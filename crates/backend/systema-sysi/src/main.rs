@@ -90,6 +90,9 @@ async fn main() -> Result<()> {
         use clap::{CommandFactory, FromArgMatches};
         let cmd = Args::command()
             .about(sysa::l10n::t_("SysAInit — System Alphabet init"))
+            // Unknown arguments and options are silently ignored; known
+            // ones are still parsed normally.
+            .ignore_errors(true)
             .mut_arg("debug", |a| {
                 a.help(sysa::l10n::t_("Enable debug-level logging."))
             })
