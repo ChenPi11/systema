@@ -4,7 +4,7 @@
 //! 1. Bind the notify listener socket (`<notify-dir>/init.sock`) **before**
 //!    spawning anything, so no early allocator event is lost.
 //! 2. Spawn System A and wait for `MANAGER_READY` on the notify channel.
-//! 3. Spawn the one-shot finder chain (if any).
+//! 3. Spawn the one-shot finder chain.
 //! 4. Spawn the workers **serially**: each worker is spawned, then
 //!    SysAInit waits for `WORKER_READY=<worker_id>` before spawning the
 //!    next one.

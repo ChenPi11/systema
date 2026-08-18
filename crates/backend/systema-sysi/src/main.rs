@@ -49,12 +49,6 @@ struct Args {
 
     #[arg(
         long,
-        help = "Run the one-shot System F finder chain (stage units, then commit)"
-    )]
-    with_finder: bool,
-
-    #[arg(
-        long,
         help = "Search for the systema-* binaries only in this directory (default: the executable directory, then PATH)"
     )]
     bin_dir: Option<PathBuf>,
@@ -109,9 +103,6 @@ async fn main() -> Result<()> {
                     "Workers to skip (short names or full binary names).",
                 ))
             })
-            .mut_arg("with_finder", |a| {
-                a.help(sysa::l10n::t_("Run the one-shot System F finder chain."))
-            })
             .mut_arg("bin_dir", |a| {
                 a.help(sysa::l10n::t_(
                     "Search for the systema-* binaries only in this directory.",
@@ -153,7 +144,7 @@ async fn main() -> Result<()> {
         info!("SysAInit running as a container child process");
     }
 
-    let set = workers::build_worker_set(&args.skip_workers, args.with_finder)?;
+    let set = workers::build_worker_set(&args.skip_workers)?;
     let summary = set.iter().map(|s| s.name).collect::<Vec<_>>().join(", ");
     info!(
         "Supervised processes ({count}): {summary}",

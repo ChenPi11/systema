@@ -32,6 +32,9 @@ use sysa::proto::{
 /// Long-running shim: exits 0 on SIGTERM, otherwise sleeps forever.
 const LONG_RUNNING: &str = "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n";
 
+/// One-shot finder shim: exits immediately (System F is not a daemon).
+const ONE_SHOT_FINDER: &str = "#!/bin/sh\nexit 0\n";
+
 const DEFAULT_WORKERS: &[&str] = &[
     "systema-sysa",
     "systema-syss",
@@ -80,6 +83,8 @@ fn default_shims(dir: &Path) {
     for worker in DEFAULT_WORKERS {
         write_shim(dir, worker, LONG_RUNNING);
     }
+    // The finder chain always runs and is one-shot.
+    write_shim(dir, "systema-sysf", ONE_SHOT_FINDER);
 }
 
 /// Reader thread that drains a child's stderr into a shared buffer.
@@ -433,10 +438,9 @@ fn sigterm_shuts_down_gracefully() {
 fn one_shot_finder_exit_does_not_terminate() {
     let dir = shim_dir("finder");
     default_shims(&dir);
-    write_shim(&dir, "systema-sysf", "#!/bin/sh\nexit 0\n");
     let notify_dir = dir.join("notify");
 
-    let mut child = run_sysi(&dir, &notify_dir, &["--with-finder"]);
+    let mut child = run_sysi(&dir, &notify_dir, &[]);
     let buf = stderr_reader(&mut child);
     boot_all(&notify_dir, &buf);
 
