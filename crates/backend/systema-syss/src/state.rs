@@ -38,6 +38,10 @@ pub struct ServiceInstance {
     pub last_exit_code: Option<i32>,
     /// Stop timeout in seconds (from ServiceConfig).
     pub timeout_stop_secs: Option<u32>,
+    /// RemainAfterExit=yes: the service stays "active" after its main
+    /// process exits successfully (oneshot style) instead of going
+    /// inactive.
+    pub remain_after_exit: bool,
     /// Invocation ID (UUID v4) of the current activation, as provided by
     /// System A.  Cleared when the service exits or is stopped.
     pub invocation_id: Option<String>,
@@ -50,6 +54,7 @@ impl ServiceInstance {
             main_pid: None,
             last_exit_code: None,
             timeout_stop_secs: None,
+            remain_after_exit: false,
             invocation_id: None,
         }
     }

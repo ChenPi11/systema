@@ -83,6 +83,32 @@ pub(crate) async fn monitor_service(
                     status.code(),
                     status.success()
                 );
+                let stay_active = {
+                    let reg = registry.lock();
+                    reg.get(&unit_name)
+                        .map(|inst| status.success() && inst.remain_after_exit)
+                        .unwrap_or(false)
+                };
+                if stay_active {
+                    // RemainAfterExit=yes: keep the unit "active" after a
+                    // successful exit (oneshot style), like systemd.  The
+                    // invocation stays assigned (systemd keeps the ID of the
+                    // still-active activation).
+                    info!(
+                        "Service {}: RemainAfterExit=yes, keeping unit active after successful exit",
+                        unit_name
+                    );
+                    {
+                        let mut reg = registry.lock();
+                        if let Some(inst) = reg.get_mut(&unit_name) {
+                            inst.state = ServiceState::Running;
+                            inst.main_pid = None;
+                            inst.last_exit_code = status.code();
+                        }
+                    }
+                    publish_service_state(&registry, &event_pub, &unit_name);
+                    break;
+                }
                 let state = if status.success() {
                     ServiceState::Dead
                 } else {

@@ -34,9 +34,10 @@
 //!
 //! - systema stores no inverse dependency edges at load time; the planner
 //!   builds a [`ReverseIndex`] over the unit map instead.
-//! - `EnqueueUnitJobMany()`-style multi-anchor transactions are not used
-//!   yet (the scheduler is single-root), but the per-unit job lists still
-//!   mirror systemd's model so multi-anchor support slots in later.
+//! - `EnqueueUnitJobMany()`-style multi-anchor transactions: supported via
+//!   [`build_plan_multi`].  Each root in the batch becomes an anchor job
+//!   inside a single [`Transaction`], matching systemd's
+//!   `manager_add_jobs()` semantics.
 //! - Units are preloaded; a missing dependency unit is a hard error
 //!   (`UnitNotFound`) instead of systemd's on-demand load.
 
@@ -1286,8 +1287,34 @@ pub fn build_plan(
     root_type: JobType,
     mode: PlannerMode,
 ) -> Result<TransactionPlan, PlanError> {
-    if !units.contains_key(root) {
-        return Err(PlanError::UnitNotFound(root.to_string()));
+    build_plan_multi(units, states, installed, &[(root, root_type)], mode)
+}
+
+/// `EnqueueUnitJobMany()`-style multi-anchor transaction planner.
+///
+/// Creates a single [`Transaction`] with every root in `roots` added as an
+/// anchor job (`by=NULL`), then runs the full systemd pipeline:
+///
+/// 1. `find_matters` — walk mattering edges from every anchor.
+/// 2. `minimize_impact` — drop non-mattering destructive jobs.
+/// 3. `drop_redundant` — remove jobs for already-active units (anchors
+///    are never dropped).
+/// 4. `collect_garbage` + `verify_order` (fixpoint loop).
+/// 5. `merge_jobs` + `collect_garbage` (fixpoint loop).
+/// 6. `drop_redundant` again.
+/// 7. `is_destructive` check.
+/// 8. `finalize` — topological sort via `step_must_wait`.
+pub fn build_plan_multi(
+    units: &HashMap<String, UnitFile>,
+    states: &HashMap<String, UnitActiveState>,
+    installed: &HashMap<String, JobType>,
+    roots: &[(&str, JobType)],
+    mode: PlannerMode,
+) -> Result<TransactionPlan, PlanError> {
+    for (root, _) in roots {
+        if !units.contains_key(*root) {
+            return Err(PlanError::UnitNotFound(root.to_string()));
+        }
     }
     let rev = ReverseIndex::build(units);
     let mut tr = Transaction::new();
@@ -1305,7 +1332,9 @@ pub fn build_plan(
     if mode == PlannerMode::RestartDependencies {
         flags |= PROPAGATE_START_AS_RESTART;
     }
-    tr.add_job_and_dependencies(units, states, installed, &rev, root, root_type, None, flags)?;
+    for (root, root_type) in roots {
+        tr.add_job_and_dependencies(units, states, installed, &rev, root, *root_type, None, flags)?;
+    }
 
     if mode == PlannerMode::Isolate {
         tr.add_isolate_jobs(units, states, installed, &rev);
@@ -1444,6 +1473,18 @@ mod tests {
         mode: PlannerMode,
     ) -> Vec<PlanStep> {
         build_plan(units, states, installed, root, t, mode)
+            .expect("plan should build")
+            .steps
+    }
+
+    fn steps_multi(
+        units: &HashMap<String, UnitFile>,
+        states: &HashMap<String, UnitActiveState>,
+        installed: &HashMap<String, JobType>,
+        roots: &[(&str, JobType)],
+        mode: PlannerMode,
+    ) -> Vec<PlanStep> {
+        build_plan_multi(units, states, installed, roots, mode)
             .expect("plan should build")
             .steps
     }
@@ -2073,5 +2114,95 @@ mod tests {
             PlanError::UnitNotFound("x.service".into()).to_string(),
             "Unit x.service is not loaded"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-anchor (EnqueueUnitJobMany) tests
+    // ------------------------------------------------------------------
+
+    /// The core regression for the /run/nologin bug: when two anchors are
+    /// planned together, a redundant-but-dependent unit is NOT dropped
+    /// (it is an anchor or has a non-redundant job), and ordering is
+    /// preserved between all roots.
+    #[test]
+    fn multi_anchor_orders_after_before() {
+        // a.service has Before=b.service
+        // b.service has Requires=c.service, After=c.service
+        // c.service is the "sysinit" equivalent
+        let units = map(vec![
+            with_before(make_unit("a.service"), &["b.service"]),
+            with_requires(with_after(make_unit("b.service"), &["c.service"]), &["c.service"]),
+            make_unit("c.service"),
+        ]);
+        let s = steps_multi(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[("a.service", Start), ("b.service", Start)],
+            Replace,
+        );
+        let n = names(&s);
+        // c must come before b (Requires + After), a must come before b (Before)
+        assert!(n.iter().position(|&x| x == "c.service").unwrap()
+            < n.iter().position(|&x| x == "b.service").unwrap(),
+            "c must start before b: {:?}", n);
+        assert!(n.iter().position(|&x| x == "a.service").unwrap()
+            < n.iter().position(|&x| x == "b.service").unwrap(),
+            "a must start before b: {:?}", n);
+        // Both anchors should be present
+        assert!(s.iter().any(|s| s.unit == "a.service" && s.anchor));
+        assert!(s.iter().any(|s| s.unit == "b.service" && s.anchor));
+    }
+
+    /// When a root unit is already active (redundant Start), it is still
+    /// kept because it is an anchor — matching systemd's behaviour that
+    /// anchor jobs are never dropped.
+    #[test]
+    fn multi_anchor_active_root_kept_as_anchor() {
+        let units = map(vec![
+            with_requires(make_unit("b.service"), &["c.service"]),
+            make_unit("c.service"),
+        ]);
+        let mut states = HashMap::new();
+        states.insert("c.service".into(), UnitActiveState::Active);
+        let s = steps_multi(
+            &units,
+            &states,
+            &HashMap::new(),
+            &[("b.service", Start)],
+            Replace,
+        );
+        // b is the only root; c is a dependency but already active.
+        // c should be dropped (redundant, not anchor).
+        assert_eq!(names(&s), vec!["b.service"]);
+    }
+
+    /// Two roots that share a dependency: the dependency appears once and
+    /// is ordered before both roots via After=.
+    #[test]
+    fn multi_anchor_shared_dependency() {
+        let units = map(vec![
+            with_after(with_requires(make_unit("a.service"), &["shared.service"]), &["shared.service"]),
+            with_after(with_requires(make_unit("b.service"), &["shared.service"]), &["shared.service"]),
+            make_unit("shared.service"),
+        ]);
+        let s = steps_multi(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[("a.service", Start), ("b.service", Start)],
+            Replace,
+        );
+        let n = names(&s);
+        assert_eq!(n.len(), 3, "should have 3 units: {:?}", n);
+        assert!(n.contains(&"shared.service"));
+        assert!(n.contains(&"a.service"));
+        assert!(n.contains(&"b.service"));
+        // shared must come before both a and b
+        let shared_pos = n.iter().position(|&x| x == "shared.service").unwrap();
+        let a_pos = n.iter().position(|&x| x == "a.service").unwrap();
+        let b_pos = n.iter().position(|&x| x == "b.service").unwrap();
+        assert!(shared_pos < a_pos, "shared before a: {:?}", n);
+        assert!(shared_pos < b_pos, "shared before b: {:?}", n);
     }
 }

@@ -331,6 +331,8 @@ message SocketConfig {
     string socket_group = 6;
     // Associated service unit name.
     string service = 7;
+    // Permission mode for automatically created socket directories (e.g. "0755").
+    string directory_mode = 8;
 }
 
 // One listen address in a SocketConfig.
@@ -633,6 +635,9 @@ message ServiceConfig {
     string standard_output = 15;
     string standard_error = 16;
     string tty_path = 17;
+    // RemainAfterExit=yes: the service stays "active" after its main process
+    // exits successfully (oneshot style), instead of going inactive.
+    bool remain_after_exit = 18;
 }
 
 // Configuration for `.scope` units, sent to the System E worker.

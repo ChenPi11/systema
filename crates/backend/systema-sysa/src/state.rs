@@ -1082,6 +1082,7 @@ fn socket_config_to_section(
         socket_user: cfg.socket_user.clone(),
         socket_group: cfg.socket_group.clone(),
         backlog: cfg.backlog,
+        directory_mode: cfg.directory_mode.clone(),
         ..Default::default()
     }
 }

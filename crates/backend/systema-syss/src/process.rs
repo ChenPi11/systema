@@ -27,6 +27,9 @@ use std::process::Stdio;
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
+#[cfg(unix)]
+use std::ffi::CString;
+
 use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
@@ -130,33 +133,45 @@ pub async fn start_service(
         cmd.current_dir(&svc.working_directory);
     }
 
-    // Environment variables.
+    // Environment variables: collected here and applied inside the pre_exec
+    // hook via setenv(3).  We must NOT use Command::env(): once any env is
+    // set, std::process builds the child environment array in the parent and
+    // execs with execvpe(), which discards every setenv() performed by
+    // pre_exec (LISTEN_PID/LISTEN_FDS included).
+    let mut child_envs: Vec<(CString, CString)> = Vec::new();
     for env_str in &svc.environment {
         if let Some((key, val)) = env_str.split_once('=') {
-            cmd.env(key, val);
+            if let (Ok(k), Ok(v)) = (CString::new(key), CString::new(val)) {
+                child_envs.push((k, v));
+            }
         }
     }
-
     // Set INVOCATION_ID if provided (systemd compatibility).
     if let Some(ref inv_id) = invocation_id {
-        cmd.env("INVOCATION_ID", inv_id);
+        if let (Ok(k), Ok(v)) = (
+            CString::new("INVOCATION_ID"),
+            CString::new(inv_id.as_str()),
+        ) {
+            child_envs.push((k, v));
+        }
     }
-
     // Force systemctl/systemd in the child to use the live bus (applied last
     // so it cannot be overridden by the unit's Environment= settings).
     for (key, val) in FORCED_SERVICE_ENV {
-        cmd.env(key, val);
+        if let (Ok(k), Ok(v)) = (CString::new(*key), CString::new(*val)) {
+            child_envs.push((k, v));
+        }
     }
 
     // TTY stdio: attach the configured TTY as the controlling terminal and
     // redirect the requested standard streams to it.  The pre_exec action is
-    // returned so it can be merged with the socket-activation one below
+    // returned so it can be merged with the env/socket-activation one below
     // (std::process only allows a single pre_exec hook).
     let (tty_fd, tty_pre_exec) = apply_tty(&mut cmd, svc, &unit_name)?;
 
-    // Socket activation: move listener fds to 3..3+N in the child and set
-    // LISTEN_FDS / LISTEN_PID (checked by sd_listen_fds()).
-    let sa_pre_exec = socket_activation_pre_exec(&listen_fds);
+    // Env injection + socket activation: hand listener fds to the child as
+    // 3..3+N and set LISTEN_FDS / LISTEN_PID (checked by sd_listen_fds()).
+    let sa_pre_exec = build_pre_exec(child_envs, &listen_fds);
     let merged = match (tty_pre_exec, sa_pre_exec) {
         (Some(mut a), Some(mut b)) => Some(Box::new(move || {
             a()?;
@@ -314,19 +329,32 @@ pub fn is_alive(_pid: u32) -> bool {
 #[cfg(unix)]
 type PreExecFn = Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>;
 
-/// Build the pre_exec closure that hands `listen_fds` to the child as
-/// systemd-style socket-activation fds: each fd is dup2'ed to 3..3+N with
-/// CLOEXEC cleared, the originals are CLOEXEC-flagged (they must not leak
-/// past exec), and `LISTEN_PID` is set to the child's pid (the value is only
-/// known in the child, and `sd_listen_fds()` verifies it against `getpid()`).
+/// Build the pre_exec closure that applies the child environment with
+/// setenv(3) and hands `listen_fds` to the child as systemd-style
+/// socket-activation fds: each fd is dup2'ed to 3..3+N with CLOEXEC
+/// cleared, the originals are CLOEXEC-flagged (they must not leak past
+/// exec), and `LISTEN_PID` / `LISTEN_FDS` are set (the pid is only known
+/// in the child; `sd_listen_fds()` verifies `LISTEN_PID` against `getpid()`).
+///
+/// The returned hook is always Some: the forced environment must reach the
+/// child even when there are no listener fds.  This only works when the
+/// Command carries no explicit env (get_envs() == None), because std then
+/// execs with execvp() using the child's environ — the one setenv() writes
+/// to — instead of a pre-built execvpe() array.
 #[cfg(unix)]
-fn socket_activation_pre_exec(listen_fds: &[RawFd]) -> Option<PreExecFn> {
-    use std::ffi::CString;
-    if listen_fds.is_empty() {
-        return None;
-    }
+fn build_pre_exec(
+    child_envs: Vec<(CString, CString)>,
+    listen_fds: &[RawFd],
+) -> Option<PreExecFn> {
     let fds = listen_fds.to_vec();
     Some(Box::new(move || {
+        for (key, val) in &child_envs {
+            unsafe {
+                if libc::setenv(key.as_ptr(), val.as_ptr(), 1) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
         for (i, &fd) in fds.iter().enumerate() {
             let target = 3 + i as RawFd;
             if fd != target {
@@ -344,27 +372,23 @@ fn socket_activation_pre_exec(listen_fds: &[RawFd]) -> Option<PreExecFn> {
                 }
             }
         }
-        let key = CString::new("LISTEN_PID").map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_PID")
-        })?;
-        let pid = unsafe { libc::getpid() };
-        let val = CString::new(pid.to_string()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in pid string")
-        })?;
-        unsafe {
-            libc::setenv(key.as_ptr(), val.as_ptr(), 1);
-        }
-        // LISTEN_FDS: sd_listen_fds() returns 0 when this variable is
-        // missing, so the child would ignore the transferred descriptors.
-        let n_fds = CString::new(fds.len().to_string()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_FDS")
-        })?;
-        unsafe {
-            libc::setenv(
-                c"LISTEN_FDS".as_ptr(),
-                n_fds.as_ptr(),
-                1,
-            );
+        if !fds.is_empty() {
+            let pid_key = CString::new("LISTEN_PID").map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_PID")
+            })?;
+            let pid = unsafe { libc::getpid() };
+            let pid_val = CString::new(pid.to_string()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in pid string")
+            })?;
+            unsafe {
+                libc::setenv(pid_key.as_ptr(), pid_val.as_ptr(), 1);
+            }
+            let n_fds = CString::new(fds.len().to_string()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_FDS")
+            })?;
+            unsafe {
+                libc::setenv(c"LISTEN_FDS".as_ptr(), n_fds.as_ptr(), 1);
+            }
         }
         Ok(())
     }))

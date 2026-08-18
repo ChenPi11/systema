@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -45,9 +46,14 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
 
     let mut listeners: Vec<BoundSocket> = Vec::new();
 
+    // Parse socket_mode and directory_mode from config, falling back to
+    // systemd defaults (0666 for socket files, 0755 for directories).
+    let socket_mode = parse_mode(&config.socket_mode, 0o666);
+    let directory_mode = parse_mode(&config.directory_mode, 0o755);
+
     for addr in &config.listen {
         if !addr.stream.is_empty() {
-            if let Some(listener) = bind_stream(&addr.stream, config.backlog).with_context(|| {
+            if let Some(listener) = bind_stream(&addr.stream, config.backlog, socket_mode, directory_mode).with_context(|| {
                 sysa::l10n::fmt(
                     sysa::l10n::t_("Failed to bind ListenStream '{addr_stream}'."),
                     &[("addr_stream", &addr.stream.to_string())],
@@ -57,7 +63,7 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
             }
         }
         if !addr.datagram.is_empty() {
-            let fd = bind_datagram(&addr.datagram).with_context(|| {
+            let fd = bind_datagram(&addr.datagram, socket_mode, directory_mode).with_context(|| {
                 sysa::l10n::fmt(
                     sysa::l10n::t_("Failed to bind ListenDatagram '{addr_datagram}'."),
                     &[("addr_datagram", &addr.datagram.to_string())],
@@ -66,7 +72,7 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
             listeners.push(BoundSocket::Udp(fd));
         }
         if !addr.sequential_packet.is_empty() {
-            if let Some(listener) = bind_seqpacket(&addr.sequential_packet, config.backlog)
+            if let Some(listener) = bind_seqpacket(&addr.sequential_packet, config.backlog, socket_mode, directory_mode)
                 .with_context(|| {
                     sysa::l10n::fmt(
                         sysa::l10n::t_(
@@ -198,6 +204,16 @@ pub fn get_listener_fd(manager: &SocketManager, unit_name: &str) -> Option<RawFd
 // ---------------------------------------------------------------------------
 // Binding helpers
 // ---------------------------------------------------------------------------
+
+/// Parse an octal mode string (e.g. "0666") with a fallback default.
+/// Matches systemd's config_parse_mode() behaviour.
+fn parse_mode(s: &str, default: u32) -> u32 {
+    if s.is_empty() {
+        return default;
+    }
+    u32::from_str_radix(s.trim(), 8).unwrap_or(default)
+}
+
 fn resolve_tcp_addr(address: &str) -> Result<std::net::SocketAddr> {
     // If it's just a port number (e.g. "8080"), parse as 0.0.0.0:8080.
     if let Ok(port) = address.parse::<u16>() {
@@ -218,7 +234,7 @@ fn probe_live_listener(path: &std::path::Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
-fn bind_stream(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
+fn bind_stream(address: &str, backlog: u32, socket_mode: u32, directory_mode: u32) -> Result<Option<BoundSocket>> {
     if address.starts_with(ABSTRACT_PREFIX) {
         bind_abstract_unix(address, backlog).map(Some)
     } else if address.starts_with('/') {
@@ -244,12 +260,32 @@ fn bind_stream(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
                         &[("address", address)],
                     )
                 })?;
+                // Set directory permissions (systemd uses DirectoryMode=, default 0755).
+                std::fs::set_permissions(
+                    parent,
+                    PermissionsExt::from_mode(directory_mode),
+                ).with_context(|| {
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("Cannot set directory permissions for socket '{address}'."),
+                        &[("address", address)],
+                    )
+                })?;
             }
         }
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| {
             sysa::l10n::fmt(
                 sysa::l10n::t_("Cannot bind Unix stream at '{address}'."),
+                &[("address", address)],
+            )
+        })?;
+        // Set socket file permissions (systemd uses SocketMode=, default 0666).
+        std::fs::set_permissions(
+            &path,
+            PermissionsExt::from_mode(socket_mode),
+        ).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot set socket permissions at '{address}'."),
                 &[("address", address)],
             )
         })?;
@@ -264,7 +300,7 @@ fn bind_stream(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
                 &[("address", address)],
             )
         })?;
-        info!("Bound Unix stream at '{}'", address);
+        info!("Bound Unix stream at '{}' (mode {:o})", address, socket_mode);
         Ok(Some(BoundSocket::UnixStream(listener)))
     } else {
         let addr = resolve_tcp_addr(address)?;
@@ -371,11 +407,11 @@ fn bind_abstract_unix(address: &str, _backlog: u32) -> Result<BoundSocket> {
     anyhow::bail!(sysa::l10n::fmt(sysa::l10n::t_("Abstract Unix sockets (prefix '@') are not supported on this platform. Use a filesystem path like '/tmp/{trimmed}' instead."), &[("trimmed", &trimmed.to_string())]));
 }
 
-fn bind_datagram(address: &str) -> Result<RawFd> {
+fn bind_datagram(address: &str, socket_mode: u32, directory_mode: u32) -> Result<RawFd> {
     // ListenDatagram= with an abstract ('@') or filesystem ('/') address is a
     // Unix datagram socket, not a UDP port.
     if address.starts_with(ABSTRACT_PREFIX) || address.starts_with('/') {
-        return bind_unix_datagram(address);
+        return bind_unix_datagram(address, socket_mode, directory_mode);
     }
     let addr = resolve_tcp_addr(address)?;
     let fd = unsafe {
@@ -426,7 +462,7 @@ fn bind_datagram(address: &str) -> Result<RawFd> {
 
 /// Bind a Unix datagram socket for an abstract ('@') or filesystem ('/')
 /// ListenDatagram= address.
-fn bind_unix_datagram(address: &str) -> Result<RawFd> {
+fn bind_unix_datagram(address: &str, socket_mode: u32, directory_mode: u32) -> Result<RawFd> {
     let fd = unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0);
         if fd < 0 {
@@ -483,6 +519,16 @@ fn bind_unix_datagram(address: &str) -> Result<RawFd> {
                         &[("address", address)],
                     )
                 })?;
+                // Set directory permissions (systemd uses DirectoryMode=, default 0755).
+                std::fs::set_permissions(
+                    parent,
+                    PermissionsExt::from_mode(directory_mode),
+                ).with_context(|| {
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("Cannot set directory permissions for socket '{address}'."),
+                        &[("address", address)],
+                    )
+                })?;
             }
         }
         let _ = std::fs::remove_file(&path);
@@ -517,18 +563,28 @@ fn bind_unix_datagram(address: &str) -> Result<RawFd> {
                 ));
             }
         }
-        info!("Bound Unix datagram at '{}'", address);
+        // Set socket file permissions (systemd uses SocketMode=, default 0666).
+        std::fs::set_permissions(
+            path,
+            PermissionsExt::from_mode(socket_mode),
+        ).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot set socket permissions at '{address}'."),
+                &[("address", address)],
+            )
+        })?;
+        info!("Bound Unix datagram at '{}' (mode {:o})", address, socket_mode);
         Ok(fd)
     }
 }
 
-fn bind_seqpacket(address: &str, backlog: u32) -> Result<Option<BoundSocket>> {
+fn bind_seqpacket(address: &str, backlog: u32, socket_mode: u32, directory_mode: u32) -> Result<Option<BoundSocket>> {
     if address.starts_with(ABSTRACT_PREFIX) {
         bind_abstract_unix(address, backlog).map(Some)
     } else {
         // SOCK_SEQPACKET not available in std UnixListener; use SOCK_STREAM
         // which behaves similarly enough for our purposes.
-        bind_stream(address, backlog)
+        bind_stream(address, backlog, socket_mode, directory_mode)
     }
 }
 
@@ -722,10 +778,10 @@ mod tests {
         let path = dir.join("journal.socket");
         let p = path.to_str().unwrap().to_string();
 
-        let fd = bind_datagram(&p).unwrap();
+        let fd = bind_datagram(&p, 0o666, 0o755).unwrap();
         assert!(path.exists());
         // A stale file on the same path must be replaced on re-bind.
-        let fd2 = bind_datagram(&p).unwrap();
+        let fd2 = bind_datagram(&p, 0o666, 0o755).unwrap();
         assert!(path.exists());
 
         unsafe {
@@ -739,7 +795,7 @@ mod tests {
     #[test]
     fn bind_datagram_abstract() {
         let name = format!("@sysk-dgram-test-{}", std::process::id());
-        let fd = bind_datagram(&name).unwrap();
+        let fd = bind_datagram(&name, 0o666, 0o755).unwrap();
         unsafe {
             libc::close(fd);
         }
@@ -747,7 +803,7 @@ mod tests {
 
     #[test]
     fn bind_datagram_udp_port() {
-        let fd = bind_datagram("0").unwrap();
+        let fd = bind_datagram("0", 0o666, 0o755).unwrap();
         unsafe {
             libc::close(fd);
         }

@@ -150,6 +150,11 @@ impl UnitController for ServiceController {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
                 inst.timeout_stop_secs = cfg.service.as_ref().map(|s| s.timeout_stop_secs);
+                inst.remain_after_exit = cfg
+                    .service
+                    .as_ref()
+                    .map(|s| s.remain_after_exit)
+                    .unwrap_or(false);
             }
         }
         self.publish_state(unit_name);
@@ -197,6 +202,11 @@ impl UnitController for ServiceController {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
                 inst.timeout_stop_secs = cfg.service.as_ref().map(|s| s.timeout_stop_secs);
+                inst.remain_after_exit = cfg
+                    .service
+                    .as_ref()
+                    .map(|s| s.remain_after_exit)
+                    .unwrap_or(false);
             }
         }
         self.publish_state(unit_name);

@@ -255,6 +255,7 @@ fn convert_socket(sock: &crate::types::SocketSection) -> SocketConfig {
         socket_group: sock.socket_group.clone(),
         backlog: sock.backlog,
         service: String::new(),
+        directory_mode: sock.directory_mode.clone(),
     }
 }
 

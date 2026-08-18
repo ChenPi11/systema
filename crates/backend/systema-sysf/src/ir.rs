@@ -231,6 +231,7 @@ pub struct SocketConfig {
     pub socket_group: String,
     pub backlog: u32,
     pub service: String,
+    pub directory_mode: String,
 }
 
 /// The unified intermediate representation (IR) for a single unit.
