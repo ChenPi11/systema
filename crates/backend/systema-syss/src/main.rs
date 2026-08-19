@@ -7,6 +7,7 @@
 
 mod controller;
 mod ipc;
+mod pam;
 mod process;
 mod state;
 

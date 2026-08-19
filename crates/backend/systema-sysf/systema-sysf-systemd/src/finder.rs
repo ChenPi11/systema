@@ -193,6 +193,7 @@ fn convert_service(svc: &ServiceSection) -> ServiceConfig {
         working_directory: svc.working_directory.clone(),
         user: svc.user.clone(),
         group: svc.group.clone(),
+        pam_name: svc.pam_name.clone(),
         environment: svc.environment.clone(),
         environment_file: svc.environment_file.clone(),
         restart_policy: convert_restart(&svc.restart),

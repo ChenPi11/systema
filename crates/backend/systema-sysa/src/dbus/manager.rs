@@ -17,6 +17,47 @@ use crate::scheduler::job_type::JobType;
 use crate::state::{next_task_id, AllocatorHandle, DesiredState, JobKind, JobMode, JobStatus};
 use crate::unit::types::{ScopeSection, UnitFile, UnitKind};
 
+/// How long `StartUnit` & friends wait for their job to reach a terminal
+/// state before replying with the job path anyway.  sd-bus clients default
+/// to a 25s method timeout, so this bounds the wait below that.
+const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Interval at which job completion is polled while waiting.
+const JOB_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Wait until `job_id` reaches a terminal state, or `timeout` elapses.
+///
+/// systemd's `StartUnit` D-Bus reply is only sent when the job completes
+/// (for a long-running service that is when it reaches *started*, not when
+/// it exits), and callers like `pam_systemd` rely on that: the user
+/// session is created only after `user@.service` has actually started.
+/// The wait is asynchronous (never blocks the runtime) and bounded, so a
+/// job that never finishes — e.g. a hung oneshot — cannot wedge a caller
+/// forever.
+async fn wait_job_completion(allocator: &AllocatorHandle, job_id: u64, timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let terminal = {
+            let state = allocator.read();
+            match state.jobs.get(&job_id) {
+                Some(job) => matches!(
+                    job.status,
+                    JobStatus::Done | JobStatus::Failed(_) | JobStatus::Cancelled
+                ),
+                None => true,
+            }
+        };
+        if terminal {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!("Job {job_id} did not complete within {timeout:?}; replying with the job path anyway");
+            return;
+        }
+        tokio::time::sleep(JOB_WAIT_POLL).await;
+    }
+}
+
 // --------------------------------------------------------------------------
 // Helper: D-Bus path encoding
 // --------------------------------------------------------------------------
@@ -396,6 +437,7 @@ impl ManagerInterface {
                 alloc.write().desired.insert(name.clone(), d);
             }
         }
+        wait_job_completion(&alloc, job_id, JOB_WAIT_TIMEOUT).await;
         Ok(job_object_path(job_id))
     }
 
@@ -824,6 +866,8 @@ impl ManagerInterface {
             .desired
             .insert(name.clone(), DesiredState::Active);
 
+        wait_job_completion(&alloc, job_id, JOB_WAIT_TIMEOUT).await;
+
         Ok(job_object_path(job_id))
     }
 
@@ -843,6 +887,8 @@ impl ManagerInterface {
             .write()
             .desired
             .insert(name.clone(), DesiredState::Inactive);
+
+        wait_job_completion(&alloc, job_id, JOB_WAIT_TIMEOUT).await;
 
         Ok(job_object_path(job_id))
     }
@@ -864,6 +910,8 @@ impl ManagerInterface {
             .desired
             .insert(name.clone(), DesiredState::Active);
 
+        wait_job_completion(&alloc, job_id, JOB_WAIT_TIMEOUT).await;
+
         Ok(job_object_path(job_id))
     }
 
@@ -878,6 +926,8 @@ impl ManagerInterface {
         let job_id = scheduler::enqueue_job(alloc.clone(), &name, JobKind::Reload, job_mode)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        wait_job_completion(&alloc, job_id, JOB_WAIT_TIMEOUT).await;
 
         Ok(job_object_path(job_id))
     }
@@ -2018,6 +2068,69 @@ mod tests {
     fn parse_job_mode_rejects_unknown() {
         assert!(parse_job_mode("bogus").is_err());
         assert!(parse_job_mode("").is_err());
+    }
+
+    // =========================================================================
+    // wait_job_completion
+    // =========================================================================
+
+    use crate::state::{Allocator, Job, JobKind};
+
+    fn insert_job(alloc: &AllocatorHandle, id: u64, status: JobStatus) {
+        alloc.write().jobs.insert(
+            id,
+            Job {
+                id,
+                unit_name: "test.service".to_string(),
+                kind: JobKind::Nop,
+                status,
+                timeout_abort: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_returns_immediately_for_terminal_job() {
+        let alloc = Allocator::handle();
+        insert_job(&alloc, 7, JobStatus::Done);
+        let start = tokio::time::Instant::now();
+        wait_job_completion(&alloc, 7, std::time::Duration::from_secs(25)).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn wait_returns_for_missing_job() {
+        let alloc = Allocator::handle();
+        let start = tokio::time::Instant::now();
+        wait_job_completion(&alloc, 99, std::time::Duration::from_secs(25)).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn wait_returns_once_job_reaches_terminal_state() {
+        let alloc = Allocator::handle();
+        insert_job(&alloc, 8, JobStatus::Running);
+        let alloc_c = alloc.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            alloc_c.write().jobs.get_mut(&8).unwrap().status = JobStatus::Failed("boom".into());
+        });
+        let start = tokio::time::Instant::now();
+        wait_job_completion(&alloc, 8, std::time::Duration::from_secs(25)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(250));
+        assert!(elapsed < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn wait_gives_up_after_timeout() {
+        let alloc = Allocator::handle();
+        insert_job(&alloc, 9, JobStatus::Running);
+        let start = tokio::time::Instant::now();
+        wait_job_completion(&alloc, 9, std::time::Duration::from_millis(150)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(140));
+        assert!(elapsed < std::time::Duration::from_secs(1));
     }
 
     // =========================================================================

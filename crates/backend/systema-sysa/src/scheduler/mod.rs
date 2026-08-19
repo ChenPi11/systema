@@ -1681,6 +1681,7 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         working_directory: svc.working_directory.clone(),
         user: svc.user.clone(),
         group: svc.group.clone(),
+        pam_name: svc.pam_name.clone(),
         environment: svc.environment.clone(),
         restart_policy: svc.restart.as_str().to_string(),
         restart_delay_secs: svc.restart_sec,

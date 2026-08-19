@@ -638,6 +638,9 @@ message ServiceConfig {
     // RemainAfterExit=yes: the service stays "active" after its main process
     // exits successfully (oneshot style), instead of going inactive.
     bool remain_after_exit = 18;
+    // PAMName=: PAM service name whose session is opened before exec (used to
+    // set up the runtime environment, e.g. pam_systemd.so for user@.service).
+    string pam_name = 19;
 }
 
 // Configuration for `.scope` units, sent to the System E worker.

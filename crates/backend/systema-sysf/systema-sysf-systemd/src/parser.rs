@@ -1060,6 +1060,7 @@ fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> 
         expand_specifiers(&get_str(config, "service", "workingdirectory"), name);
     svc.user = get_str(config, "service", "user");
     svc.group = get_str(config, "service", "group");
+    svc.pam_name = get_str(config, "service", "pamname");
     svc.pid_file = get_str(config, "service", "pidfile");
     svc.bus_name = get_str(config, "service", "busname");
     svc.notify_access = get_str(config, "service", "notifyaccess");

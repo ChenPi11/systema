@@ -401,6 +401,7 @@ pub struct ServiceSection {
     pub working_directory: String,
     pub user: String,
     pub group: String,
+    pub pam_name: String,
     pub environment: Vec<String>,
     pub environment_file: Vec<String>,
     pub pid_file: String,

@@ -95,8 +95,81 @@ pub async fn start_service(
         unit_name, parsed.program, parsed.args
     );
 
-    // Build environment lookup table (process env + unit Environment=).
-    let env_table = build_env_table(&svc.environment);
+    // Whether the service gets its credentials switched (User=/Group=) and
+    // its PAM session opened.  The `+` (FULLY_PRIVILEGED) and `!`/`!!`
+    // (NO_SETUID) ExecStart prefixes disable both, exactly like systemd's
+    // `needs_setuid` in exec-invoke.c.
+    let wants_credentials = !parsed.flags.privileged && !parsed.flags.no_new_privileges;
+
+    // Resolve User=/Group= credentials first (numeric UIDs are supported,
+    // like systemd's get_user_creds()).  The canonical username from
+    // /etc/passwd is what PAM gets (systemd passes pw_name, not the raw
+    // "User=" value — pam_systemd rejects purely numeric user names).
+    let creds = if wants_credentials {
+        let user = svc.user.clone();
+        let group = svc.group.clone();
+        tokio::task::spawn_blocking(move || resolve_credentials(&user, &group))
+            .await
+            .context("Credential lookup task failed")?
+            .with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Failed to resolve credentials for {unit_name}."),
+                    &[("unit_name", &unit_name)],
+                )
+            })?
+    } else {
+        None
+    };
+
+    // Open the PAM session (PAMName= + User= required, mirroring systemd's
+    // exec-invoke.c `setup_pam()` trigger).  pam_systemd.so & co run here
+    // and export the runtime environment (XDG_RUNTIME_DIR, ...) which is
+    // merged into the child's environment below.
+    let mut pam_env: Vec<(String, String)> = Vec::new();
+    let mut pam_session: Option<crate::pam::PamSession> = None;
+    if wants_credentials && !svc.pam_name.is_empty() && !svc.user.is_empty() {
+        let pam_name = svc.pam_name.clone();
+        // The canonical username (pw_name) resolved above; fall back to the
+        // raw User= value if resolution somehow produced no name.
+        let username = creds
+            .as_ref()
+            .and_then(|c| c.username.clone())
+            .unwrap_or_else(|| svc.user.clone());
+        let tty = if svc.tty_path.is_empty() {
+            None
+        } else {
+            Some(svc.tty_path.clone())
+        };
+        let pam_name_task = pam_name.clone();
+        let username_task = username.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::pam::pam_setup(&pam_name_task, &username_task, tty.as_deref())
+        })
+        .await
+        {
+            Ok(Ok((env, session))) => {
+                pam_env = env;
+                pam_session = Some(session);
+                info!(
+                    "Opened PAM session '{}' for user '{}' ({})",
+                    pam_name, username, unit_name
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "PAM setup for {} ({}) failed: {}; continuing without PAM environment",
+                    unit_name, pam_name, e
+                );
+            }
+            Err(e) => {
+                warn!("PAM setup task for {} failed: {}", unit_name, e);
+            }
+        }
+    }
+
+    // Build environment lookup table (process env + unit Environment= +
+    // PAM env + forced env).
+    let env_table = build_env_table(&svc.environment, &pam_env);
 
     // Expand $VAR / ${VAR} in every argument, handling standalone splitting.
     let final_args = if parsed.flags.no_env_expand {
@@ -146,6 +219,13 @@ pub async fn start_service(
             }
         }
     }
+    // PAM environment (applied after Environment= so it cannot be
+    // overridden by the unit, mirroring systemd's strv_env_merge order).
+    for (key, val) in &pam_env {
+        if let (Ok(k), Ok(v)) = (CString::new(key.as_str()), CString::new(val.as_str())) {
+            child_envs.push((k, v));
+        }
+    }
     // Set INVOCATION_ID if provided (systemd compatibility).
     if let Some(ref inv_id) = invocation_id {
         if let (Ok(k), Ok(v)) = (
@@ -171,7 +251,8 @@ pub async fn start_service(
 
     // Env injection + socket activation: hand listener fds to the child as
     // 3..3+N and set LISTEN_FDS / LISTEN_PID (checked by sd_listen_fds()).
-    let sa_pre_exec = build_pre_exec(child_envs, &listen_fds);
+    // User=/Group= credentials are applied last, in the child.
+    let sa_pre_exec = build_pre_exec(child_envs, &listen_fds, creds);
     let merged = match (tty_pre_exec, sa_pre_exec) {
         (Some(mut a), Some(mut b)) => Some(Box::new(move || {
             a()?;
@@ -211,6 +292,27 @@ pub async fn start_service(
     })?;
 
     info!("Service {} started, PID={}", unit_name, pid);
+
+    // Keep the PAM session open until the service's main process exits,
+    // then tear it down (the "(sd-pam)" helper equivalent).
+    if let Some(session) = pam_session {
+        let unit_name_for_cleanup = unit_name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // The monitor reaps the child; once reaped (or a zombie),
+                // the process is gone and the PAM session can be closed.
+                if !is_alive(pid) || pid_is_zombie(pid) {
+                    break;
+                }
+            }
+            let _ = tokio::task::spawn_blocking(move || session.close()).await;
+            debug!(
+                "Closed PAM session for {} (PID {})",
+                unit_name_for_cleanup, pid
+            );
+        });
+    }
 
     // Update state to Running.
     {
@@ -329,12 +431,104 @@ pub fn is_alive(_pid: u32) -> bool {
 #[cfg(unix)]
 type PreExecFn = Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>;
 
+/// Credential switching data for the child pre_exec hook
+/// (User=/Group=, applied like systemd's `apply_credentials()`).
+#[cfg(unix)]
+struct Creds {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    /// Canonical username (pw_name) for `initgroups()`; `None` when only
+    /// `Group=` was set.
+    username: Option<String>,
+}
+
+/// Resolve `User=`/`Group=` into uid/gid.  Numeric UIDs are supported
+/// (systemd behaviour: `User=1000` resolves via `getpwuid`).  Returns
+/// `Ok(None)` when neither is set.
+#[cfg(unix)]
+fn resolve_credentials(user: &str, group: &str) -> Result<Option<Creds>> {
+    use nix::unistd::{Gid, Group, Uid, User};
+
+    let username = if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
+    };
+    let group = if group.is_empty() {
+        None
+    } else {
+        Some(group.to_string())
+    };
+    if username.is_none() && group.is_none() {
+        return Ok(None);
+    }
+
+    let mut gid: Option<Gid> = None;
+    if let Some(g) = &group {
+        let gr = Group::from_name(g)
+            .with_context(|| format!("lookup of group '{g}' failed"))?
+            .ok_or_else(|| anyhow::anyhow!("group '{g}' not found"))?;
+        gid = Some(gr.gid);
+    }
+
+    let mut uid: Option<Uid> = None;
+    let mut resolved_user: Option<String> = None;
+    if let Some(u) = &username {
+        let found = match User::from_name(u)
+            .with_context(|| format!("lookup of user '{u}' failed"))?
+        {
+            Some(usr) => Some(usr),
+            // Numeric UID (systemd resolves `User=1000` via getpwuid).
+            None => u
+                .parse::<u32>()
+                .ok()
+                .and_then(|n| {
+                    User::from_uid(Uid::from_raw(n))
+                        .with_context(|| format!("lookup of uid '{n}' failed"))
+                        .ok()
+                        .flatten()
+                }),
+        };
+        let usr = found.ok_or_else(|| anyhow::anyhow!("user '{u}' not found"))?;
+        uid = Some(usr.uid);
+        resolved_user = Some(usr.name);
+        if gid.is_none() {
+            gid = Some(usr.gid);
+        }
+    }
+
+    Ok(Some(Creds {
+        uid: uid.unwrap_or(Uid::from_raw(0)).as_raw(),
+        gid: gid
+            .unwrap_or(Gid::from_raw(0))
+            .as_raw(),
+        username: resolved_user,
+    }))
+}
+
+/// Whether `pid` is a zombie (exited but not yet reaped).  Linux-specific;
+/// used to detect process death without waiting.
+#[cfg(unix)]
+fn pid_is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(2).map(|st| st == "Z"))
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pid_is_zombie(_pid: u32) -> bool {
+    false
+}
+
 /// Build the pre_exec closure that applies the child environment with
-/// setenv(3) and hands `listen_fds` to the child as systemd-style
+/// setenv(3), hands `listen_fds` to the child as systemd-style
 /// socket-activation fds: each fd is dup2'ed to 3..3+N with CLOEXEC
 /// cleared, the originals are CLOEXEC-flagged (they must not leak past
-/// exec), and `LISTEN_PID` / `LISTEN_FDS` are set (the pid is only known
-/// in the child; `sd_listen_fds()` verifies `LISTEN_PID` against `getpid()`).
+/// exec), sets `LISTEN_PID` / `LISTEN_FDS` (the pid is only known in the
+/// child; `sd_listen_fds()` verifies `LISTEN_PID` against `getpid()`), and
+/// finally switches credentials (`initgroups`/`setgid`/`setuid`) when
+/// `creds` is set — mirroring systemd's `apply_credentials()`.
 ///
 /// The returned hook is always Some: the forced environment must reach the
 /// child even when there are no listener fds.  This only works when the
@@ -345,6 +539,7 @@ type PreExecFn = Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>;
 fn build_pre_exec(
     child_envs: Vec<(CString, CString)>,
     listen_fds: &[RawFd],
+    creds: Option<Creds>,
 ) -> Option<PreExecFn> {
     let fds = listen_fds.to_vec();
     Some(Box::new(move || {
@@ -388,6 +583,37 @@ fn build_pre_exec(
             })?;
             unsafe {
                 libc::setenv(c"LISTEN_FDS".as_ptr(), n_fds.as_ptr(), 1);
+            }
+        }
+        if let Some(creds) = &creds {
+            unsafe {
+                match &creds.username {
+                    // Load the user's supplementary groups (systemd's
+                    // initgroups()), or drop all supplementary groups when
+                    // only Group= was set.
+                    Some(username) => {
+                        let uname = CString::new(username.as_str()).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "NUL in username",
+                            )
+                        })?;
+                        if libc::initgroups(uname.as_ptr(), creds.gid) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    None => {
+                        if libc::setgroups(0, std::ptr::null()) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                }
+                if libc::setgid(creds.gid) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(creds.uid) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
         }
         Ok(())
@@ -944,8 +1170,13 @@ fn expand_specifiers(s: &str, name: &str) -> String {
 // $VAR / ${VAR} environment variable expansion
 // ---------------------------------------------------------------------------
 
-/// Build a lookup table from the unit's `Environment=` settings.
-fn build_env_table(unit_env: &[String]) -> HashMap<String, String> {
+/// Build a lookup table from the unit's `Environment=` settings and the PAM
+/// environment (order: process env, unit env, PAM env, forced env — later
+/// entries win).
+fn build_env_table(
+    unit_env: &[String],
+    pam_env: &[(String, String)],
+) -> HashMap<String, String> {
     let mut table: HashMap<String, String> = HashMap::new();
 
     for (key, val) in std::env::vars() {
@@ -956,6 +1187,10 @@ fn build_env_table(unit_env: &[String]) -> HashMap<String, String> {
         if let Some((key, val)) = entry.split_once('=') {
             table.insert(key.to_string(), val.to_string());
         }
+    }
+
+    for (key, val) in pam_env {
+        table.insert(key.clone(), val.clone());
     }
 
     for (key, val) in FORCED_SERVICE_ENV {
@@ -1545,8 +1780,77 @@ mod tests {
             "SYSTEMCTL_FORCE_BUS=0".to_string(),
             "SYSTEMD_OFFLINE=1".to_string(),
         ];
-        let table = build_env_table(&unit_env);
+        let table = build_env_table(&unit_env, &[]);
         assert_eq!(table.get("SYSTEMCTL_FORCE_BUS").map(String::as_str), Some("1"));
         assert_eq!(table.get("SYSTEMD_OFFLINE").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn pam_env_override_unit_environment_in_table() {
+        let unit_env = vec!["XDG_RUNTIME_DIR=/tmp/unit".to_string()];
+        let pam_env = vec![("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())];
+        let table = build_env_table(&unit_env, &pam_env);
+        assert_eq!(
+            table.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
+    }
+
+    #[test]
+    fn forced_env_overrides_pam_environment_in_table() {
+        let pam_env = vec![
+            ("SYSTEMCTL_FORCE_BUS".to_string(), "0".to_string()),
+            ("SYSTEMD_OFFLINE".to_string(), "1".to_string()),
+        ];
+        let table = build_env_table(&[], &pam_env);
+        assert_eq!(table.get("SYSTEMCTL_FORCE_BUS").map(String::as_str), Some("1"));
+        assert_eq!(table.get("SYSTEMD_OFFLINE").map(String::as_str), Some("0"));
+    }
+
+    // --- Credential resolution ---
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_no_credentials_is_none() {
+        let c = resolve_credentials("", "").unwrap();
+        assert!(c.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_named_user() {
+        let c = resolve_credentials("root", "").unwrap().unwrap();
+        assert_eq!(c.uid, 0);
+        assert_eq!(c.gid, 0);
+        assert_eq!(c.username.as_deref(), Some("root"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_numeric_uid_gets_canonical_name() {
+        // `User=1000`-style numeric UIDs resolve via getpwuid and must yield
+        // the canonical pw_name (systemd get_user_creds() behaviour) — that
+        // name is what PAM receives (pam_systemd rejects numeric usernames).
+        let me = nix::unistd::Uid::current();
+        let pw = nix::unistd::User::from_uid(me).unwrap().unwrap();
+        let c = resolve_credentials(&me.as_raw().to_string(), "").unwrap().unwrap();
+        assert_eq!(c.uid, pw.uid.as_raw());
+        assert_eq!(c.gid, pw.gid.as_raw());
+        assert_eq!(c.username.as_deref(), Some(pw.name.as_str()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_group_only() {
+        let c = resolve_credentials("", "root").unwrap().unwrap();
+        assert_eq!(c.gid, 0);
+        assert_eq!(c.uid, 0);
+        assert_eq!(c.username, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_missing_user_fails() {
+        assert!(resolve_credentials("systema-no-such-user-xyz", "").is_err());
     }
 }

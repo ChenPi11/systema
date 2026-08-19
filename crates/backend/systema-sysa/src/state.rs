@@ -920,6 +920,7 @@ fn service_config_to_section(
         working_directory: cfg.working_directory.clone(),
         user: cfg.user.clone(),
         group: cfg.group.clone(),
+        pam_name: cfg.pam_name.clone(),
         environment: cfg.environment.clone(),
         environment_file: cfg.environment_file.clone(),
         restart: restart_policy_from_ir(&cfg.restart_policy),
