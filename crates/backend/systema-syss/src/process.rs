@@ -242,6 +242,17 @@ pub async fn start_service(
             child_envs.push((k, v));
         }
     }
+    // Type=notify / notify-reload: point sd_notify(3) at the shared
+    // datagram socket, like systemd's exec-invoke.c:2218 (applied after
+    // everything else so the unit cannot override it).
+    if matches!(svc.service_type.as_str(), "notify" | "notify-reload") {
+        if let (Ok(k), Ok(v)) = (
+            CString::new("NOTIFY_SOCKET"),
+            CString::new(crate::notify::notify_socket_path()),
+        ) {
+            child_envs.push((k, v));
+        }
+    }
 
     // TTY stdio: attach the configured TTY as the controlling terminal and
     // redirect the requested standard streams to it.  The pre_exec action is
@@ -509,7 +520,7 @@ fn resolve_credentials(user: &str, group: &str) -> Result<Option<Creds>> {
 /// Whether `pid` is a zombie (exited but not yet reaped).  Linux-specific;
 /// used to detect process death without waiting.
 #[cfg(unix)]
-fn pid_is_zombie(pid: u32) -> bool {
+pub fn pid_is_zombie(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|s| s.split_whitespace().nth(2).map(|st| st == "Z"))

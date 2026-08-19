@@ -1,17 +1,21 @@
+use crate::notify::NotifyManager;
 use crate::process::{start_service, stop_service};
 use crate::state::{ServiceRegistry, ServiceState};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use sysa::controller::{decode_unit_config, UnitController, UnitStatus};
+use sysa::proto::UnitConfig;
 use sysa::worker_ipc::EventPublisher;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
+#[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
     event_pub: EventPublisher,
     fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>>,
+    notify: Option<NotifyManager>,
 }
 
 impl ServiceController {
@@ -19,11 +23,51 @@ impl ServiceController {
         registry: ServiceRegistry,
         event_pub: EventPublisher,
         fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>>,
+        notify: Option<NotifyManager>,
     ) -> Self {
         ServiceController {
             registry,
             event_pub,
             fdpass,
+            notify,
+        }
+    }
+
+    /// Whether the unit is `Type=notify` / `Type=notify-reload` and thus
+    /// must report `READY=1` (sd_notify) before its start job completes.
+    fn is_notify_type(cfg: &UnitConfig) -> bool {
+        cfg.service
+            .as_ref()
+            .map(|s| matches!(s.service_type.as_str(), "notify" | "notify-reload"))
+            .unwrap_or(false)
+    }
+
+    /// Wait for the service's readiness notification (Type=notify(-reload)).
+    /// On failure the service is stopped and the unit is marked failed.
+    async fn await_notify_start(&self, unit_name: &str, pid: u32, cfg: &UnitConfig) -> Result<()> {
+        let Some(notify) = self.notify.as_ref() else {
+            return Ok(());
+        };
+        if !Self::is_notify_type(cfg) {
+            return Ok(());
+        }
+        let timeout = cfg
+            .service
+            .as_ref()
+            .map(|s| s.timeout_start_secs.max(1))
+            .unwrap_or(90) as u64;
+        notify.register_start(unit_name, pid);
+        match notify.wait_ready(unit_name, pid, timeout).await {
+            Ok(()) => {
+                info!("{} (PID {}): reported READY=1", unit_name, pid);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("{} (PID {}): notify start failed: {}", unit_name, pid, e);
+                let _ = stop_service(self.registry.clone(), unit_name, 10).await;
+                self.publish_state(unit_name);
+                Err(anyhow!("{}", e))
+            }
         }
     }
 
@@ -164,6 +208,10 @@ impl UnitController for ServiceController {
             self.event_pub.clone(),
             child,
         ));
+        // Type=notify(-reload): the start job completes only when the
+        // service reports READY=1 (or fails / times out), like systemd's
+        // service_enter_start_post().
+        self.await_notify_start(unit_name, _pid, &cfg).await?;
         Ok(())
     }
 
@@ -216,28 +264,63 @@ impl UnitController for ServiceController {
             self.event_pub.clone(),
             child,
         ));
+        self.await_notify_start(unit_name, _pid, &cfg).await?;
         Ok(())
     }
 
-    async fn reload(&self, unit_name: &str, _config: &[u8]) -> Result<()> {
+    async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
+        let cfg = decode_unit_config(config)?;
         let pid = {
             let reg = self.registry.lock();
             reg.get(unit_name).and_then(|i| i.main_pid)
         };
-        if let Some(pid) = pid {
-            #[cfg(unix)]
-            {
-                use nix::sys::signal;
-                use nix::unistd::Pid;
-                signal::kill(Pid::from_raw(pid as i32), signal::Signal::SIGHUP)
-                    .context("Failed to send SIGHUP")?;
-            }
-            Ok(())
-        } else {
+        let Some(pid) = pid else {
             anyhow::bail!(sysa::l10n::fmt(
                 sysa::l10n::t_("Reload of {unit_name} failed: service is not running."),
                 &[("unit_name", unit_name)],
             ))
+        };
+        // Type=notify-reload: the reload job waits for RELOADING=1
+        // (validated against MONOTONIC_USEC) followed by READY=1, like
+        // systemd's service_notify_message_process_state().  The cycle must
+        // be registered before the signal goes out so no notification can
+        // slip in between.
+        let wait_reload = {
+            let notify_reload = cfg
+                .service
+                .as_ref()
+                .map(|s| s.service_type == "notify-reload")
+                .unwrap_or(false);
+            notify_reload
+                && self
+                    .notify
+                    .as_ref()
+                    .map(|n| n.register_reload(unit_name, pid))
+                    .unwrap_or(false)
+        };
+        #[cfg(unix)]
+        {
+            use nix::sys::signal;
+            use nix::unistd::Pid;
+            signal::kill(Pid::from_raw(pid as i32), signal::Signal::SIGHUP)
+                .context("Failed to send SIGHUP")?;
         }
+        if wait_reload {
+            let timeout = cfg
+                .service
+                .as_ref()
+                .map(|s| s.timeout_start_secs.max(1))
+                .unwrap_or(90) as u64;
+            let notify = self.notify.as_ref().unwrap();
+            notify
+                .wait_reload(unit_name, pid, timeout)
+                .await
+                .map_err(|e| {
+                    warn!("{} (PID {}): notify reload failed: {}", unit_name, pid, e);
+                    anyhow!("{}", e)
+                })?;
+            info!("{} (PID {}): reload completed (READY=1)", unit_name, pid);
+        }
+        Ok(())
     }
 }

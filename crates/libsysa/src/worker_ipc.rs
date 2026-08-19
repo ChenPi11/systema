@@ -303,7 +303,7 @@ impl WorkerIpc {
         custom_handler: H,
     ) -> Result<()>
     where
-        C: UnitController,
+        C: UnitController + Send + Sync + 'static,
         H: Fn(&Envelope, &EventPublisher) -> Result<bool>,
     {
         let mut backoff = Duration::from_millis(500);
@@ -334,7 +334,7 @@ impl WorkerIpc {
         mut out_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
     ) -> Result<()>
     where
-        C: UnitController,
+        C: UnitController + Send + Sync + 'static,
         H: Fn(&Envelope, &EventPublisher) -> Result<bool>,
     {
         use futures::SinkExt;
@@ -398,7 +398,7 @@ impl WorkerIpc {
 
         let event_publisher =
             EventPublisher::new(out_tx.clone(), &self.worker_id, pending_acks.clone());
-        let controller = controller_factory(event_publisher.clone());
+        let controller = Arc::new(controller_factory(event_publisher.clone()));
 
         // Writer task: drain out_rx → write to socket
         let writer_task = async move {
@@ -479,107 +479,49 @@ impl WorkerIpc {
                             call.method, call.unit_name
                         );
 
-                        let method_result = match call.method.as_str() {
-                            "status" => match controller.status(&call.unit_name).await {
-                                Ok(status) => MethodResult {
-                                    method: call.method.clone(),
-                                    unit_name: call.unit_name.clone(),
-                                    success: true,
-                                    error: String::new(),
-                                    result: status.encode_to_vec(),
-                                },
-                                Err(e) => MethodResult {
-                                    method: call.method.clone(),
-                                    unit_name: call.unit_name.clone(),
-                                    success: false,
-                                    error: e.to_string(),
-                                    result: vec![],
-                                },
-                            },
-                            "start" => {
-                                match controller
-                                    .start(&call.unit_name, &call.args, &call.invocation_id)
-                                    .await
+                        // start/restart/reload may block for a long time
+                        // (Type=notify waits for READY=1, up to
+                        // TimeoutStartSec).  Run them in a spawned task so
+                        // the reader loop keeps servicing other envelopes
+                        // (state acks, status/stop requests, ...) meanwhile;
+                        // the result is sent by the task itself.
+                        let deferred = matches!(call.method.as_str(), "start" | "restart" | "reload");
+                        if deferred {
+                            let controller = controller.clone();
+                            let out_tx = out_tx.clone();
+                            let worker_id = self.worker_id.clone();
+                            let request_id = env.request_id;
+                            tokio::spawn(async move {
+                                let method_result = run_method(&*controller, &call).await;
+                                match make_envelope(
+                                    request_id,
+                                    &worker_id,
+                                    "system-a",
+                                    "method.result",
+                                    method_result,
+                                )
+                                .and_then(encode_envelope)
                                 {
-                                    Ok(()) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: true,
-                                        error: String::new(),
-                                        result: vec![],
-                                    },
-                                    Err(e) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: false,
-                                        error: e.to_string(),
-                                        result: vec![],
-                                    },
+                                    Ok(encoded) => {
+                                        if out_tx.send(encoded).is_err() {
+                                            warn!(
+                                                "Outgoing channel closed; cannot send method result for {}",
+                                                call.method
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to encode method.result for {}: {}",
+                                            call.method, e
+                                        )
+                                    }
                                 }
-                            }
-                            "stop" => match controller.stop(&call.unit_name).await {
-                                Ok(()) => MethodResult {
-                                    method: call.method.clone(),
-                                    unit_name: call.unit_name.clone(),
-                                    success: true,
-                                    error: String::new(),
-                                    result: vec![],
-                                },
-                                Err(e) => MethodResult {
-                                    method: call.method.clone(),
-                                    unit_name: call.unit_name.clone(),
-                                    success: false,
-                                    error: e.to_string(),
-                                    result: vec![],
-                                },
-                            },
-                            "restart" => {
-                                match controller
-                                    .restart(&call.unit_name, &call.args, &call.invocation_id)
-                                    .await
-                                {
-                                    Ok(()) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: true,
-                                        error: String::new(),
-                                        result: vec![],
-                                    },
-                                    Err(e) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: false,
-                                        error: e.to_string(),
-                                        result: vec![],
-                                    },
-                                }
-                            }
-                            "reload" => {
-                                match controller.reload(&call.unit_name, &call.args).await {
-                                    Ok(()) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: true,
-                                        error: String::new(),
-                                        result: vec![],
-                                    },
-                                    Err(e) => MethodResult {
-                                        method: call.method.clone(),
-                                        unit_name: call.unit_name.clone(),
-                                        success: false,
-                                        error: e.to_string(),
-                                        result: vec![],
-                                    },
-                                }
-                            }
-                            other => MethodResult {
-                                method: call.method.clone(),
-                                unit_name: call.unit_name.clone(),
-                                success: false,
-                                error: format!("unknown method: {other}"),
-                                result: vec![],
-                            },
-                        };
+                            });
+                            continue;
+                        }
+
+                        let method_result = run_method(controller.as_ref(), &call).await;
 
                         match make_envelope(
                             env.request_id,
@@ -665,5 +607,44 @@ impl WorkerIpc {
         }
 
         Ok(())
+    }
+}
+
+/// Execute a `method.call` against the unit controller and build the
+/// `method.result` payload.  Long-running methods (start/restart/reload)
+/// are invoked through a spawned task so the reader loop is never blocked.
+async fn run_method<C: UnitController>(controller: &C, call: &MethodCall) -> MethodResult {
+    let result = match call.method.as_str() {
+        "status" => controller.status(&call.unit_name).await.map(|s| s.encode_to_vec()),
+        "start" => controller
+            .start(&call.unit_name, &call.args, &call.invocation_id)
+            .await
+            .map(|()| vec![]),
+        "stop" => controller.stop(&call.unit_name).await.map(|()| vec![]),
+        "restart" => controller
+            .restart(&call.unit_name, &call.args, &call.invocation_id)
+            .await
+            .map(|()| vec![]),
+        "reload" => controller
+            .reload(&call.unit_name, &call.args)
+            .await
+            .map(|()| vec![]),
+        other => Err(anyhow::anyhow!("unknown method: {other}")),
+    };
+    match result {
+        Ok(payload) => MethodResult {
+            method: call.method.clone(),
+            unit_name: call.unit_name.clone(),
+            success: true,
+            error: String::new(),
+            result: payload,
+        },
+        Err(e) => MethodResult {
+            method: call.method.clone(),
+            unit_name: call.unit_name.clone(),
+            success: false,
+            error: e.to_string(),
+            result: vec![],
+        },
     }
 }

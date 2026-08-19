@@ -25,4 +25,4 @@ serde_json.workspace = true
 parking_lot.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["process", "signal", "user", "fs"] }
+nix = { version = "0.29", features = ["process", "signal", "user", "fs", "socket", "uio"] }
