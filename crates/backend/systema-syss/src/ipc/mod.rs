@@ -40,6 +40,7 @@ pub async fn run() -> Result<()> {
 
     let fdpass_controller = fdpass.clone();
     let notify = crate::notify::NotifyManager::setup();
+    let dbus = crate::dbus::DbusWaiter::default();
     WorkerIpc::new(WORKER_ID, WORKER_UNIT_TYPES)
         .run(
             move |event_pub| {
@@ -48,6 +49,7 @@ pub async fn run() -> Result<()> {
                     event_pub,
                     fdpass_controller.clone(),
                     notify.clone(),
+                    dbus.clone(),
                 )
             },
             |_, _| Ok(false),

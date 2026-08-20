@@ -641,6 +641,10 @@ message ServiceConfig {
     // PAMName=: PAM service name whose session is opened before exec (used to
     // set up the runtime environment, e.g. pam_systemd.so for user@.service).
     string pam_name = 19;
+    // BusName=: D-Bus name whose acquisition marks a Type=dbus service as
+    // started (the worker waits for the name to be owned before the start
+    // job completes, like systemd's service_bus_name_owner_change()).
+    string bus_name = 20;
 }
 
 // Configuration for `.scope` units, sent to the System E worker.

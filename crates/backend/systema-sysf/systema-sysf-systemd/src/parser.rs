@@ -434,6 +434,13 @@ fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
                     &[("name", name)],
                 )
             })?;
+            // systemd service_verify(): a Type=dbus service without BusName=
+            // is refused at load time, before anything is spawned.
+            if svc.service_type == ServiceType::Dbus && svc.bus_name.is_empty() {
+                anyhow::bail!(sysa::l10n::t_(
+                    "Service is of type D-Bus but no D-Bus service name has been specified. Refusing."
+                ));
+            }
             unit.service = Some(svc);
         }
         UnitKind::Target => {
@@ -1447,6 +1454,42 @@ WantedBy=multi-user.target
         assert_eq!(svc.restart_sec, 5);
         assert_eq!(svc.timeout_start_sec, 30);
         assert_eq!(svc.user, "root");
+    }
+
+    #[test]
+    fn test_parse_dbus_service_requires_bus_name() {
+        // systemd service_verify(): Type=dbus without BusName= is refused
+        // at load time, before anything is spawned.
+        let err = parse_unit(
+            "dbus.service",
+            r#"
+[Service]
+Type=dbus
+ExecStart=/usr/bin/dbus-daemon
+"#,
+        )
+        .expect_err("Type=dbus without BusName= must be refused at load");
+        assert!(
+            err.to_string().contains("no D-Bus service name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_dbus_service_with_bus_name_ok() {
+        let unit = parse_unit(
+            "dbus.service",
+            r#"
+[Service]
+Type=dbus
+BusName=org.freedesktop.DBus
+ExecStart=/usr/bin/dbus-daemon --system
+"#,
+        )
+        .expect("Type=dbus with BusName= loads fine");
+        let svc = unit.service.unwrap();
+        assert!(matches!(svc.service_type, ServiceType::Dbus));
+        assert_eq!(svc.bus_name, "org.freedesktop.DBus");
     }
 
     #[test]

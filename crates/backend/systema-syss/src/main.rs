@@ -6,6 +6,7 @@
 //! - Report `method.result` and `unit.state_update` messages back to System A.
 
 mod controller;
+mod dbus;
 mod ipc;
 mod notify;
 mod pam;

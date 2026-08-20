@@ -1694,6 +1694,7 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
         standard_error: svc.standard_error.clone(),
         tty_path: svc.tty_path.clone(),
         remain_after_exit: svc.remain_after_exit,
+        bus_name: svc.bus_name.clone(),
     });
 
     let socket = uf.socket.as_ref().map(|sk| {

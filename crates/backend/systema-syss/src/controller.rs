@@ -1,3 +1,4 @@
+use crate::dbus::DbusWaiter;
 use crate::notify::NotifyManager;
 use crate::process::{start_service, stop_service};
 use crate::state::{ServiceRegistry, ServiceState};
@@ -16,6 +17,7 @@ pub struct ServiceController {
     event_pub: EventPublisher,
     fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>>,
     notify: Option<NotifyManager>,
+    dbus: DbusWaiter,
 }
 
 impl ServiceController {
@@ -24,12 +26,14 @@ impl ServiceController {
         event_pub: EventPublisher,
         fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>>,
         notify: Option<NotifyManager>,
+        dbus: DbusWaiter,
     ) -> Self {
         ServiceController {
             registry,
             event_pub,
             fdpass,
             notify,
+            dbus,
         }
     }
 
@@ -64,6 +68,57 @@ impl ServiceController {
             }
             Err(e) => {
                 warn!("{} (PID {}): notify start failed: {}", unit_name, pid, e);
+                let _ = stop_service(self.registry.clone(), unit_name, 10).await;
+                self.publish_state(unit_name);
+                Err(anyhow!("{}", e))
+            }
+        }
+    }
+
+    /// Whether the unit is `Type=dbus` and thus must own its `BusName=`
+    /// before the start job completes.
+    fn is_dbus_type(cfg: &UnitConfig) -> bool {
+        cfg.service
+            .as_ref()
+            .map(|s| s.service_type.as_str() == "dbus")
+            .unwrap_or(false)
+    }
+
+    /// Wait for the service to acquire its `BusName=` on the system bus
+    /// (Type=dbus).  On failure the service is stopped and the unit is
+    /// marked failed, like systemd's TimeoutStartSec kill.
+    async fn await_dbus_start(&self, unit_name: &str, pid: u32, cfg: &UnitConfig) -> Result<()> {
+        if !Self::is_dbus_type(cfg) {
+            return Ok(());
+        }
+        let svc = cfg.service.as_ref().expect("dbus type implies service");
+        let bus_name = svc.bus_name.as_str();
+        // systemd refuses such a unit at load (service_verify()); the sysa
+        // parser enforces the same.  Defend in depth: never wait on an
+        // empty name.
+        if bus_name.is_empty() {
+            return Err(anyhow!(sysa::l10n::t_(
+                "Service is of type D-Bus but no D-Bus service name has been specified. Refusing."
+            )));
+        }
+        let timeout = svc.timeout_start_secs.max(1) as u64;
+        match self
+            .dbus
+            .wait_name_owned(bus_name, pid, timeout)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "{} (PID {}): acquired D-Bus name {}",
+                    unit_name, pid, bus_name
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    "{} (PID {}): dbus start failed: {}",
+                    unit_name, pid, e
+                );
                 let _ = stop_service(self.registry.clone(), unit_name, 10).await;
                 self.publish_state(unit_name);
                 Err(anyhow!("{}", e))
@@ -210,8 +265,11 @@ impl UnitController for ServiceController {
         ));
         // Type=notify(-reload): the start job completes only when the
         // service reports READY=1 (or fails / times out), like systemd's
-        // service_enter_start_post().
+        // service_enter_start_post().  Type=dbus: the start job completes
+        // only once the service owns its BusName= on the system bus, like
+        // systemd's service_bus_name_owner_change().
         self.await_notify_start(unit_name, _pid, &cfg).await?;
+        self.await_dbus_start(unit_name, _pid, &cfg).await?;
         Ok(())
     }
 
@@ -265,6 +323,7 @@ impl UnitController for ServiceController {
             child,
         ));
         self.await_notify_start(unit_name, _pid, &cfg).await?;
+        self.await_dbus_start(unit_name, _pid, &cfg).await?;
         Ok(())
     }
 
@@ -322,5 +381,67 @@ impl UnitController for ServiceController {
             info!("{} (PID {}): reload completed (READY=1)", unit_name, pid);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sysa::proto::ServiceConfig;
+
+    fn controller() -> ServiceController {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ServiceController::new(
+            crate::state::new_registry(),
+            EventPublisher::new(tx, "test-worker", Arc::default()),
+            Arc::new(Mutex::new(None)),
+            None,
+            DbusWaiter::default(),
+        )
+    }
+
+    fn dbus_cfg(bus_name: &str) -> UnitConfig {
+        UnitConfig {
+            unit_name: "dbus-test.service".to_string(),
+            service: Some(ServiceConfig {
+                service_type: "dbus".to_string(),
+                bus_name: bus_name.to_string(),
+                timeout_start_secs: 30,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dbus_type_is_detected() {
+        assert!(ServiceController::is_dbus_type(&dbus_cfg("org.example.Daemon")));
+        let mut cfg = dbus_cfg("org.example.Daemon");
+        cfg.service.as_mut().unwrap().service_type = "simple".to_string();
+        assert!(!ServiceController::is_dbus_type(&cfg));
+    }
+
+    #[tokio::test]
+    async fn non_dbus_start_is_not_waited_on() {
+        let mut cfg = dbus_cfg("org.example.Daemon");
+        cfg.service.as_mut().unwrap().service_type = "simple".to_string();
+        let result = controller()
+            .await_dbus_start("dbus-test.service", 9999, &cfg)
+            .await;
+        assert!(result.is_ok(), "simple services are not gated");
+    }
+
+    #[tokio::test]
+    async fn empty_bus_name_is_refused() {
+        // The sysa parser refuses such units at load; the worker defends in
+        // depth with the same message.
+        let err = controller()
+            .await_dbus_start("dbus-test.service", 9999, &dbus_cfg(""))
+            .await
+            .expect_err("Type=dbus without BusName= must be refused");
+        assert!(
+            err.to_string().contains("no D-Bus service name"),
+            "unexpected: {err}"
+        );
     }
 }
