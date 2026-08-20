@@ -140,7 +140,6 @@ extern "C" fn handle_sighup(_sig: i32) {
             msg.len(),
         )
     };
-    crate::kmsg::write_record(msg);
 }
 
 /// Make SIGHUP non-fatal: a getty taking over the boot console

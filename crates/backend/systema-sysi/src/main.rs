@@ -19,7 +19,6 @@
 //! (see [`mount_setup`]) like systemd's `mount_setup()` does, and only
 //! when it has the privileges to mount.
 
-mod kmsg;
 mod mount_setup;
 mod supervise;
 mod workers;
@@ -146,12 +145,11 @@ async fn main() -> Result<()> {
         Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
-    kmsg::init();
     tracing_subscriber::fmt()
-        .with_writer(kmsg::DualWriter)
+        .with_writer(std::io::stderr)
         .with_env_filter(log_level.parse::<EnvFilter>()?)
         .init();
-    info!("Logging to stderr and /dev/kmsg");
+    info!("Logging to stderr");
 
     if std::process::id() == 1 {
         info!("SysAInit running as PID 1 (reaping orphaned processes)");
