@@ -4,10 +4,12 @@
 //! 1. Bind the notify listener socket (`<notify-dir>/init.sock`) **before**
 //!    spawning anything, so no early allocator event is lost.
 //! 2. Spawn System A and wait for `MANAGER_READY` on the notify channel.
-//! 3. Spawn the one-shot finder chain.
-//! 4. Spawn the workers **serially**: each worker is spawned, then
+//! 3. Spawn the workers **serially**: each worker is spawned, then
 //!    SysAInit waits for `WORKER_READY=<worker_id>` before spawning the
 //!    next one.
+//! 4. Spawn the one-shot finder chain and wait for each to exit.
+//!    Finders must complete after all workers are registered so that
+//!    the committed unit set is fully available for the control phase.
 //! 5. Control phase: ask System A to start the enabled units and
 //!    `default.target` (over the allocator IPC socket — no D-Bus needed).
 //! 6. Steady state: reap children, forward signals, and log notify events.
@@ -335,7 +337,59 @@ async fn wait_ready(
     }
 }
 
-/// Phase 4 — the control plane: ask System A to start every enabled unit,
+/// Wait for a one-shot child process to exit.
+///
+/// Returns `Ok(None)` when the process exits successfully (code 0),
+/// `Ok(Some(code))` when the caller must shut down (signal, other
+/// long-running child death, non-zero exit, or timeout).
+async fn wait_one_shot_exit(
+    ctx: &mut WaitCtx,
+    procs: &[Spawned],
+    grace: Duration,
+    ready_timeout: Duration,
+    pid: i32,
+    name: &str,
+) -> Result<Option<i32>> {
+    let deadline = tokio::time::Instant::now() + ready_timeout;
+    loop {
+        tokio::select! {
+            _ = ctx.terminate.recv() => {
+                info!("SIGTERM received; shutting down");
+                return Ok(Some(shutdown(procs, 0, grace).await));
+            }
+            _ = ctx.interrupt.recv() => {
+                info!("SIGINT received; shutting down");
+                return Ok(Some(shutdown(procs, 0, grace).await));
+            }
+            Some((reaped_pid, status)) = ctx.reaper_rx.recv() => {
+                if reaped_pid == pid {
+                    let code = status_code(&status);
+                    if code != 0 {
+                        error!(
+                            "One-shot {} (pid={pid}) exited with code {code}: {status:?}",
+                            name
+                        );
+                        return Ok(Some(code));
+                    }
+                    info!("One-shot {} (pid={pid}) exited successfully", name);
+                    return Ok(None);
+                }
+                if let Some(code) = handle_reaped(procs, reaped_pid, &status) {
+                    return Ok(Some(shutdown(procs, code, grace).await));
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                error!(
+                    "Timed out waiting for one-shot {} (pid={pid}) to exit after {ready_timeout:?}",
+                    name
+                );
+                return Ok(Some(1));
+            }
+        }
+    }
+}
+
+/// Phase 5 — the control plane: ask System A to start every enabled unit,
 /// plus `default.target` if it is not among them.
 ///
 /// The exchange goes over the allocator IPC socket (`manager.list_units` /
@@ -540,18 +594,7 @@ pub async fn run(
         return Ok(code);
     }
 
-    // --- Phase 2: one-shot finder chain (spawn only). ---
-    for rp in &one_shots {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
-            let code = shutdown(&procs, code, grace).await;
-            let _ = std::fs::remove_file(&sock_path);
-            drop(notify_thread);
-            drop(reaper);
-            return Ok(code);
-        }
-    }
-
-    // --- Phase 3: workers, serially, each gated on WORKER_READY. ---
+    // --- Phase 2: workers, serially, each gated on WORKER_READY. ---
     for rp in &workers {
         if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
             let code = shutdown(&procs, code, grace).await;
@@ -573,6 +616,36 @@ pub async fn run(
             ready_timeout,
             &what,
             move |kv| kv.get("WORKER_READY") == Some(&expected_id),
+        )
+        .await?
+        {
+            let _ = std::fs::remove_file(&sock_path);
+            drop(notify_thread);
+            drop(reaper);
+            return Ok(code);
+        }
+    }
+
+    // --- Phase 3: one-shot finder chain, wait for each to exit. ---
+    // Finders must complete after all workers are registered so that
+    // the committed unit set is fully available for the control phase.
+    for rp in &one_shots {
+        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
+            let code = shutdown(&procs, code, grace).await;
+            let _ = std::fs::remove_file(&sock_path);
+            drop(notify_thread);
+            drop(reaper);
+            return Ok(code);
+        }
+        let pid = procs.last().map(|p| p.pid).unwrap_or(0);
+        let what = format!("one-shot '{}' (pid={})", rp.spec.name, pid);
+        if let Some(code) = wait_one_shot_exit(
+            &mut ctx,
+            &procs,
+            grace,
+            ready_timeout,
+            pid,
+            &what,
         )
         .await?
         {

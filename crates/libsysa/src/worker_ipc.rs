@@ -632,13 +632,33 @@ async fn run_method<C: UnitController>(controller: &C, call: &MethodCall) -> Met
         other => Err(anyhow::anyhow!("unknown method: {other}")),
     };
     match result {
-        Ok(payload) => MethodResult {
-            method: call.method.clone(),
-            unit_name: call.unit_name.clone(),
-            success: true,
-            error: String::new(),
-            result: payload,
-        },
+        Ok(payload) => {
+            // For start/restart calls, if the controller returned an empty
+            // payload (the common case for non-oneshot types), fetch the
+            // current unit status and include it.  This ensures sysa's
+            // `apply_state_to_cache()` overwrites the stale optimistic
+            // update from `update_cache_on_task_result()` with the
+            // controller's actual state (critical for oneshot services
+            // that have already exited by the time the start job completes).
+            let result = if payload.is_empty()
+                && matches!(call.method.as_str(), "start" | "restart")
+            {
+                controller
+                    .status(&call.unit_name)
+                    .await
+                    .map(|s| s.encode_to_vec())
+                    .unwrap_or(payload)
+            } else {
+                payload
+            };
+            MethodResult {
+                method: call.method.clone(),
+                unit_name: call.unit_name.clone(),
+                success: true,
+                error: String::new(),
+                result,
+            }
+        }
         Err(e) => MethodResult {
             method: call.method.clone(),
             unit_name: call.unit_name.clone(),

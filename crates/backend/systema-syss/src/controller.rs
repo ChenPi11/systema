@@ -75,6 +75,117 @@ impl ServiceController {
         }
     }
 
+    /// Whether the unit is `Type=oneshot` and thus the start job must wait
+    /// for the ExecStart process to exit (like systemd).
+    fn is_oneshot_type(cfg: &UnitConfig) -> bool {
+        cfg.service
+            .as_ref()
+            .map(|s| s.service_type.as_str() == "oneshot")
+            .unwrap_or(false)
+    }
+
+    /// Wait for the oneshot service's ExecStart process to exit.
+    /// For `Type=oneshot` the start job completes only once the process
+    /// exits successfully, mirroring systemd's
+    /// `service_enter_start()` → `service_connect_watch_pid()` flow.
+    /// On failure or timeout the unit is marked failed.
+    async fn await_oneshot_exit(
+        &self,
+        unit_name: &str,
+        pid: u32,
+        mut child: tokio::process::Child,
+        cfg: &UnitConfig,
+    ) -> Result<()> {
+        if !Self::is_oneshot_type(cfg) {
+            return Ok(());
+        }
+        let timeout = cfg
+            .service
+            .as_ref()
+            .map(|s| s.timeout_start_secs.max(1))
+            .unwrap_or(90) as u64;
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait()).await {
+            Ok(Ok(status)) => {
+                info!(
+                    "Service {} (PID {}) exited: code={:?}, success={}",
+                    unit_name,
+                    pid,
+                    status.code(),
+                    status.success()
+                );
+                let stay_active = cfg
+                    .service
+                    .as_ref()
+                    .map(|s| status.success() && s.remain_after_exit)
+                    .unwrap_or(false);
+                if stay_active {
+                    info!(
+                        "Service {}: RemainAfterExit=yes, keeping unit active after successful exit",
+                        unit_name
+                    );
+                    {
+                        let mut reg = self.registry.lock();
+                        if let Some(inst) = reg.get_mut(unit_name) {
+                            inst.state = ServiceState::Running;
+                            inst.main_pid = None;
+                            inst.last_exit_code = status.code();
+                        }
+                    }
+                } else {
+                    let state = if status.success() {
+                        ServiceState::Dead
+                    } else {
+                        ServiceState::Failed
+                    };
+                    {
+                        let mut reg = self.registry.lock();
+                        if let Some(inst) = reg.get_mut(unit_name) {
+                            inst.state = state;
+                            inst.main_pid = None;
+                            inst.last_exit_code = status.code();
+                            inst.invocation_id = None;
+                        }
+                    }
+                }
+                self.publish_state(unit_name);
+                if !status.success() {
+                    return Err(anyhow!(
+                        "oneshot service {} exited with code {:?}",
+                        unit_name,
+                        status.code()
+                    ));
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                warn!("Error waiting for oneshot {}: {}", unit_name, e);
+                {
+                    let mut reg = self.registry.lock();
+                    if let Some(inst) = reg.get_mut(unit_name) {
+                        inst.state = ServiceState::Failed;
+                        inst.main_pid = None;
+                        inst.invocation_id = None;
+                    }
+                }
+                self.publish_state(unit_name);
+                Err(anyhow!("oneshot service {} error: {}", unit_name, e))
+            }
+            Err(_) => {
+                warn!(
+                    "Timeout waiting for oneshot {} ({}s), stopping",
+                    unit_name, timeout
+                );
+                let _ = stop_service(self.registry.clone(), unit_name, 10).await;
+                self.publish_state(unit_name);
+                Err(anyhow!(
+                    "oneshot service {} timed out after {}s",
+                    unit_name,
+                    timeout
+                ))
+            }
+        }
+    }
+
     /// Whether the unit is `Type=dbus` and thus must own its `BusName=`
     /// before the start job completes.
     fn is_dbus_type(cfg: &UnitConfig) -> bool {
@@ -257,19 +368,27 @@ impl UnitController for ServiceController {
             }
         }
         self.publish_state(unit_name);
-        tokio::spawn(crate::ipc::monitor_service(
-            self.registry.clone(),
-            unit_name.to_string(),
-            self.event_pub.clone(),
-            child,
-        ));
-        // Type=notify(-reload): the start job completes only when the
-        // service reports READY=1 (or fails / times out), like systemd's
-        // service_enter_start_post().  Type=dbus: the start job completes
-        // only once the service owns its BusName= on the system bus, like
-        // systemd's service_bus_name_owner_change().
-        self.await_notify_start(unit_name, _pid, &cfg).await?;
-        self.await_dbus_start(unit_name, _pid, &cfg).await?;
+        // The start job completion semantics depend on the service type:
+        // - Type=oneshot: the start job completes only when ExecStart
+        //   exits successfully (like systemd's service_enter_start()).
+        // - Type=notify(-reload): the start job completes when READY=1
+        //   is received (like systemd's service_enter_start_post()).
+        // - Type=dbus: the start job completes when BusName= is owned.
+        // - Others (simple/forking/etc.): the start job completes as
+        //   soon as the process is spawned.
+        if Self::is_oneshot_type(&cfg) {
+            self.await_oneshot_exit(unit_name, _pid, child, &cfg)
+                .await?;
+        } else {
+            tokio::spawn(crate::ipc::monitor_service(
+                self.registry.clone(),
+                unit_name.to_string(),
+                self.event_pub.clone(),
+                child,
+            ));
+            self.await_notify_start(unit_name, _pid, &cfg).await?;
+            self.await_dbus_start(unit_name, _pid, &cfg).await?;
+        }
         Ok(())
     }
 
@@ -316,14 +435,19 @@ impl UnitController for ServiceController {
             }
         }
         self.publish_state(unit_name);
-        tokio::spawn(crate::ipc::monitor_service(
-            self.registry.clone(),
-            unit_name.to_string(),
-            self.event_pub.clone(),
-            child,
-        ));
-        self.await_notify_start(unit_name, _pid, &cfg).await?;
-        self.await_dbus_start(unit_name, _pid, &cfg).await?;
+        if Self::is_oneshot_type(&cfg) {
+            self.await_oneshot_exit(unit_name, _pid, child, &cfg)
+                .await?;
+        } else {
+            tokio::spawn(crate::ipc::monitor_service(
+                self.registry.clone(),
+                unit_name.to_string(),
+                self.event_pub.clone(),
+                child,
+            ));
+            self.await_notify_start(unit_name, _pid, &cfg).await?;
+            self.await_dbus_start(unit_name, _pid, &cfg).await?;
+        }
         Ok(())
     }
 
@@ -443,5 +567,103 @@ mod tests {
             err.to_string().contains("no D-Bus service name"),
             "unexpected: {err}"
         );
+    }
+
+    fn oneshot_cfg() -> UnitConfig {
+        UnitConfig {
+            unit_name: "oneshot-test.service".to_string(),
+            service: Some(ServiceConfig {
+                service_type: "oneshot".to_string(),
+                timeout_start_secs: 30,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Register a unit in the controller's registry so state updates land.
+    fn register_unit(ctrl: &ServiceController, name: &str) {
+        use crate::state::ServiceInstance;
+        let mut reg = ctrl.registry.lock();
+        reg.insert(
+            name.to_string(),
+            ServiceInstance {
+                state: ServiceState::Starting,
+                main_pid: Some(9999),
+                ..ServiceInstance::new()
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_type_is_detected() {
+        assert!(ServiceController::is_oneshot_type(&oneshot_cfg()));
+        let mut cfg = oneshot_cfg();
+        cfg.service.as_mut().unwrap().service_type = "simple".to_string();
+        assert!(!ServiceController::is_oneshot_type(&cfg));
+    }
+
+    #[tokio::test]
+    async fn non_oneshot_start_is_not_waited_on() {
+        let mut cfg = oneshot_cfg();
+        cfg.service.as_mut().unwrap().service_type = "simple".to_string();
+        assert!(
+            !ServiceController::is_oneshot_type(&cfg),
+            "simple should not be detected as oneshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_oneshot_exit_success() {
+        let child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn true");
+        let ctrl = controller();
+        register_unit(&ctrl, "oneshot-test.service");
+        let cfg = oneshot_cfg();
+        let result = ctrl
+            .await_oneshot_exit("oneshot-test.service", child.id().unwrap_or(0), child, &cfg)
+            .await;
+        assert!(result.is_ok(), "oneshot exit 0 should succeed: {result:?}");
+        let reg = ctrl.registry.lock();
+        let inst = reg.get("oneshot-test.service").expect("unit should exist");
+        assert_eq!(inst.state, ServiceState::Dead);
+        assert_eq!(inst.last_exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn await_oneshot_exit_failure() {
+        let child = tokio::process::Command::new("false")
+            .spawn()
+            .expect("failed to spawn false");
+        let ctrl = controller();
+        register_unit(&ctrl, "oneshot-test.service");
+        let cfg = oneshot_cfg();
+        let result = ctrl
+            .await_oneshot_exit("oneshot-test.service", child.id().unwrap_or(0), child, &cfg)
+            .await;
+        assert!(result.is_err(), "oneshot exit 1 should fail");
+        let reg = ctrl.registry.lock();
+        let inst = reg.get("oneshot-test.service").expect("unit should exist");
+        assert_eq!(inst.state, ServiceState::Failed);
+        assert_eq!(inst.last_exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn await_oneshot_exit_remain_after_exit() {
+        let mut cfg = oneshot_cfg();
+        cfg.service.as_mut().unwrap().remain_after_exit = true;
+        let child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn true");
+        let ctrl = controller();
+        register_unit(&ctrl, "oneshot-test.service");
+        let result = ctrl
+            .await_oneshot_exit("oneshot-test.service", child.id().unwrap_or(0), child, &cfg)
+            .await;
+        assert!(result.is_ok(), "oneshot exit 0 should succeed: {result:?}");
+        let reg = ctrl.registry.lock();
+        let inst = reg.get("oneshot-test.service").expect("unit should exist");
+        assert_eq!(inst.state, ServiceState::Running);
     }
 }

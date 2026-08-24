@@ -20,4 +20,5 @@ clap.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 libc = "0.2"

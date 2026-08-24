@@ -15,9 +15,9 @@
 //!
 //! Deliberately out of scope: restarts, hostname, dbus-daemon (the system
 //! bus must be provided externally), journaling.  API filesystem mounts
-//! are a PID 1 duty: SysAInit mounts the cgroup v2 hierarchy itself
-//! (see [`mount_setup`]) like systemd's `mount_setup()` does, and only
-//! when it has the privileges to mount.
+//! are a PID 1 duty: SysAInit mounts the cgroup v2 hierarchy, `/dev/shm`
+//! and `/dev/pts` itself (see [`mount_setup`]) like systemd's
+//! `mount_setup()` does, and only when it has the privileges to mount.
 
 mod mount_setup;
 mod supervise;
@@ -89,12 +89,20 @@ async fn main() -> Result<()> {
     sysa::paths::init();
     sysa::l10n::init();
 
-    // Like systemd's `mount_setup()`, SysAInit mounts the cgroup v2
-    // hierarchy itself before anything else starts.  Skipped without
-    // mount privileges (rootless), and never fatal: resource control
-    // degrades to the no-op controller when cgroup2 is unavailable.
+    // Like systemd's `mount_setup()`, SysAInit mounts the API filesystems
+    // itself before anything else starts.  Skipped without mount
+    // privileges (rootless), and never fatal: resource control degrades
+    // to the no-op controller when cgroup2 is unavailable, and Wayland
+    // compositors fall back when /dev/shm is missing (they abort, but the
+    // boot continues).
     if let Err(e) = mount_setup::mount_cgroup2() {
         warn!("cgroup2 mount failed; resource control will degrade: {e:#}");
+    }
+    if let Err(e) = mount_setup::mount_dev_shm() {
+        warn!("/dev/shm mount failed; POSIX shared memory unavailable: {e:#}");
+    }
+    if let Err(e) = mount_setup::mount_dev_pts() {
+        warn!("/dev/pts mount failed; pseudo-terminals unavailable: {e:#}");
     }
 
     let args = {

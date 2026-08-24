@@ -345,6 +345,8 @@ message SocketAddress {
     string sequential_packet = 3;
     // ListenFIFO= path.
     string fifo = 4;
+    // ListenNetlink= address, e.g. "kobject-uevent 1".
+    string netlink = 5;
 }
 
 // Configuration for a .mount unit, sent inside UnitConfig.

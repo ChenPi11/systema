@@ -720,6 +720,84 @@ async fn handle_worker_session(
                         continue;
                     }
 
+                    if env.method == "socket.fired" {
+                        // Payload is the raw socket unit name (UTF-8), the
+                        // same convention as `socket.request_fd`.
+                        let socket_unit = String::from_utf8_lossy(&env.payload).to_string();
+                        let target = resolve_socket_service(&alloc_for_recv, &socket_unit);
+                        info!(
+                            "Socket '{}' fired — triggering '{}'",
+                            socket_unit, target
+                        );
+
+                        // Skip when the service is already active or coming
+                        // up: the activation monitor keeps firing on every
+                        // readable edge and a redundant start job would just
+                        // fail with EALREADY.
+                        let busy = {
+                            let state = alloc_for_recv.read();
+                            state
+                                .unit_states
+                                .get(&target)
+                                .map(|c| {
+                                    matches!(
+                                        c.active_state.as_str(),
+                                        "active" | "activating" | "reloading"
+                                    )
+                                })
+                                .unwrap_or(false)
+                        };
+                        if busy {
+                            debug!(
+                                "Socket-triggered service '{}' already active — ignoring",
+                                target
+                            );
+                            continue;
+                        }
+
+                        // Ensure the target unit is loaded before enqueueing.
+                        if !alloc_for_recv.read().units.contains_key(&target) {
+                            let alloc2 = alloc_for_recv.clone();
+                            let name2 = target.clone();
+                            let loaded =
+                                tokio::task::spawn_blocking(move || load_unit_sync(&alloc2, &name2))
+                                    .await;
+                            match loaded {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        "Failed to load socket-triggered unit '{}': {}",
+                                        target, e
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to load socket-triggered unit '{}': {}",
+                                        target, e
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        match crate::scheduler::enqueue_start_with_mode(
+                            alloc_for_recv.clone(),
+                            &target,
+                            crate::state::JobMode::Replace,
+                        )
+                        .await
+                        {
+                            Ok(job_id) => {
+                                info!("Enqueued job {job_id} for socket-triggered '{target}'");
+                            }
+                            Err(e) => {
+                                warn!("Cannot start socket-triggered unit '{}': {}", target, e);
+                            }
+                        }
+                        continue;
+                    }
+
                     if env.method == "cgroup.metrics" {
                         let update = match CgroupMetricsUpdate::decode(env.payload.as_slice()) {
                             Ok(u) => u,
@@ -897,14 +975,30 @@ struct WorkerSubscription {
     units: HashSet<String>,
 }
 
+/// Resolve the service unit a socket unit activates.
+///
+/// An explicit `[Socket] Service=` directive wins; otherwise the name is
+/// derived following the systemd convention "foo.socket" -> "foo.service".
+/// Falls back to plain derivation when the socket unit is unknown.
+fn resolve_socket_service(allocator: &AllocatorHandle, socket_unit: &str) -> String {
+    let derived = socket_unit.replace(".socket", ".service");
+    let state = allocator.read();
+    state
+        .units
+        .get(socket_unit)
+        .and_then(|ir| ir.socket.as_ref())
+        .filter(|sc| !sc.service.is_empty())
+        .map(|sc| sc.service.clone())
+        .unwrap_or(derived)
+}
+
 /// (Re)register the EventBus subscriber for a worker connection.
 ///
 /// Removes the previous subscriber (if any) and registers a fresh
 /// [`WorkerEventForwarder`] matching the given subscription, then replays the
 /// currently active units so the worker converges without waiting for the
 /// next transition.  Returns `None` when the subscription is empty.
-async fn apply_worker_subscription(
-    allocator: &AllocatorHandle,
+async fn apply_worker_subscription(    allocator: &AllocatorHandle,
     worker_id: &str,
     forward_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
     subscription: &WorkerSubscription,
@@ -1332,34 +1426,6 @@ async fn handle_manager_start_units(
     let mut results = Vec::with_capacity(req.names.len());
     for name in &req.names {
         info!("manager.start_units: processing '{name}'");
-        // Materialize on-disk definitions first (idempotent), so enabled
-        // units that were not loaded at startup can still be started.
-        let loaded = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            crate::unit::loader::ensure_loaded_from_disk(allocator.clone(), name),
-        )
-        .await;
-        match loaded {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                warn!("manager.start_units: cannot load '{}': {}", name, e);
-                results.push(UnitStartResult {
-                    name: name.clone(),
-                    success: false,
-                    message: e.to_string(),
-                });
-                continue;
-            }
-            Err(_) => {
-                warn!("manager.start_units: timed out loading '{}'", name);
-                results.push(UnitStartResult {
-                    name: name.clone(),
-                    success: false,
-                    message: "load timed out".to_string(),
-                });
-                continue;
-            }
-        }
         match tokio::time::timeout(
             std::time::Duration::from_secs(15),
             crate::scheduler::enqueue_start_with_mode(
@@ -2075,5 +2141,40 @@ mod tests {
         let result = StopUnitsResult::decode(reply.payload.as_slice()).unwrap();
         assert!(!result.success);
         assert!(!result.message.is_empty());
+    }
+
+    #[test]
+    fn resolve_socket_service_prefers_directive() {
+        use crate::unit::types::SocketSection;
+
+        let state = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        {
+            let mut state = state.write();
+            // Explicit Service= directive.
+            let mut explicit = UnitFile::new("a.socket");
+            explicit.socket = Some(SocketSection {
+                service: "elsewhere.service".to_string(),
+                ..Default::default()
+            });
+            // No directive: falls back to name derivation.
+            let mut plain = UnitFile::new("b.socket");
+            plain.socket = Some(SocketSection {
+                listen_netlink: vec!["kobject-uevent".to_string()],
+                ..Default::default()
+            });
+            state.units.insert("a.socket".to_string(), explicit);
+            state.units.insert("b.socket".to_string(), plain);
+        }
+
+        assert_eq!(
+            resolve_socket_service(&state, "a.socket"),
+            "elsewhere.service"
+        );
+        assert_eq!(resolve_socket_service(&state, "b.socket"), "b.service");
+        // Unknown socket unit: pure derivation.
+        assert_eq!(
+            resolve_socket_service(&state, "ghost.socket"),
+            "ghost.service"
+        );
     }
 }

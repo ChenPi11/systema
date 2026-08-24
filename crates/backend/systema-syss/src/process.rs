@@ -22,6 +22,7 @@
 //! | `|`    | `VIA_SHELL`                | Run via `sh -c`                  |
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::process::Stdio;
 
 #[cfg(unix)]
@@ -36,6 +37,9 @@ use tracing::{debug, info, warn};
 
 #[cfg(unix)]
 use nix::libc;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use sysa::proto::UnitConfig;
 
@@ -54,6 +58,47 @@ const FORCED_SERVICE_ENV: &[(&str, &str)] = &[
     ("SYSTEMCTL_FORCE_BUS", "1"),
     ("SYSTEMD_OFFLINE", "0"),
 ];
+
+/// Directory where per-service stdout/stderr logs are captured.
+const SERVICE_LOG_DIR: &str = "/var/log/services";
+
+/// Lazily create the service log directory (`/var/log/services/`) with
+/// world-readable permissions (0755).  Returns `Ok(())` on success or if the
+/// directory already exists; logs a warning and returns `Ok(())` on failure
+/// so that a log-directory issue never prevents a service from starting.
+fn ensure_service_log_dir() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        if let Err(e) = std::fs::create_dir_all(SERVICE_LOG_DIR) {
+            warn!("Failed to create {}: {}", SERVICE_LOG_DIR, e);
+        } else {
+            // Ensure the directory is world-readable and traversable.
+            let _ = std::fs::set_permissions(
+                SERVICE_LOG_DIR,
+                std::fs::Permissions::from_mode(0o755),
+            );
+        }
+    });
+}
+
+/// Open a log file at `/var/log/services/<name>.log` in append mode with
+/// 0644 permissions (world-readable).  Returns `None` on failure so that
+/// log-file issues never prevent a service from starting.
+fn open_service_log(name: &str) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = format!("{}/{}.log", SERVICE_LOG_DIR, name);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o644)
+        .open(&path)
+        .ok()?;
+    // Ensure existing files are also world-readable (the mode option only
+    // applies on creation).
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+    Some(file)
+}
 
 /// Launch the service described by `config`.
 /// Returns the PID and the Child handle of the spawned main process.
@@ -167,6 +212,21 @@ pub async fn start_service(
         }
     }
 
+    // XDG_RUNTIME_DIR fallback: pam_systemd normally provides this via the
+    // PAM environment, and systemd --user refuses to run without it
+    // (main.c "Trying to run as user instance, but $XDG_RUNTIME_DIR is not
+    // set.").  When the PAM setup was skipped or failed (e.g. a missing
+    // /etc/pam.d/systemd-user), fall back to the user's runtime directory
+    // if it exists, mirroring what pam_systemd would have set.
+    if let Some((key, value)) =
+        xdg_runtime_dir_fallback(&svc.environment, &pam_env, creds.as_ref().map(|c| c.uid))
+    {
+        pam_env.push((key, value.clone()));
+        info!(
+            "Set XDG_RUNTIME_DIR={value} for {unit_name} (PAM did not provide it)"
+        );
+    }
+
     // Build environment lookup table (process env + unit Environment= +
     // PAM env + forced env).
     let env_table = build_env_table(&svc.environment, &pam_env);
@@ -259,6 +319,22 @@ pub async fn start_service(
     // returned so it can be merged with the env/socket-activation one below
     // (std::process only allows a single pre_exec hook).
     let (tty_fd, tty_pre_exec) = apply_tty(&mut cmd, svc, &unit_name)?;
+
+    // Per-service log capture: redirect stdout/stderr to
+    // /var/log/services/<unit_name>.log unless TTY already owns them.
+    // Two separate file handles are needed because Stdio::from() consumes
+    // the File; append mode makes concurrent writes safe.
+    if tty_fd.is_none() {
+        ensure_service_log_dir();
+        if let Some(f) = open_service_log(&unit_name) {
+            if let Ok(f2) = f.try_clone() {
+                cmd.stdout(Stdio::from(f));
+                cmd.stderr(Stdio::from(f2));
+            } else {
+                cmd.stdout(Stdio::from(f));
+            }
+        }
+    }
 
     // Env injection + socket activation: hand listener fds to the child as
     // 3..3+N and set LISTEN_FDS / LISTEN_PID (checked by sd_listen_fds()).
@@ -1211,6 +1287,34 @@ fn build_env_table(
     table
 }
 
+/// Whether `XDG_RUNTIME_DIR` should fall back to `/run/user/<uid>`.
+///
+/// `pam_systemd` normally exports this via the PAM environment and
+/// systemd --user refuses to run without it ("Trying to run as user
+/// instance, but $XDG_RUNTIME_DIR is not set.").  When the PAM setup was
+/// skipped or failed (e.g. a missing `/etc/pam.d/systemd-user`), fall
+/// back to the user's runtime directory if it exists, mirroring what
+/// pam_systemd would have set.  A unit-provided `Environment=` value takes
+/// precedence over the fallback.
+fn xdg_runtime_dir_fallback(
+    unit_env: &[String],
+    pam_env: &[(String, String)],
+    uid: Option<libc::uid_t>,
+) -> Option<(String, String)> {
+    if pam_env.iter().any(|(k, _)| k == "XDG_RUNTIME_DIR")
+        || unit_env.iter().any(|e| e.starts_with("XDG_RUNTIME_DIR="))
+    {
+        return None;
+    }
+    let uid = uid?;
+    let dir = format!("/run/user/{uid}");
+    if std::path::Path::new(&dir).is_dir() {
+        Some(("XDG_RUNTIME_DIR".to_string(), dir))
+    } else {
+        None
+    }
+}
+
 /// Expand `$VAR` / `${VAR}` in an argv, handling:
 ///
 /// - Standalone `$VAR` (exact word = `$NAME`): value is split by whitespace
@@ -1863,5 +1967,45 @@ mod tests {
     #[cfg(unix)]
     fn resolve_missing_user_fails() {
         assert!(resolve_credentials("systema-no-such-user-xyz", "").is_err());
+    }
+
+    // --- XDG_RUNTIME_DIR fallback ---
+
+    #[test]
+    fn xdg_runtime_dir_fallback_missing_dir_is_none() {
+        let r = xdg_runtime_dir_fallback(&[], &[], Some(999_999));
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn xdg_runtime_dir_fallback_respects_unit_env() {
+        let r = xdg_runtime_dir_fallback(&["XDG_RUNTIME_DIR=/custom".to_string()], &[], Some(0));
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn xdg_runtime_dir_fallback_respects_pam_env() {
+        let r = xdg_runtime_dir_fallback(
+            &[],
+            &[("XDG_RUNTIME_DIR".to_string(), "/run/user/0".to_string())],
+            Some(0),
+        );
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn xdg_runtime_dir_fallback_uses_existing_dir() {
+        let uid = nix::unistd::Uid::current();
+        let dir = format!("/run/user/{}", uid.as_raw());
+        if !std::path::Path::new(&dir).is_dir() {
+            // Environment without a runtime dir (e.g. CI container); the
+            // fallback must then be None, not an invented path.
+            assert_eq!(xdg_runtime_dir_fallback(&[], &[], Some(uid.as_raw())), None);
+            return;
+        }
+        assert_eq!(
+            xdg_runtime_dir_fallback(&[], &[], Some(uid.as_raw())),
+            Some(("XDG_RUNTIME_DIR".to_string(), dir))
+        );
     }
 }

@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::RwLock;
+use prost::Message as ProstMessage;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info, warn};
 
-use sysa::proto::Envelope;
+use sysa::proto::{Envelope, UnitResourceEvent};
 use sysa::worker_ipc::{EventPublisher, WorkerIpc};
 
+use crate::activation::ActivationRegistry;
 use crate::controller::SocketController;
 use crate::socket::{self};
 
@@ -16,6 +19,24 @@ const WORKER_UNIT_TYPES: &[&str] = &["socket"];
 pub async fn run() -> Result<()> {
     let socket_manager = socket::new_manager();
     let fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>> = Arc::new(Mutex::new(None));
+
+    // Socket-activation registry + the publisher slot it fires into.  Both
+    // are connection-independent: monitors survive IPC reconnects, and the
+    // forwarder below stamps events onto whichever publisher is live.
+    let (activation, mut fired_rx) = ActivationRegistry::new();
+    let publisher_slot: Arc<RwLock<Option<EventPublisher>>> = Arc::new(RwLock::new(None));
+    {
+        let slot = publisher_slot.clone();
+        tokio::spawn(async move {
+            while let Some(unit) = fired_rx.recv().await {
+                let ep = slot.read().clone();
+                match ep {
+                    Some(ep) => ep.send_envelope_bytes("socket.fired", unit.into_bytes()),
+                    None => debug!("Dropping activation fire for '{unit}': not connected"),
+                }
+            }
+        });
+    }
 
     // Connect to fdpass socket (non-fatal if unavailable).
     {
@@ -41,6 +62,7 @@ pub async fn run() -> Result<()> {
     let custom = {
         let fdpass = fdpass.clone();
         let socket_manager = socket_manager.clone();
+        let activation = activation.clone();
         move |env: &Envelope, _ep: &EventPublisher| -> Result<bool> {
             if env.method.as_str() == "socket.request_fd" {
                 let unit_name = String::from_utf8(env.payload.clone()).unwrap_or_default();
@@ -62,6 +84,14 @@ pub async fn run() -> Result<()> {
                     }
                 });
                 Ok(true)
+            } else if env.method.as_str() == "event.publish" {
+                // Service state feedback from System A: suppress activation
+                // monitors while their service runs, re-arm when it stops.
+                match UnitResourceEvent::decode(env.payload.as_slice()) {
+                    Ok(ev) => activation.apply_service_state(&ev.unit_name, &ev.active_state),
+                    Err(e) => warn!("Cannot decode UnitResourceEvent from System A: {e}"),
+                }
+                Ok(true)
             } else {
                 Ok(false)
             }
@@ -70,7 +100,10 @@ pub async fn run() -> Result<()> {
 
     WorkerIpc::new(WORKER_ID, WORKER_UNIT_TYPES)
         .run(
-            |_event_pub| SocketController::new(socket_manager.clone()),
+            |event_pub| {
+                *publisher_slot.write() = Some(event_pub.clone());
+                SocketController::new(socket_manager.clone(), activation.clone(), event_pub)
+            },
             custom,
         )
         .await

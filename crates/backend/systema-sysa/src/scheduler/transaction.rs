@@ -230,8 +230,8 @@ impl ReverseIndex {
     /// The normalized `UNIT_ATOM_AFTER` dependency set of `u`: declared
     /// `After=` targets plus the units that declare `Before= u`.
     ///
-    /// Socket units pulled in through `Requires=`/`BindsTo=` are treated as
-    /// `After=` targets as well: System S requests the listener fds of
+    /// Socket units pulled in through `Requires=`/`BindsTo=` or `Sockets=`
+    /// are treated as `After=` targets: System S requests the listener fds of
     /// `socket_units` at spawn time, so the socket must be bound before the
     /// dependent unit starts (systemd relies on sockets.target having
     /// already activated them; System A has no such early activation, so
@@ -247,6 +247,13 @@ impl ReverseIndex {
         if let Some(uf) = units.get(u) {
             for dep in uf.unit.requires.iter().chain(uf.unit.binds_to.iter()) {
                 if dep.ends_with(".socket") {
+                    out.insert(dep.clone());
+                }
+            }
+            // Socket units from Sockets= (socket activation) also require
+            // ordering: the socket must be bound before the service starts.
+            if let Some(svc) = &uf.service {
+                for dep in &svc.sockets {
                     out.insert(dep.clone());
                 }
             }
@@ -527,17 +534,34 @@ impl Transaction {
                     warn!("Cannot add dependency job for {dep}: {e}");
                 }
             }
+            // Socket units from Sockets= are pulled in like Wants= (soft
+            // dependency): the socket should be started, but failure to
+            // start it does not prevent the service from starting.
+            if let Some(svc) = &uf.service {
+                for dep in &svc.sockets {
+                    if let Err(e) = self.add_job_and_dependencies(
+                        units, states, installed, rev, dep, JobType::Start, Some(job),
+                        flags & IGNORE_ORDER,
+                    ) {
+                        warn!("Cannot add socket activation job for {dep}: {e}");
+                    }
+                }
+            }
             for dep in &section.requisite {
                 self.add_job_and_dependencies(
                     units, states, installed, rev, dep, JobType::VerifyActive, Some(job),
                     MATTERS | (flags & IGNORE_ORDER),
                 )?;
             }
+            // Conflicts= with a missing unit is a no-op: a non-existent
+            // unit can never be active, so there is nothing to stop.
             for dep in &section.conflicts {
-                self.add_job_and_dependencies(
+                if let Err(e) = self.add_job_and_dependencies(
                     units, states, installed, rev, dep, JobType::Stop, Some(job),
                     MATTERS | CONFLICTS | (flags & IGNORE_ORDER),
-                )?;
+                ) {
+                    warn!("Cannot add conflict stop job for {dep}: {e}");
+                }
             }
         }
 
@@ -1460,6 +1484,12 @@ mod tests {
         u
     }
 
+    fn with_sockets(mut u: UnitFile, sockets: &[&str]) -> UnitFile {
+        let svc = u.service.get_or_insert_with(Default::default);
+        svc.sockets = sockets.iter().map(|s| s.to_string()).collect();
+        u
+    }
+
     fn map(units: Vec<UnitFile>) -> HashMap<String, UnitFile> {
         units.into_iter().map(|u| (u.name.clone(), u)).collect()
     }
@@ -2204,5 +2234,112 @@ mod tests {
         let b_pos = n.iter().position(|&x| x == "b.service").unwrap();
         assert!(shared_pos < a_pos, "shared before a: {:?}", n);
         assert!(shared_pos < b_pos, "shared before b: {:?}", n);
+    }
+
+    // ------------------------------------------------------------------
+    // Sockets= (socket activation)
+    // ------------------------------------------------------------------
+
+    /// Sockets= should order socket units before the dependent service,
+    /// even when Requires=/BindsTo= does not list them.
+    #[test]
+    fn sockets_directive_orders_socket_before_service() {
+        let units = map(vec![
+            make_unit("control.socket"),
+            make_unit("kernel.socket"),
+            with_sockets(make_unit("udevd.service"), &["control.socket", "kernel.socket"]),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "udevd.service",
+            Start,
+            Replace,
+        );
+        let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
+        assert!(
+            pos("control.socket") < pos("udevd.service"),
+            "control.socket must start before udevd.service"
+        );
+        assert!(
+            pos("kernel.socket") < pos("udevd.service"),
+            "kernel.socket must start before udevd.service"
+        );
+    }
+
+    /// Sockets= pulls in socket units via Wants=-like semantics (soft
+    /// dependency): the socket units appear in the plan when starting
+    /// the service.
+    #[test]
+    fn sockets_directive_pulls_in_socket_units() {
+        let units = map(vec![
+            make_unit("my.socket"),
+            with_sockets(make_unit("my.service"), &["my.socket"]),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "my.service",
+            Start,
+            Replace,
+        );
+        let n = names(&s);
+        assert!(n.contains(&"my.socket"), "my.socket should be pulled in: {:?}", n);
+        assert!(n.contains(&"my.service"), "my.service should be in plan: {:?}", n);
+    }
+
+    /// Sockets= and Requires= for the same socket unit merge into a single
+    /// plan step (no duplicates).
+    #[test]
+    fn sockets_and_requires_merge_to_single_step() {
+        let units = map(vec![
+            make_unit("svc.socket"),
+            with_requires(
+                with_sockets(make_unit("svc.service"), &["svc.socket"]),
+                &["svc.socket"],
+            ),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "svc.service",
+            Start,
+            Replace,
+        );
+        let socket_count = s.iter().filter(|x| x.unit == "svc.socket").count();
+        assert_eq!(socket_count, 1, "svc.socket should appear once, got {}", socket_count);
+    }
+
+    /// Sockets= with After= ordering: socket units from both Requires= and
+    /// Sockets= are ordered before the service.
+    #[test]
+    fn sockets_directive_respects_after_ordering() {
+        let units = map(vec![
+            make_unit("control.socket"),
+            make_unit("kernel.socket"),
+            with_after(
+                with_sockets(make_unit("udevd.service"), &["control.socket", "kernel.socket"]),
+                &["control.socket", "kernel.socket"],
+            ),
+            with_after(
+                with_requires(make_unit("trigger.service"), &["udevd.service"]),
+                &["udevd.service"],
+            ),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "trigger.service",
+            Start,
+            Replace,
+        );
+        let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
+        assert!(pos("control.socket") < pos("udevd.service"));
+        assert!(pos("kernel.socket") < pos("udevd.service"));
+        assert!(pos("udevd.service") < pos("trigger.service"));
     }
 }

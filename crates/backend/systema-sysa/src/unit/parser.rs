@@ -740,6 +740,11 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection, name: &str) -> Resul
     if !cmem.is_empty() {
         unit.condition_memory.extend(split_vec(&expand(&cmem)));
     }
+    let ckml = get_str(config, "unit", "conditionkernelmoduleloaded");
+    if !ckml.is_empty() {
+        unit.condition_kernel_module_loaded
+            .extend(split_vec(&expand(&ckml)));
+    }
 
     // --- Assert checks ---
     let ape = get_str(config, "unit", "assertpathexists");
@@ -1011,6 +1016,7 @@ fn parse_socket_section(config: &Ini, sock: &mut SocketSection, name: &str) -> R
     }
 
     sock.accept = get_bool(config, "socket", "accept", false);
+    sock.service = expand_specifiers(&get_str(config, "socket", "service"), name);
     sock.socket_user = get_str(config, "socket", "socketuser");
     sock.socket_group = get_str(config, "socket", "socketgroup");
     sock.socket_mode = get_str(config, "socket", "socketmode");
@@ -1358,6 +1364,19 @@ WantedBy=sockets.target
         assert!(sock.accept);
     }
 
+    #[test]
+    fn test_parse_socket_service_directive() {
+        let content = "[Socket]\nListenNetlink=kobject-uevent\nService=my-udevd.service\n";
+        let unit = parse_unit("udev.socket", content).unwrap();
+        let sock = unit.socket.unwrap();
+        assert_eq!(sock.listen_netlink, vec!["kobject-uevent"]);
+        assert_eq!(sock.service, "my-udevd.service");
+
+        // Absent directive → empty string (caller derives from unit name).
+        let plain = parse_unit("plain.socket", "[Socket]\nListenStream=99\n").unwrap();
+        assert_eq!(plain.socket.unwrap().service, "");
+    }
+
     // -----------------------------------------------------------------------
     // Swap unit parsing
     // -----------------------------------------------------------------------
@@ -1427,6 +1446,7 @@ ConditionFileNotEmpty=/etc/myapp.conf
 ConditionHost=myhost
 ConditionVirtualization=no
 ConditionACPower=yes
+ConditionKernelModuleLoaded=!drm
 "#;
         let unit = parse_unit("myapp.service", content).unwrap();
         assert_eq!(
@@ -1440,6 +1460,10 @@ ConditionACPower=yes
         assert_eq!(unit.unit.condition_host, vec!["myhost"]);
         assert_eq!(unit.unit.condition_virtualization, vec!["no"]);
         assert_eq!(unit.unit.condition_ac_power, vec!["yes"]);
+        assert_eq!(
+            unit.unit.condition_kernel_module_loaded,
+            vec!["!drm"]
+        );
     }
 
     #[test]

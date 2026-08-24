@@ -1553,6 +1553,7 @@ dependencies = [
  "futures",
  "libc",
  "parking_lot",
+ "prost",
  "sysa",
  "tokio",
  "tokio-util",

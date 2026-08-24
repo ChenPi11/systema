@@ -297,6 +297,9 @@ pub struct UnitSection {
     pub condition_environment: Vec<String>,
     /// `ConditionMemory=` — memory size comparison, e.g. `>=1G`.
     pub condition_memory: Vec<String>,
+    /// `ConditionKernelModuleLoaded=` — check if a kernel module is loaded.
+    /// A `!`-prefixed value negates the check (skip if loaded).
+    pub condition_kernel_module_loaded: Vec<String>,
 
     // ------------------------------------------------------------------
     // Assert checks — like Condition but cause a hard failure if not met.
@@ -359,6 +362,7 @@ impl Default for UnitSection {
             condition_first_boot: Vec::new(),
             condition_environment: Vec::new(),
             condition_memory: Vec::new(),
+            condition_kernel_module_loaded: Vec::new(),
             assert_path_exists: Vec::new(),
             assert_path_exists_glob: Vec::new(),
             assert_file_not_empty: Vec::new(),
@@ -411,6 +415,8 @@ pub struct ServiceSection {
     pub timeout_stop_sec: u32,
     pub remain_after_exit: bool,
     pub bus_name: String,
+    /// Socket units to activate via socket activation (`Sockets=`).
+    pub sockets: Vec<String>,
     pub notify_access: String,
     pub watchdog_sec: u32,
     pub kill_signal: String,
@@ -713,6 +719,9 @@ pub struct SocketSection {
     pub listen_special: Vec<String>,
     /// Accept a connection per service instance (`Accept=`).
     pub accept: bool,
+    /// Service unit to activate on data arrival (`Service=`).  Empty means
+    /// derive the name from the socket unit ("foo.socket" -> "foo.service").
+    pub service: String,
     /// User for socket file ownership (`SocketUser=`).
     pub socket_user: String,
     /// Group for socket file ownership (`SocketGroup=`).

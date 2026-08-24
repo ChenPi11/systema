@@ -1,15 +1,20 @@
 //! API filesystem mount setup for SysAInit.
 //!
 //! The kernel and the initramfs mount `/proc`, `/sys` and `/dev`, but
-//! nothing mounts the cgroup v2 (unified) hierarchy: systemd mounts it
-//! itself as PID 1 in `mount_setup()` (`src/shared/mount-setup.c`,
-//! `mount_table` entry for cgroup2), so SysAInit does the same.
+//! nothing mounts the cgroup v2 (unified) hierarchy, `/dev/shm` or
+//! `/dev/pts`: systemd mounts them itself as PID 1 in `mount_setup()`
+//! (`src/shared/mount-setup.c`, `mount_table`), so SysAInit does the same.
 //!
-//! The mount is attempted only when SysAInit has the privileges to mount
+//! The mounts are attempted only when SysAInit has the privileges to mount
 //! (effective root: real root, or root inside a container / user
-//! namespace).  In a rootless environment the mount is skipped and
+//! namespace).  In a rootless environment the mounts are skipped and
 //! resource control degrades to the no-op controller, as if cgroup2 had
 //! never been mounted.
+//!
+//! `/dev/shm` matters beyond POSIX shm: Wayland compositors using
+//! wlroots (Hyprland, sway, ...) create their shared-memory buffers via
+//! `shm_open(3)`, and without a tmpfs at `/dev/shm` they abort on
+//! startup — a login session would die immediately after the greeter.
 
 use std::fs;
 
@@ -24,6 +29,16 @@ const CGROUP_PATH: &str = "/sys/fs/cgroup";
 /// Mount options for cgroup2, kept in sync with systemd's mount-table
 /// entry (`nsdelegate,memory_recursiveprot`).
 const CGROUP_OPTIONS: &str = "nsdelegate,memory_recursiveprot";
+
+/// POSIX shared memory tmpfs, kept in sync with systemd's mount-table
+/// entry (`mode=01777`, MS_NOSUID|MS_NODEV|MS_STRICTATIME).
+const DEV_SHM_PATH: &str = "/dev/shm";
+const DEV_SHM_OPTIONS: &str = "mode=01777";
+
+/// /dev/pts devpts, kept in sync with systemd's mount-table entry
+/// (`mode=0620,gid=5`, MS_NOSUID|MS_NOEXEC).
+const DEV_PTS_PATH: &str = "/dev/pts";
+const DEV_PTS_OPTIONS: &str = "mode=0620,gid=5";
 
 /// Whether SysAInit may perform mounts: the effective user must be root.
 ///
@@ -46,6 +61,51 @@ fn is_mount_point(path: &str) -> bool {
         return false;
     };
     mountinfo.lines().any(|line| line.split(' ').nth(4) == Some(path))
+}
+
+/// Mount a filesystem at `path`, mirroring systemd's `mount_table`
+/// handling: skip when already mounted or without privileges, create the
+/// mount point, mount, then undo when the result is not writable
+/// (systemd's MNT_CHECK_WRITABLE).
+fn mount_table_entry(
+    fstype: &str,
+    path: &str,
+    options: &str,
+    flags: MsFlags,
+) -> anyhow::Result<()> {
+    if !has_mount_privileges() {
+        debug!("Running without mount privileges (rootless); not mounting {fstype} at {path}");
+        return Ok(());
+    }
+
+    if is_mount_point(path) {
+        info!("{fstype} already mounted at {path}; not mounting again");
+        return Ok(());
+    }
+
+    fs::create_dir_all(path)
+        .with_context(|| format!("Cannot create mount point {path}"))?;
+
+    mount(Some(fstype), path, Some(fstype), flags, Some(options)).map_err(|e| {
+        if e == Errno::EBUSY {
+            anyhow!("{path} is already occupied by another filesystem")
+        } else {
+            anyhow!("Cannot mount {fstype} at {path}: {e}")
+        }
+    })?;
+
+    // systemd's MNT_CHECK_WRITABLE: undo the mount when the filesystem
+    // is not actually writable.
+    // SAFETY: access(2) only touches errno and returns -1 on failure.
+    if unsafe { nix::libc::access(path.as_ptr().cast(), nix::libc::W_OK) } != 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = umount2(path, MntFlags::UMOUNT_NOFOLLOW);
+        let _ = fs::remove_dir(path);
+        return Err(anyhow!("{fstype} mount at {path} is not writable, undoing: {err}"));
+    }
+
+    info!("Mounted {fstype} at {path} ({options})");
+    Ok(())
 }
 
 /// Mount the cgroup v2 hierarchy at `/sys/fs/cgroup`, mirroring systemd.
@@ -96,4 +156,57 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
 
     info!("Mounted cgroup2 at {CGROUP_PATH} ({CGROUP_OPTIONS})");
     Ok(())
+}
+
+/// Mount a tmpfs at `/dev/shm` for POSIX shared memory (systemd's
+/// mount-table entry: tmpfs, `mode=01777`,
+/// `MS_NOSUID|MS_NODEV|MS_STRICTATIME`).  wlroots-based compositors abort
+/// without it.  Never fatal: like systemd, the failure is logged by the
+/// caller and the boot continues.
+pub fn mount_dev_shm() -> anyhow::Result<()> {
+    mount_table_entry(
+        "tmpfs",
+        DEV_SHM_PATH,
+        DEV_SHM_OPTIONS,
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_STRICTATIME,
+    )
+}
+
+/// Mount devpts at `/dev/pts` (systemd's mount-table entry: devpts,
+/// `mode=0620,gid=5`, `MS_NOSUID|MS_NOEXEC`).  Inside containers
+/// (nspawn) the kernel's default `/dev/pts` lacks `newinstance`, so the
+/// pseudo-terminal devpts must be remounted; harmless when already
+/// mounted by devtmpfs.  Never fatal.
+pub fn mount_dev_pts() -> anyhow::Result<()> {
+    mount_table_entry(
+        "devpts",
+        DEV_PTS_PATH,
+        DEV_PTS_OPTIONS,
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_is_a_mount_point() {
+        assert!(is_mount_point("/"));
+    }
+
+    #[test]
+    fn bogus_path_is_not_a_mount_point() {
+        assert!(!is_mount_point("/definitely/not/a/real/mountpoint"));
+    }
+
+    #[test]
+    fn non_privileged_mounts_are_noops() {
+        if unsafe { nix::libc::geteuid() } == 0 {
+            // Real root may actually mount; only assert the rootless path.
+            return;
+        }
+        assert!(mount_dev_shm().is_ok());
+        assert!(mount_dev_pts().is_ok());
+    }
 }

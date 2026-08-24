@@ -21,6 +21,7 @@ enum BoundSocket {
     UnixStream(UnixListener),
     Udp(RawFd),
     Fifo,
+    Netlink(RawFd),
 }
 
 /// Runtime state for one managed socket unit.
@@ -97,6 +98,20 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
             })?;
             listeners.push(BoundSocket::Fifo);
         }
+        if !addr.netlink.is_empty() {
+            let fd = bind_netlink(&addr.netlink).with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_(
+                        "Failed to bind ListenNetlink '{addr_netlink}'.",
+                    ),
+                    &[(
+                        "addr_netlink",
+                        &addr.netlink.to_string(),
+                    )],
+                )
+            })?;
+            listeners.push(BoundSocket::Netlink(fd));
+        }
     }
 
     let any_address = config
@@ -107,6 +122,7 @@ pub fn start_socket(manager: &SocketManager, unit_name: &str, config: &SocketCon
                 || !addr.datagram.is_empty()
                 || !addr.sequential_packet.is_empty()
                 || !addr.fifo.is_empty()
+                || !addr.netlink.is_empty()
         });
     if !any_address {
         anyhow::bail!(sysa::l10n::t_(
@@ -198,7 +214,26 @@ pub fn get_listener_fd(manager: &SocketManager, unit_name: &str) -> Option<RawFd
         BoundSocket::UnixStream(l) => Some(l.as_raw_fd()),
         BoundSocket::Udp(fd) => Some(*fd),
         BoundSocket::Fifo => None,
+        BoundSocket::Netlink(fd) => Some(*fd),
     }
+}
+
+/// Return the raw fds of every listening socket for a unit (skipping
+/// address kinds without an fd, e.g. FIFOs).
+pub fn get_listener_fds(manager: &SocketManager, unit_name: &str) -> Vec<RawFd> {
+    let guard = manager.lock();
+    let Some(ms) = guard.get(unit_name) else {
+        return Vec::new();
+    };
+    ms.listeners
+        .iter()
+        .filter_map(|ls| match ls {
+            BoundSocket::Tcp(l) => Some(l.as_raw_fd()),
+            BoundSocket::UnixStream(l) => Some(l.as_raw_fd()),
+            BoundSocket::Udp(fd) | BoundSocket::Netlink(fd) => Some(*fd),
+            BoundSocket::Fifo => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +623,92 @@ fn bind_seqpacket(address: &str, backlog: u32, socket_mode: u32, directory_mode:
     }
 }
 
+/// Bind a netlink socket for a `ListenNetlink=` address.
+///
+/// Format: `"protocol_name group"` — e.g. `"kobject-uevent 1"`.
+#[cfg(target_os = "linux")]
+fn bind_netlink(address: &str) -> Result<RawFd> {
+    let parts: Vec<&str> = address.split_whitespace().collect();
+    if parts.is_empty() {
+        anyhow::bail!(sysa::l10n::t_(
+            "ListenNetlink address is empty."
+        ));
+    }
+
+    let proto_id: libc::c_int = match parts[0] {
+        "kobject-uevent" => libc::NETLINK_KOBJECT_UEVENT,
+        "generic" => libc::NETLINK_GENERIC,
+        "route" => libc::NETLINK_ROUTE,
+        "firewall" => libc::NETLINK_FIREWALL,
+        "netfilter" => libc::NETLINK_NETFILTER,
+        "dnrtmsg" => libc::NETLINK_DNRTMSG,
+        "kobject-uevent-1" => libc::NETLINK_KOBJECT_UEVENT,
+        _ => {
+            parts[0].parse::<libc::c_int>().unwrap_or_else(|_| {
+                warn!(
+                    "Unknown netlink protocol '{}', defaulting to kobject-uevent",
+                    parts[0]
+                );
+                libc::NETLINK_KOBJECT_UEVENT
+            })
+        }
+    };
+
+    let groups: libc::c_uint = if parts.len() > 1 {
+        parts[1].parse::<libc::c_uint>().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let fd = unsafe {
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            proto_id,
+        );
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("socket(AF_NETLINK) failed: {e}."),
+                &[("e", &e.to_string())]
+            ));
+        }
+        fd
+    };
+
+    unsafe {
+        let mut addr: libc::sockaddr_nl = std::mem::zeroed();
+        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        addr.nl_pid = 0;
+        addr.nl_groups = groups;
+
+        let ret = libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("bind netlink '{address}' failed: {e}."),
+                &[("address", address), ("e", &e.to_string())]
+            ));
+        }
+    }
+
+    info!(
+        "Bound netlink socket '{}' (proto={}, groups={})",
+        address, proto_id, groups
+    );
+    Ok(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_netlink(_address: &str) -> Result<RawFd> {
+    anyhow::bail!(sysa::l10n::t_("Netlink sockets are only supported on Linux."));
+}
+
 fn create_fifo(path: &str, mode: &str) -> Result<()> {
     let cpath = CString::new(path).with_context(|| {
         sysa::l10n::fmt(
@@ -807,5 +928,21 @@ mod tests {
         unsafe {
             libc::close(fd);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bind_netlink_kobject_uevent() {
+        let fd = bind_netlink("kobject-uevent 1").unwrap();
+        assert!(fd >= 0);
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bind_netlink_empty_fails() {
+        assert!(bind_netlink("").is_err());
     }
 }

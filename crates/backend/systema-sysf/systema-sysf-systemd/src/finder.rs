@@ -250,12 +250,13 @@ fn convert_socket(sock: &crate::types::SocketSection) -> SocketConfig {
         listen_stream: sock.listen_stream.clone(),
         listen_datagram: sock.listen_datagram.clone(),
         listen_fifo: sock.listen_fifo.clone(),
+        listen_netlink: sock.listen_netlink.clone(),
         accept: sock.accept,
+        service: sock.service.clone(),
         socket_mode: sock.socket_mode.clone(),
         socket_user: sock.socket_user.clone(),
         socket_group: sock.socket_group.clone(),
         backlog: sock.backlog,
-        service: String::new(),
         directory_mode: sock.directory_mode.clone(),
     }
 }

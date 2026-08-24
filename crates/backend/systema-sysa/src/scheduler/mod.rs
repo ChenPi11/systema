@@ -1127,37 +1127,74 @@ pub async fn enqueue_job(
 
         // Record the job and the task_id → job_kind mapping.
         // Track invocation_id for GetUnitByInvocationID lookups.
+        //
+        // Re-check for an existing in-flight job of the same unit+kind
+        // under the write lock: the pre-lock checks above race with a
+        // concurrent enqueue (the actual job insert happens here), which
+        // could otherwise dispatch a duplicate task for one request.
+        let mut duplicate_job = false;
         {
             let mut state = allocator.write();
-            if let Some(ref inv_id) = invocation_id {
-                state.invocation_ids.insert(name.clone(), inv_id.clone());
-            }
-            state.jobs.insert(
-                job_id,
-                Job {
-                    id: job_id,
-                    unit_name: name.clone(),
-                    kind: step_kind,
-                    status: JobStatus::Running,
-                    timeout_abort: None,
-                },
-            );
-            state.task_kinds.insert(task_id, step_kind);
-            // Assign unit ownership to the dispatching worker.  Starting an
-            // automount implicitly assigns ownership of its companion mount
-            // unit (same worker handles both).
-            if let Some(wid) = &worker_id {
-                state.unit_owners.insert(name.clone(), wid.clone());
-                if step_kind == JobKind::Start && name.ends_with(".automount") {
-                    let mount_name = format!("{}.mount", name.trim_end_matches(".automount"));
-                    if state.units.contains_key(&mount_name) {
-                        state.unit_owners.insert(mount_name, wid.clone());
+            let existing_id: Option<u64> = state.jobs.values().find(|j| {
+                j.unit_name == *name
+                    && j.kind == step_kind
+                    && matches!(j.status, JobStatus::Running)
+            }).map(|j| j.id);
+            if let Some(existing_id) = existing_id {
+                warn!(
+                    "Job already exists for unit {} ({:?}, id={}); not dispatching a duplicate",
+                    name, step_kind, existing_id
+                );
+                duplicate_job = true;
+                if is_root {
+                    // The caller is waiting on the primary job id; complete
+                    // it immediately — the existing in-flight job is the
+                    // one doing the work (systemd semantics: a second
+                    // StartUnit for a running job merges into it).
+                    if let Some(ref tx) = state.job_completion_tx {
+                        let _ = tx.send(JobCompletion {
+                            job_id: primary_job_id,
+                            unit_name: unit_name.to_string(),
+                            result: JobResultKind::Done,
+                        });
                     }
                 }
+            } else {
+                if let Some(ref inv_id) = invocation_id {
+                    state.invocation_ids.insert(name.clone(), inv_id.clone());
+                }
+                state.jobs.insert(
+                    job_id,
+                    Job {
+                        id: job_id,
+                        unit_name: name.clone(),
+                        kind: step_kind,
+                        status: JobStatus::Running,
+                        timeout_abort: None,
+                    },
+                );
+                state.task_kinds.insert(task_id, step_kind);
+                // Assign unit ownership to the dispatching worker.  Starting an
+                // automount implicitly assigns ownership of its companion mount
+                // unit (same worker handles both).
+                if let Some(wid) = &worker_id {
+                    state.unit_owners.insert(name.clone(), wid.clone());
+                    if step_kind == JobKind::Start && name.ends_with(".automount") {
+                        let mount_name = format!("{}.mount", name.trim_end_matches(".automount"));
+                        if state.units.contains_key(&mount_name) {
+                            state.unit_owners.insert(mount_name, wid.clone());
+                        }
+                    }
+                }
+                if serial_mode {
+                    state.serial_completion_txs.insert(task_id, next_serial_tx);
+                }
             }
-            if serial_mode {
-                state.serial_completion_txs.insert(task_id, next_serial_tx);
-            }
+        }
+        if duplicate_job {
+            // Nothing was dispatched; skip JobNew, the timeout monitor and
+            // the envelope send for this step.
+            continue;
         }
 
         // Emit JobNew signal for this job.
@@ -1723,9 +1760,20 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
                 ..Default::default()
             });
         }
-        // Derive the associated service name per systemd convention:
+        for addr in &sk.listen_netlink {
+            listen.push(SocketAddress {
+                netlink: addr.clone(),
+                ..Default::default()
+            });
+        }
+        // Resolve the associated service name: an explicit `Service=`
+        // directive wins; otherwise follow the systemd convention
         // "foo.socket" -> "foo.service".
-        let svc_name = uf.name.replace(".socket", ".service");
+        let svc_name = if sk.service.is_empty() {
+            uf.name.replace(".socket", ".service")
+        } else {
+            sk.service.clone()
+        };
 
         SocketConfig {
             listen,
@@ -1827,6 +1875,10 @@ fn build_unit_config(uf: &UnitFile, all_units: &HashMap<String, UnitFile>) -> Un
                 .filter(|d| d.ends_with(".socket"))
                 .cloned()
                 .collect();
+            // Also include socket units from Sockets= (socket activation).
+            if let Some(svc) = &uf.service {
+                deps.extend(svc.sockets.iter().cloned());
+            }
             deps.sort();
             deps.dedup();
             deps
@@ -2116,6 +2168,15 @@ fn check_conditions(unit: &UnitSection) -> bool {
         let first = is_first_boot();
         let want = matches!(value.to_lowercase().as_str(), "yes" | "true" | "1");
         if (first != want) != negate {
+            return false;
+        }
+    }
+    for spec in &unit.condition_kernel_module_loaded {
+        let (negate, module) = strip_negate(spec);
+        let loaded = std::path::Path::new("/sys/module")
+            .join(module)
+            .exists();
+        if loaded == negate {
             return false;
         }
     }
@@ -2410,6 +2471,31 @@ mod tests {
     }
 
     #[test]
+    fn test_socket_config_service_resolution() {
+        // No Service= directive: derive "foo.socket" -> "foo.service".
+        let mut uf = make_unit("foo.socket");
+        uf.socket = Some(crate::unit::types::SocketSection {
+            listen_netlink: vec!["kobject-uevent".to_string()],
+            ..Default::default()
+        });
+        let cfg = build_unit_config(&uf, &HashMap::new());
+        assert_eq!(cfg.socket.as_ref().unwrap().service, "foo.service");
+
+        // Explicit Service= wins over the derived name.
+        let mut uf = make_unit("bar.socket");
+        uf.socket = Some(crate::unit::types::SocketSection {
+            listen_stream: vec!["22".to_string()],
+            service: "custom-daemon.service".to_string(),
+            ..Default::default()
+        });
+        let cfg = build_unit_config(&uf, &HashMap::new());
+        assert_eq!(
+            cfg.socket.as_ref().unwrap().service,
+            "custom-daemon.service"
+        );
+    }
+
+    #[test]
     fn test_strip_negate_normal() {
         let (neg, val) = strip_negate("/some/path");
         assert!(!neg);
@@ -2475,6 +2561,42 @@ mod tests {
     fn test_check_asserts_no_asserts() {
         let unit = UnitSection::default();
         assert!(check_asserts(&unit));
+    }
+
+    #[test]
+    fn test_check_conditions_kernel_module_loaded_existing() {
+        let mut unit = UnitSection::default();
+        // "configfs" is loaded on virtually all Linux systems.
+        unit.condition_kernel_module_loaded
+            .push("configfs".to_string());
+        assert!(check_conditions(&unit));
+    }
+
+    #[test]
+    fn test_check_conditions_kernel_module_loaded_negated_existing() {
+        let mut unit = UnitSection::default();
+        // "!configfs" → skip if loaded → should fail.
+        unit.condition_kernel_module_loaded
+            .push("!configfs".to_string());
+        assert!(!check_conditions(&unit));
+    }
+
+    #[test]
+    fn test_check_conditions_kernel_module_loaded_missing() {
+        let mut unit = UnitSection::default();
+        // A module name that definitely does not exist.
+        unit.condition_kernel_module_loaded
+            .push("definitely_not_a_module_abc123".to_string());
+        assert!(!check_conditions(&unit));
+    }
+
+    #[test]
+    fn test_check_conditions_kernel_module_loaded_negated_missing() {
+        let mut unit = UnitSection::default();
+        // "!<nonexistent>" → skip if loaded → module not loaded → should pass.
+        unit.condition_kernel_module_loaded
+            .push("!definitely_not_a_module_abc123".to_string());
+        assert!(check_conditions(&unit));
     }
 
     // =========================================================================

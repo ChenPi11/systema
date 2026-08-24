@@ -278,6 +278,9 @@ pub struct UnitSection {
     pub condition_environment: Vec<String>,
     /// `ConditionMemory=` — memory size comparison, e.g. `>=1G`.
     pub condition_memory: Vec<String>,
+    /// `ConditionKernelModuleLoaded=` — check if a kernel module is loaded.
+    /// A `!`-prefixed value negates the check (skip if loaded).
+    pub condition_kernel_module_loaded: Vec<String>,
 
     // ------------------------------------------------------------------
     // Assert checks — like Condition but cause a hard failure if not met.
@@ -636,6 +639,9 @@ pub struct SocketSection {
     pub listen_special: Vec<String>,
     /// Accept a connection per service instance (`Accept=`).
     pub accept: bool,
+    /// Service unit to activate on data arrival (`Service=`).  Empty means
+    /// derive the name from the socket unit ("foo.socket" -> "foo.service").
+    pub service: String,
     /// User for socket file ownership (`SocketUser=`).
     pub socket_user: String,
     /// Group for socket file ownership (`SocketGroup=`).

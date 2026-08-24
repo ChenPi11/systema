@@ -958,6 +958,11 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection, name: &str) -> Resul
     if !cmem.is_empty() {
         unit.condition_memory.extend(split_vec(&expand(&cmem)));
     }
+    let ckml = get_str(config, "unit", "conditionkernelmoduleloaded");
+    if !ckml.is_empty() {
+        unit.condition_kernel_module_loaded
+            .extend(split_vec(&expand(&ckml)));
+    }
 
     // --- Assert checks ---
     let ape = get_str(config, "unit", "assertpathexists");
@@ -1020,6 +1025,7 @@ fn parse_exec_line(raw: &str, unit_name: &str) -> ExecCommand {
 }
 
 fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> Result<()> {
+    let expand = |v: &str| expand_specifiers(v, name);
     let stype = get_str(config, "service", "type");
     svc.service_type = ServiceType::from(stype.as_str());
     parse_resource_control(config, "service", &mut svc.rc);
@@ -1070,6 +1076,20 @@ fn parse_service_section(config: &Ini, svc: &mut ServiceSection, name: &str) -> 
     svc.pam_name = get_str(config, "service", "pamname");
     svc.pid_file = get_str(config, "service", "pidfile");
     svc.bus_name = get_str(config, "service", "busname");
+
+    // Sockets= lists socket units for socket activation (distinct from
+    // Requires=/BindsTo= which create hard dependencies).
+    let sockets = get_str(config, "service", "sockets");
+    if !sockets.is_empty() {
+        svc.sockets = split_vec(&expand(&sockets));
+    }
+
+    // systemd infers Type=dbus when BusName= is set and Type= is not
+    // specified (service_verify() in src/core/service.c).
+    if !svc.bus_name.is_empty() && stype.is_empty() {
+        svc.service_type = ServiceType::Dbus;
+    }
+
     svc.notify_access = get_str(config, "service", "notifyaccess");
     svc.standard_input = get_str(config, "service", "standardinput");
     svc.standard_output = get_str(config, "service", "standardoutput");
@@ -1231,6 +1251,7 @@ fn parse_socket_section(config: &Ini, sock: &mut SocketSection, name: &str) -> R
     }
 
     sock.accept = get_bool(config, "socket", "accept", false);
+    sock.service = expand_specifiers(&get_str(config, "socket", "service"), name);
     sock.socket_user = get_str(config, "socket", "socketuser");
     sock.socket_group = get_str(config, "socket", "socketgroup");
     sock.socket_mode = get_str(config, "socket", "socketmode");
@@ -1493,6 +1514,45 @@ ExecStart=/usr/bin/dbus-daemon --system
     }
 
     #[test]
+    fn test_busname_implies_type_dbus_when_type_unset() {
+        // systemd service_verify(): when Type= is omitted but BusName= is
+        // present, the type defaults to Type=dbus.
+        let unit = parse_unit(
+            "lightdm.service",
+            r#"
+[Service]
+ExecStart=/usr/sbin/lightdm
+BusName=org.freedesktop.DisplayManager
+"#,
+        )
+        .expect("BusName= without Type= should infer Type=dbus");
+        let svc = unit.service.unwrap();
+        assert!(
+            matches!(svc.service_type, ServiceType::Dbus),
+            "expected Type=dbus from BusName= inference, got {:?}",
+            svc.service_type
+        );
+        assert_eq!(svc.bus_name, "org.freedesktop.DisplayManager");
+    }
+
+    #[test]
+    fn test_explicit_type_overrides_busname_default() {
+        let unit = parse_unit(
+            "foo.service",
+            r#"
+[Service]
+Type=simple
+ExecStart=/usr/bin/foo
+BusName=org.example.Foo
+"#,
+        )
+        .unwrap();
+        let svc = unit.service.unwrap();
+        assert!(matches!(svc.service_type, ServiceType::Simple));
+        assert_eq!(svc.bus_name, "org.example.Foo");
+    }
+
+    #[test]
     fn test_exec_start_ignore_failure_prefix() {
         let content = "[Service]\nExecStart=-/usr/bin/cleanup\n";
         let unit = parse_unit("cleanup.service", content).unwrap();
@@ -1716,6 +1776,19 @@ WantedBy=sockets.target
         assert!(sock.accept);
     }
 
+    #[test]
+    fn test_parse_socket_service_directive() {
+        let content = "[Socket]\nListenNetlink=kobject-uevent\nService=my-udevd.service\n";
+        let unit = parse_unit("udev.socket", content).unwrap();
+        let sock = unit.socket.unwrap();
+        assert_eq!(sock.listen_netlink, vec!["kobject-uevent"]);
+        assert_eq!(sock.service, "my-udevd.service");
+
+        // Absent directive → empty string (caller derives from unit name).
+        let plain = parse_unit("plain.socket", "[Socket]\nListenStream=99\n").unwrap();
+        assert_eq!(plain.socket.unwrap().service, "");
+    }
+
     // -----------------------------------------------------------------------
     // Swap unit parsing
     // -----------------------------------------------------------------------
@@ -1785,6 +1858,7 @@ ConditionFileNotEmpty=/etc/myapp.conf
 ConditionHost=myhost
 ConditionVirtualization=no
 ConditionACPower=yes
+ConditionKernelModuleLoaded=!drm
 "#;
         let unit = parse_unit("myapp.service", content).unwrap();
         assert_eq!(unit.unit.condition_path_exists, vec!["/etc/myapp.conf"]);
@@ -1792,6 +1866,7 @@ ConditionACPower=yes
         assert_eq!(unit.unit.condition_host, vec!["myhost"]);
         assert_eq!(unit.unit.condition_virtualization, vec!["no"]);
         assert_eq!(unit.unit.condition_ac_power, vec!["yes"]);
+        assert_eq!(unit.unit.condition_kernel_module_loaded, vec!["!drm"]);
     }
 
     #[test]
@@ -2294,5 +2369,30 @@ AllowedCPUs=0-3
         let unit = parse_unit("cond.service", content).unwrap();
         assert_eq!(unit.unit.condition_path_exists, vec!["/a", "/b"]);
         assert_eq!(unit.unit.condition_virtualization, vec!["kvm"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sockets= (socket activation)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sockets_parsed_from_service_section() {
+        let content = "[Service]\nSockets=systemd-journald.socket systemd-journald-dev-log.socket\n";
+        let unit = parse_unit("journald.service", content).unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.sockets.len(), 2);
+        assert!(svc.sockets.contains(&"systemd-journald.socket".to_string()));
+        assert!(
+            svc.sockets
+                .contains(&"systemd-journald-dev-log.socket".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sockets_empty_when_not_set() {
+        let content = "[Service]\nExecStart=/bin/echo hello\n";
+        let unit = parse_unit("simple.service", content).unwrap();
+        let svc = unit.service.unwrap();
+        assert!(svc.sockets.is_empty());
     }
 }

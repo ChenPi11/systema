@@ -226,6 +226,7 @@ pub struct SocketConfig {
     pub listen_stream: Vec<String>,
     pub listen_datagram: Vec<String>,
     pub listen_fifo: Vec<String>,
+    pub listen_netlink: Vec<String>,
     pub accept: bool,
     pub socket_mode: String,
     pub socket_user: String,

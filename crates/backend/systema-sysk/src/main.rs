@@ -1,3 +1,4 @@
+mod activation;
 mod controller;
 mod ipc;
 mod socket;
