@@ -17,7 +17,6 @@ use sysa::finder::UnitFinder;
 use sysa::paths;
 use systema_sysf::ir::UnitIR;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "systema-sysf", about = "System F — System Finder Worker")]
@@ -81,9 +80,8 @@ async fn main() -> Result<()> {
         Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
-    tracing_subscriber::fmt()
-        .with_env_filter(log_level.parse::<EnvFilter>()?)
-        .init();
+    // Self-managed logging: <log-dir>/<name>.log, or stderr for "-".
+    sysa::logging::init(sysa::paths::instance().log_dir, "systema-sysf", log_level);
 
     match args.command {
         Some(Command::Commit) => run_commit(&args.name).await,

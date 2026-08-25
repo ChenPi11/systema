@@ -17,6 +17,9 @@ pub struct Paths {
     /// `systemd/system` under this path on startup so that units can
     /// reference `/run/systemd/system`.
     pub runstatedir: &'static str,
+    /// Base directory for log files (e.g. `/var/log`).  SysAInit writes its
+    /// own log and the per-worker logs (`systema-sysa.log`, ...) here.
+    pub log_dir: &'static str,
     pub unit_search_paths: Vec<String>,
     pub generator_search_paths: Vec<String>,
     /// Search paths for System F finder executables.  The `systema-sysf`
@@ -64,6 +67,7 @@ fn compute_paths() -> Paths {
         ),
         locale_dir: resolve("SYSTEMA_LOCALE_DIR", builtin::LOCALE_DIR),
         runstatedir: resolve("SYSTEMA_RUNSTATEDIR", builtin::RUNSTATEDIR),
+        log_dir: resolve("SYSTEMA_LOG_DIR", builtin::LOG_DIR),
         unit_search_paths: resolve_list("SYSTEMA_UNIT_PATH", builtin::UNIT_SEARCH_PATHS),
         generator_search_paths: resolve_list(
             "SYSTEMA_GENERATOR_PATH",

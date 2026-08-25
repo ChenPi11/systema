@@ -16,7 +16,6 @@ mod state;
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "systema-sysc", about = "System C — System Cron/Timer Worker")]
@@ -52,9 +51,8 @@ async fn main() -> Result<()> {
         Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
-    tracing_subscriber::fmt()
-        .with_env_filter(log_level.parse::<EnvFilter>()?)
-        .init();
+    // Self-managed logging: <log-dir>/<name>.log, or stderr for "-".
+    sysa::logging::init(sysa::paths::instance().log_dir, "systema-sysc", log_level);
 
     info!("System C (System Cron/Timer Worker) starting up");
 

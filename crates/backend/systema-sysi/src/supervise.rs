@@ -217,6 +217,7 @@ fn spawn_process(
     debug: bool,
     log_level: &str,
     log_dir: &std::path::Path,
+    extra_flags: &HashMap<&'static str, Vec<String>>,
 ) -> Option<i32> {
     let mut cmd = std::process::Command::new(&rp.path);
     if debug {
@@ -225,35 +226,45 @@ fn spawn_process(
         cmd.arg("--log-level").arg(log_level);
     }
     cmd.args(rp.spec.args);
+    if let Some(flags) = extra_flags.get(rp.spec.name) {
+        cmd.args(flags);
+    }
 
-    // Per-process log file: <log_dir>/<binary>.log (e.g. systema-syss.log).
-    // On failure fall back to inheriting SysAInit's stderr.
-    let log_path = log_dir.join(format!("{}.log", rp.spec.binary));
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(file) => {
-            let stdout = file.try_clone().ok();
-            cmd.stdout(std::process::Stdio::from(file));
-            cmd.stderr(match stdout {
-                Some(f) => std::process::Stdio::from(f),
-                None => std::process::Stdio::inherit(),
-            });
-            info!(
-                "Redirecting {} logs to {}",
-                rp.spec.name,
-                log_path.display()
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Cannot open log file {} ({}); {} inherits stderr",
-                log_path.display(),
-                e,
-                rp.spec.name
-            );
+    // Workers resolve SYSTEMA_LOG_DIR themselves ("-" means stderr) and
+    // write tracing output into <log-dir>/<binary>.log.  SysAInit only
+    // redirects the inherited stdio for pre-logging output; with "-" there
+    // is nothing to redirect.
+    let log_dir_str = log_dir.to_string_lossy().into_owned();
+    cmd.env("SYSTEMA_LOG_DIR", &log_dir_str);
+
+    if log_dir_str != "-" {
+        let log_path = log_dir.join(format!("{}.log", rp.spec.binary));
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(file) => {
+                let stdout = file.try_clone().ok();
+                cmd.stdout(std::process::Stdio::from(file));
+                cmd.stderr(match stdout {
+                    Some(f) => std::process::Stdio::from(f),
+                    None => std::process::Stdio::inherit(),
+                });
+                info!(
+                    "Redirecting {} logs to {}",
+                    rp.spec.name,
+                    log_path.display()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot open log file {} ({}); {} inherits stderr",
+                    log_path.display(),
+                    e,
+                    rp.spec.name
+                );
+            }
         }
     }
 
@@ -501,6 +512,7 @@ pub async fn run(
     grace: Duration,
     ready_timeout: Duration,
     log_dir: &std::path::Path,
+    extra_flags: &HashMap<&'static str, Vec<String>>,
 ) -> Result<i32> {
     // Partition the resolved set: the allocator (System A), the one-shot
     // finder chain, and the long-running workers.
@@ -569,7 +581,7 @@ pub async fn run(
 
     // --- Phase 1: System A, then wait for MANAGER_READY. ---
     let code = if let Some(rp) = allocator_specs.first() {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
+        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir, extra_flags) {
             Some(shutdown(&procs, code, grace).await)
         } else {
             wait_ready(
@@ -596,7 +608,7 @@ pub async fn run(
 
     // --- Phase 2: workers, serially, each gated on WORKER_READY. ---
     for rp in &workers {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
+        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir, extra_flags) {
             let code = shutdown(&procs, code, grace).await;
             let _ = std::fs::remove_file(&sock_path);
             drop(notify_thread);
@@ -630,7 +642,7 @@ pub async fn run(
     // Finders must complete after all workers are registered so that
     // the committed unit set is fully available for the control phase.
     for rp in &one_shots {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir) {
+        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir, extra_flags) {
             let code = shutdown(&procs, code, grace).await;
             let _ = std::fs::remove_file(&sock_path);
             drop(notify_thread);

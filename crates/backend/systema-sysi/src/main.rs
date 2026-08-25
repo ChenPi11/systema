@@ -25,10 +25,10 @@ mod workers;
 
 use anyhow::{bail, Result};
 use clap::Parser;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "systema-sysi", about = "SysAInit — System Alphabet init")]
@@ -78,32 +78,149 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "/var/log",
         help = "Directory for per-process log files (systema-sysa.log, systema-syss.log, ...)"
     )]
     log_dir: PathBuf,
+
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Extra flags for every worker; --<name>-flags / SYSTEMA_SYS*_FLAGS take precedence"
+    )]
+    worker_flags: Option<String>,
+
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System A only")]
+    sysa_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System S only")]
+    syss_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System E only")]
+    syse_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System T only")]
+    syst_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System C only")]
+    sysc_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System K only")]
+    sysk_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System P only")]
+    sysp_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System D only")]
+    sysd_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System R only")]
+    sysr_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System M only")]
+    sysm_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System F only")]
+    sysf_flags: Option<String>,
+}
+
+/// Canonical short names of every supervised worker (must mirror
+/// [`workers::default_workers`] + the finder chain).
+const WORKER_SHORT_NAMES: &[&str] = &[
+    "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm", "sysf",
+];
+
+impl Args {
+    fn specific_flags(&self, name: &str) -> Option<&String> {
+        Some(match name {
+            "sysa" => self.sysa_flags.as_ref()?,
+            "syss" => self.syss_flags.as_ref()?,
+            "syse" => self.syse_flags.as_ref()?,
+            "syst" => self.syst_flags.as_ref()?,
+            "sysc" => self.sysc_flags.as_ref()?,
+            "sysk" => self.sysk_flags.as_ref()?,
+            "sysp" => self.sysp_flags.as_ref()?,
+            "sysd" => self.sysd_flags.as_ref()?,
+            "sysr" => self.sysr_flags.as_ref()?,
+            "sysm" => self.sysm_flags.as_ref()?,
+            "sysf" => self.sysf_flags.as_ref()?,
+            _ => return None,
+        })
+    }
+}
+
+/// Per-worker environment override (`SYSTEMA_SYSA_FLAGS`, ...);
+/// `"workers"` maps to the global `SYSTEMA_WORKERS_FLAGS`.
+fn env_flags(name: &str) -> Option<String> {
+    std::env::var(format!("SYSTEMA_{}_FLAGS", name.to_uppercase()))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Resolve the effective extra flags for one worker.  Precedence:
+/// `--<name>-flags` > `SYSTEMA_SYS<NAME>_FLAGS` > `--worker-flags` >
+/// `SYSTEMA_WORKERS_FLAGS`.
+fn resolve_flags(args: &Args, name: &str) -> Vec<String> {
+    args.specific_flags(name)
+        .cloned()
+        .or_else(|| env_flags(name))
+        .or_else(|| args.worker_flags.clone())
+        .or_else(|| env_flags("workers"))
+        .map(|raw| split_flags(&raw))
+        .unwrap_or_default()
+}
+
+/// Split a shell-like flag string on whitespace, honouring single/double
+/// quotes and backslash escapes so values may contain spaces.
+fn split_flags(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut has_token = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                has_token = true;
+                for c2 in chars.by_ref() {
+                    if c2 == '\'' {
+                        break;
+                    }
+                    cur.push(c2);
+                }
+            }
+            '"' => {
+                has_token = true;
+                while let Some(c2) = chars.next() {
+                    match c2 {
+                        '"' => break,
+                        '\\' => match chars.peek() {
+                            Some(&n) if matches!(n, '"' | '\\' | '$' | '`') => {
+                                cur.push(n);
+                                chars.next();
+                            }
+                            _ => cur.push('\\'),
+                        },
+                        _ => cur.push(c2),
+                    }
+                }
+            }
+            '\\' => {
+                has_token = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if has_token {
+                    out.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            _ => {
+                has_token = true;
+                cur.push(c);
+            }
+        }
+    }
+    if has_token {
+        out.push(cur);
+    }
+    out
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     sysa::paths::init();
     sysa::l10n::init();
-
-    // Like systemd's `mount_setup()`, SysAInit mounts the API filesystems
-    // itself before anything else starts.  Skipped without mount
-    // privileges (rootless), and never fatal: resource control degrades
-    // to the no-op controller when cgroup2 is unavailable, and Wayland
-    // compositors fall back when /dev/shm is missing (they abort, but the
-    // boot continues).
-    if let Err(e) = mount_setup::mount_cgroup2() {
-        warn!("cgroup2 mount failed; resource control will degrade: {e:#}");
-    }
-    if let Err(e) = mount_setup::mount_dev_shm() {
-        warn!("/dev/shm mount failed; POSIX shared memory unavailable: {e:#}");
-    }
-    if let Err(e) = mount_setup::mount_dev_pts() {
-        warn!("/dev/pts mount failed; pseudo-terminals unavailable: {e:#}");
-    }
 
     let args = {
         use clap::{CommandFactory, FromArgMatches};
@@ -149,15 +266,45 @@ async fn main() -> Result<()> {
                 a.help(sysa::l10n::t_(
                     "Directory for per-process log files (systema-sysa.log, ...).",
                 ))
+                .default_value(sysa::paths::instance().log_dir)
+            })
+            .mut_arg("worker_flags", |a| {
+                a.help(sysa::l10n::t_(
+                    "Extra flags for every worker; --<name>-flags / SYSTEMA_SYS*_FLAGS take precedence.",
+                ))
             });
+        let cmd = WORKER_SHORT_NAMES.iter().fold(cmd, |cmd, name| {
+            cmd.mut_arg(format!("{name}_flags"), |a| {
+                a.help(sysa::l10n::t_(
+                    "Extra flags for this worker only (overrides --worker-flags).",
+                ))
+            })
+        });
         Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(log_level.parse::<EnvFilter>()?)
-        .init();
-    info!("Logging to stderr");
+    // SysAInit's own log: <log-dir>/systema-sysi.log, stderr for "-".
+    // Workers resolve SYSTEMA_LOG_DIR the same way (see logging module).
+    let log_dir_str = args.log_dir.to_string_lossy().into_owned();
+    sysa::logging::init(&log_dir_str, "systema-sysi", log_level);
+    info!("SysAInit starting (PID {})", std::process::id());
+
+    // Like systemd's `mount_setup()`, SysAInit mounts the API filesystems
+    // itself before anything else starts.  Skipped without mount
+    // privileges (rootless), and never fatal: resource control degrades
+    // to the no-op controller when cgroup2 is unavailable, and Wayland
+    // compositors fall back when /dev/shm is missing (they abort, but the
+    // boot continues).  Runs after logging is set up so failures land in
+    // the log file.
+    if let Err(e) = mount_setup::mount_cgroup2() {
+        warn!("cgroup2 mount failed; resource control will degrade: {e:#}");
+    }
+    if let Err(e) = mount_setup::mount_dev_shm() {
+        warn!("/dev/shm mount failed; POSIX shared memory unavailable: {e:#}");
+    }
+    if let Err(e) = mount_setup::mount_dev_pts() {
+        warn!("/dev/pts mount failed; pseudo-terminals unavailable: {e:#}");
+    }
 
     if std::process::id() == 1 {
         info!("SysAInit running as PID 1 (reaping orphaned processes)");
@@ -194,6 +341,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Per-worker extra flags, resolved once (arg > env precedence).
+    let extra_flags: HashMap<&'static str, Vec<String>> = WORKER_SHORT_NAMES
+        .iter()
+        .map(|name| (*name, resolve_flags(&args, name)))
+        .filter(|(_, flags)| !flags.is_empty())
+        .collect();
+    for (name, flags) in &extra_flags {
+        info!("Extra flags for {name}: {}", flags.join(" "));
+    }
+
     let code = supervise::run(
         &resolved,
         args.debug,
@@ -201,7 +358,77 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.shutdown_timeout),
         Duration::from_secs(args.ready_timeout),
         &args.log_dir,
+        &extra_flags,
     )
     .await?;
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_flags_whitespace() {
+        assert_eq!(split_flags("--foo --bar=1"), vec!["--foo", "--bar=1"]);
+        assert_eq!(split_flags("  a   b  "), vec!["a", "b"]);
+        assert_eq!(split_flags(""), Vec::<String>::new());
+        assert_eq!(split_flags("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_flags_quotes_and_escapes() {
+        assert_eq!(split_flags("--x 'a b'"), vec!["--x", "a b"]);
+        assert_eq!(split_flags("\"a\\\"b\" c"), vec!["a\"b", "c"]);
+        assert_eq!(split_flags(r"a\ b"), vec!["a b"]);
+        // Empty quoted argument is preserved.
+        assert_eq!(split_flags("'' x"), vec!["", "x"]);
+    }
+
+    #[test]
+    fn resolve_flags_precedence_specific_over_global() {
+        let args = Args::parse_from([
+            "systema-sysi",
+            "--log-dir",
+            "-",
+            "--worker-flags",
+            "--global",
+            "--syss-flags",
+            "--specific",
+        ]);
+        assert_eq!(resolve_flags(&args, "syss"), vec!["--specific"]);
+        assert_eq!(resolve_flags(&args, "sysk"), vec!["--global"]);
+    }
+
+    #[test]
+    fn resolve_flags_env_fallbacks() {
+        std::env::set_var("SYSTEMA_SYSA_FLAGS", "--env-specific");
+        std::env::set_var("SYSTEMA_WORKERS_FLAGS", "--env-global");
+        let args = Args::parse_from(["systema-sysi", "--log-dir", "-"]);
+        // Specific env beats global env; unrelated workers get the global one.
+        assert_eq!(resolve_flags(&args, "sysa"), vec!["--env-specific"]);
+        assert_eq!(resolve_flags(&args, "syst"), vec!["--env-global"]);
+        std::env::remove_var("SYSTEMA_SYSA_FLAGS");
+        std::env::remove_var("SYSTEMA_WORKERS_FLAGS");
+    }
+
+    #[test]
+    fn resolve_flags_arg_beats_env() {
+        std::env::set_var("SYSTEMA_SYSK_FLAGS", "--from-env");
+        let args = Args::parse_from([
+            "systema-sysi",
+            "--log-dir",
+            "-",
+            "--sysk-flags",
+            "--from-arg",
+        ]);
+        assert_eq!(resolve_flags(&args, "sysk"), vec!["--from-arg"]);
+        std::env::remove_var("SYSTEMA_SYSK_FLAGS");
+    }
+
+    #[test]
+    fn resolve_flags_none_by_default() {
+        let args = Args::parse_from(["systema-sysi", "--log-dir", "-"]);
+        assert!(resolve_flags(&args, "sysd").is_empty());
+    }
 }

@@ -73,6 +73,8 @@ pub const LOCALE_DIR: &str = "/usr/share/locale";
 
 pub const RUNSTATEDIR: &str = "/run";
 
+pub const LOG_DIR: &str = "/var/log";
+
 pub const UNIT_SEARCH_PATHS: &[&str] = &[
     "/etc/system-alphabet",
     "/run/system-alphabet",
