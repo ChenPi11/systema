@@ -393,6 +393,11 @@ pub struct AllocatorState {
     /// count is forwarded to System R (`user.sessions`) on every change so
     /// the user's `user-<UID>.slice` follows its sessions.
     pub user_sessions: HashMap<u32, HashSet<String>>,
+
+    /// Channel to the [`ReloadTask`](crate::reload_task) for enqueuing
+    /// reload requests.  Set by `main` after spawning the task; `None`
+    /// before initialisation.
+    pub reload_tx: Option<tokio::sync::mpsc::Sender<crate::reload_task::ReloadRequest>>,
 }
 
 impl AllocatorState {
@@ -420,6 +425,7 @@ impl AllocatorState {
             unit_owners: HashMap::new(),
             cgroup_metrics: HashMap::new(),
             user_sessions: HashMap::new(),
+            reload_tx: None,
         };
         state.ensure_root_slice();
         state

@@ -19,12 +19,12 @@ use sysa::controller::UnitStatus;
 use sysa::event_bus::Event;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
-    AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope,
-    EventSubscribe, EventUnsubscribe, ListUnitsRequest, ListUnitsResult, MethodResult, PathFired,
-    RegisterAck, RegisterUnits, StagingAreaEntry, StagingQuery, StagingQueryResult,
-    StartUnitsRequest, StartUnitsResult, StopUnitsRequest, StopUnitsResult, TimerFired,
-    UnitDefineResult, UnitInfo, UnitRegistrationAck, UnitStartResult, UnitStateUpdate,
-    UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, DaemonReloadRequest,
+    DaemonReloadResult, Envelope, EventSubscribe, EventUnsubscribe, ListUnitsRequest,
+    ListUnitsResult, MethodResult, PathFired, RegisterAck, RegisterUnits, StagingAreaEntry,
+    StagingQuery, StagingQueryResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest,
+    StopUnitsResult, TimerFired, UnitDefineResult, UnitInfo, UnitRegistrationAck, UnitStartResult,
+    UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
@@ -276,9 +276,12 @@ async fn handle_worker(
             handle_manager_start_units(framed, env, allocator, client_uid).await
         }
         "manager.stop_units" => handle_manager_stop_units(framed, env, allocator, client_uid).await,
+        "manager.daemon_reload" => {
+            handle_manager_daemon_reload(framed, env, allocator, client_uid).await
+        }
         other => {
             anyhow::bail!(sysa::l10n::fmt(
-                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', 'manager.list_units', 'manager.start_units', or 'manager.stop_units', got '{method}'"),
+                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', 'manager.list_units', 'manager.start_units', 'manager.stop_units', or 'manager.daemon_reload', got '{method}'"),
                 &[("method", other)],
             ))
         }
@@ -1170,6 +1173,17 @@ async fn try_finder_commit(
             }
         }
     };
+    // Boot-time units reach System A exclusively through staging commits,
+    // which historically skipped `unit_add_default_dependencies()`: services
+    // then lacked the implicit Requires+After=sysinit.target edge, so e.g.
+    // systemd-user-sessions.service could race systemd-tmpfiles-setup.service
+    // (the /run/nologin bug).  Enqueue a FromCommit request so the
+    // ReloadTask applies default dependencies and syncs workers; the pass
+    // is idempotent (set inserts).
+    if let Some(tx) = allocator.read().reload_tx.as_ref() {
+        let _ = tx
+            .try_send(crate::reload_task::ReloadRequest::FromCommit);
+    }
 
     // Register D-Bus objects synchronously so the commit does not return
     // until System A is fully ready to serve the registered units.
@@ -1523,6 +1537,79 @@ async fn handle_manager_stop_units(
         result,
     )?;
     send_envelope(&mut framed, &reply).await?;
+    Ok(())
+}
+
+/// `manager.daemon_reload` — trigger a full unit-file rescan via System F.
+///
+/// This is the IPC equivalent of `systemctl daemon-reload`.  SysAInit
+/// calls this once after all workers are registered to perform the
+/// initial unit discovery (replacing the old one-shot Finder chain).
+async fn handle_manager_daemon_reload(
+    mut framed: sysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<()> {
+    let _req = DaemonReloadRequest::decode(env.payload.as_slice())?;
+    info!(
+        "Control request from UID={client_uid}: manager.daemon_reload"
+    );
+
+    let tx = {
+        let state = allocator.read();
+        state.reload_tx.clone()
+    };
+    let Some(tx) = tx else {
+        warn!("manager.daemon_reload: ReloadTask not yet running");
+        let reply = make_envelope(
+            next_request_id(),
+            "system-a",
+            "",
+            "manager.daemon_reload.result",
+            DaemonReloadResult {
+                success: false,
+                message: "ReloadTask not running".into(),
+            },
+        )?;
+        send_envelope(&mut framed, &reply).await?;
+        return Ok(());
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(crate::reload_task::ReloadRequest::ByTrigger(reply_tx))
+        .await
+        .is_err()
+    {
+        warn!("manager.daemon_reload: ReloadTask channel closed");
+        let reply = make_envelope(
+            next_request_id(),
+            "system-a",
+            "",
+            "manager.daemon_reload.result",
+            DaemonReloadResult {
+                success: false,
+                message: "ReloadTask channel closed".into(),
+            },
+        )?;
+        send_envelope(&mut framed, &reply).await?;
+        return Ok(());
+    }
+    let _ = reply_rx.await;
+
+    let reply = make_envelope(
+        next_request_id(),
+        "system-a",
+        "",
+        "manager.daemon_reload.result",
+        DaemonReloadResult {
+            success: true,
+            message: String::new(),
+        },
+    )?;
+    send_envelope(&mut framed, &reply).await?;
+    info!("manager.daemon_reload: complete");
     Ok(())
 }
 

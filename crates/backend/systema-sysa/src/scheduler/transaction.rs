@@ -2207,6 +2207,67 @@ mod tests {
         assert_eq!(names(&s), vec!["b.service"]);
     }
 
+    /// Reproduction of the /run/nologin boot race seen on the VM
+    /// (2026-08-25): `systemd-tmpfiles-setup.service` (`f+! /run/nologin`)
+    /// and `systemd-user-sessions.service` (`rm -f /run/nologin`) were both
+    /// planned as anchors of the flat start_units transaction.  Without the
+    /// DefaultDependencies injection (After=sysinit.target) there is no
+    /// ordering edge between them, so the planner may run them concurrently
+    /// and tmpfiles can re-create /run/nologin after user-sessions removed
+    /// it.  With the injection (as real systemd guarantees) sysinit.target
+    /// is pulled in and orders tmpfiles-setup before user-sessions.
+    #[test]
+    fn nologin_race_requires_default_dependencies() {
+        // Real unit graph on the VM rootfs.
+        let tmpfiles = with_after(
+            with_before(make_unit("systemd-tmpfiles-setup.service"), &["sysinit.target"]),
+            &["local-fs.target", "systemd-sysusers.service", "systemd-journald.service"],
+        );
+        let user_sessions = with_after(
+            make_unit("systemd-user-sessions.service"),
+            &["remote-fs.target", "nss-user-lookup.target", "network.target", "home.mount"],
+        );
+        let sysinit = make_unit("sysinit.target");
+        let remote_fs = make_unit("remote-fs.target");
+
+        // Without injection: no edge between the two anchors -> no ordering
+        // guarantee (this mirrors what the VM actually ran).
+        let units = map(vec![tmpfiles.clone(), user_sessions.clone(), sysinit.clone(), remote_fs]);
+        let s = steps_multi(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[
+                ("systemd-tmpfiles-setup.service", Start),
+                ("systemd-user-sessions.service", Start),
+            ],
+            Replace,
+        );
+        assert_eq!(names(&s).len(), 2, "no pull-in without Requires: {:?}", names(&s));
+
+        // With injection: user-sessions gains Requires+After=sysinit.target,
+        // tmpfiles keeps Before=sysinit.target -> strict ordering via sysinit.
+        let injected = with_requires(with_after(user_sessions, &["sysinit.target"]), &["sysinit.target"]);
+        let units = map(vec![tmpfiles, injected, sysinit, make_unit("local-fs.target"), make_unit("systemd-journald.service")]);
+        let s = steps_multi(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[
+                ("systemd-tmpfiles-setup.service", Start),
+                ("systemd-user-sessions.service", Start),
+            ],
+            Replace,
+        );
+        let n = names(&s);
+        assert!(n.contains(&"sysinit.target"), "sysinit pulled in: {:?}", n);
+        let pos = |u: &str| n.iter().position(|&x| x == u).unwrap_or_else(|| panic!("{u} not in plan {n:?}"));
+        assert!(
+            pos("systemd-tmpfiles-setup.service") < pos("systemd-user-sessions.service"),
+            "tmpfiles must complete before user-sessions: {n:?}",
+        );
+    }
+
     /// Two roots that share a dependency: the dependency appears once and
     /// is ordered before both roots via After=.
     #[test]

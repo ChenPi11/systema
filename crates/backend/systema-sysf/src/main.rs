@@ -16,6 +16,7 @@ use clap::Parser;
 use sysa::finder::UnitFinder;
 use sysa::paths;
 use systema_sysf::ir::UnitIR;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
@@ -49,6 +50,8 @@ enum Command {
     Commit,
     /// Query the current UID-bound staging area contents
     Query,
+    /// Listen for reload notifications from System A and re-run finders
+    DaemonReload,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -76,6 +79,11 @@ async fn main() -> Result<()> {
             })
             .mut_subcommand("query", |cmd| {
                 cmd.about(sysa::l10n::t_("Query the UID-bound staging area."))
+            })
+            .mut_subcommand("daemon-reload", |cmd| {
+                cmd.about(sysa::l10n::t_(
+                    "Listen for reload notifications from System A.",
+                ))
             });
         Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
@@ -86,6 +94,7 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::Commit) => run_commit(&args.name).await,
         Some(Command::Query) => run_query(&args.name).await,
+        Some(Command::DaemonReload) => run_daemon_reload(&args.name).await,
         None => run_finders(&args.name).await,
     }
 }
@@ -226,4 +235,97 @@ async fn run_query(name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Daemon-reload listener: bind a Unix socket and wait for System A to
+/// trigger a re-scan.
+///
+/// # Unix-socket protocol
+///
+/// ```text
+/// System A connects → writes [1u8] → System F runs finders → System F writes [1u8] ack
+/// ```
+///
+/// The socket file lives in `/run` (tmpfs) and is removed when this
+/// function returns (on SIGTERM / signal-driven shutdown from SysI).
+async fn run_daemon_reload(name: &str) -> Result<()> {
+    let socket_path = paths::instance().reload_socket;
+    let socket_path_owned = std::path::PathBuf::from(socket_path);
+
+    // Ensure the parent directory exists.
+    if let Some(parent) = socket_path_owned.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("Failed to create socket directory {path}."),
+                &[("path", &parent.display().to_string())],
+            )
+        })?;
+    }
+
+    // Remove any stale socket file from a previous run.
+    let _ = std::fs::remove_file(&socket_path_owned);
+
+    let listener = tokio::net::UnixListener::bind(&socket_path_owned).with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Failed to bind reload socket {path}."),
+            &[("path", &socket_path_owned.display().to_string())],
+        )
+    })?;
+    info!("System F daemon-reload listening on {}", socket_path_owned.display());
+
+    // The result of the loop is the exit code; clean up the socket on return.
+    let result = run_daemon_reload_loop(&listener, name).await;
+    let _ = std::fs::remove_file(&socket_path_owned);
+    info!("Reload socket cleaned up: {}", socket_path_owned.display());
+    result
+}
+
+/// Inner loop: accept connections, process triggers, send acks.
+async fn run_daemon_reload_loop(
+    listener: &tokio::net::UnixListener,
+    name: &str,
+) -> Result<()> {
+    loop {
+        let (mut stream, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("Reload socket accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        info!("System A connected from {:?}", addr);
+
+        let mut buf = [0u8; 1];
+        match stream.read_exact(&mut buf).await {
+            Ok(_n) if buf[0] == 1 => {
+                info!("Reload trigger received; running finders (name='{name}')");
+            }
+            Ok(_n) => {
+                warn!("Unexpected trigger byte {:?}; ignoring", buf[0]);
+                continue;
+            }
+            Err(e) => {
+                warn!("Failed to read trigger from System A: {e}");
+                continue;
+            }
+        }
+
+        // Run all finders and commit the staging area.
+        match run_finders(name).await {
+            Ok(()) => {
+                // Send ack byte back to System A.
+                if let Err(e) = stream.write_all(&[1u8]).await {
+                    warn!("Failed to send ack to System A: {e}");
+                } else {
+                    info!("Reload complete; ack sent");
+                }
+            }
+            Err(e) => {
+                error!("Finder reload failed: {e}");
+                // Send error ack (value 0).
+                let _ = stream.write_all(&[0u8]).await;
+            }
+        }
+    }
 }

@@ -11,6 +11,7 @@ mod dbus;
 mod event;
 mod graph;
 mod ipc;
+mod reload_task;
 mod scheduler;
 mod state;
 mod unit;
@@ -68,6 +69,15 @@ async fn main() -> Result<()> {
 
     // Shared allocator state accessible from both the IPC server and D-Bus server.
     let allocator = state::Allocator::handle();
+
+    // Spawn the ReloadTask: serialises all finder-commit and D-Bus Reload
+    // operations through a single consumer.  System A never scans unit
+    // files directly.
+    let (reload_tx, _reload_handle) = reload_task::ReloadTask::spawn(allocator.clone());
+    {
+        let mut state = allocator.write();
+        state.reload_tx = Some(reload_tx);
+    }
 
     // Register in-process event-bus subscribers.
     {

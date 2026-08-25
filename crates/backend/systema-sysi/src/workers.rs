@@ -28,7 +28,7 @@ pub struct WorkerSpec {
     pub kind: ProcessKind,
     /// Only spawned on Linux (platform-gated binaries).
     pub linux_only: bool,
-    /// Extra command-line arguments (e.g. the finder's `commit` step).
+    /// Extra command-line arguments.
     pub args: &'static [&'static str],
 }
 
@@ -47,17 +47,6 @@ impl WorkerSpec {
             kind,
             linux_only,
             args: &[],
-        }
-    }
-
-    fn with_args(name: &'static str, binary: &'static str, args: &'static [&'static str]) -> Self {
-        Self {
-            name,
-            binary,
-            worker_id: None,
-            kind: ProcessKind::OneShot,
-            linux_only: false,
-            args,
         }
     }
 }
@@ -141,16 +130,6 @@ fn default_workers() -> Vec<WorkerSpec> {
     ]
 }
 
-/// The one-shot finder chain (System F).
-///
-/// System F is not a daemon: `systema-sysf` scans the finder search paths
-/// for finder executables (e.g. `systema-sysf.systemd`), runs them all
-/// concurrently to stage their units, then commits the staging area.
-/// The whole chain is one-shot and always run.
-fn finder_chain() -> Vec<WorkerSpec> {
-    vec![WorkerSpec::with_args("sysf", "systema-sysf", &[])]
-}
-
 /// Platform abstraction so tests can simulate non-Linux hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -182,8 +161,7 @@ pub fn build_worker_set_for(
     platform: Platform,
     skip: &[String],
 ) -> anyhow::Result<Vec<WorkerSpec>> {
-    let mut all: Vec<WorkerSpec> = default_workers();
-    all.extend(finder_chain());
+    let all: Vec<WorkerSpec> = default_workers();
 
     let mut retained: Vec<WorkerSpec> = Vec::with_capacity(all.len());
     for spec in all {
@@ -202,7 +180,6 @@ pub fn build_worker_set_for(
     if let Some(unknown) = skip.iter().find(|s| {
         !default_workers()
             .iter()
-            .chain(finder_chain().iter())
             .any(|spec| s.as_str() == spec.name || s.as_str() == spec.binary)
     }) {
         anyhow::bail!("unknown worker name '{unknown}'");
@@ -304,12 +281,10 @@ mod tests {
         let set = build_worker_set_for(Platform::Linux, &[]).unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm", "sysf"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm"]
         );
-        assert_eq!(set.len(), 11);
-        assert!(set.iter().take(10).all(|s| s.kind == ProcessKind::LongRunning));
-        assert_eq!(set[10].binary, "systema-sysf");
-        assert!(set[10].kind == ProcessKind::OneShot);
+        assert_eq!(set.len(), 10);
+        assert!(set.iter().all(|s| s.kind == ProcessKind::LongRunning));
     }
 
     #[test]
@@ -317,7 +292,7 @@ mod tests {
         let set = build_worker_set_for(Platform::Other, &[]).unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysf"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr"]
         );
     }
 
@@ -326,7 +301,7 @@ mod tests {
         let set = build_worker_set_for(Platform::Linux, &skip(&["sysd", "sysc"])).unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysk", "sysp", "sysr", "sysm", "sysf"]
+            vec!["sysa", "syss", "syse", "syst", "sysk", "sysp", "sysr", "sysm"]
         );
     }
 
@@ -339,7 +314,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysr", "sysf"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysr"]
         );
     }
 
@@ -350,9 +325,8 @@ mod tests {
     }
 
     #[test]
-    fn skipping_sysf_removes_the_whole_chain() {
-        let set = build_worker_set_for(Platform::Linux, &skip(&["sysf"])).unwrap();
-        assert_eq!(set.len(), 10);
+    fn sysf_not_in_worker_set() {
+        let set = build_worker_set_for(Platform::Linux, &[]).unwrap();
         assert!(!names(&set).contains(&"sysf"));
     }
 
@@ -414,7 +388,7 @@ mod tests {
         let (resolved, missing) = resolve_set(&set, Some(&dir));
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].spec.name, "sysa");
-        assert_eq!(missing.len(), 10);
+        assert_eq!(missing.len(), 9);
         assert!(missing.iter().any(|m| m.name == "syss"));
         let _ = fs::remove_dir_all(&dir);
     }

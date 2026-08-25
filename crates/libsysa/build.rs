@@ -104,6 +104,8 @@ pub const FINDER_SEARCH_PATHS: &[&str] = &[
     "/opt/systema/finder",
 ];
 
+pub const RELOAD_SOCKET: &str = "/run/system-alphabet/sysf.sock";
+
 pub const SYSTEMA_BIN_SEARCH_PATHS: &[&str] = &[
     "/",
     "/bin",

@@ -36,6 +36,10 @@ const TARGET_TIME_SYNC: &str = "time-sync.target";
 const TARGET_TIME_SET: &str = "time-set.target";
 
 /// Load all unit files from the default search paths into the allocator.
+///
+/// This is the direct-scan path, now superseded by the ReloadTask pipeline
+/// for runtime reloads.  Kept for test scaffolding and future use.
+#[allow(dead_code)]
 pub async fn load_default_units(allocator: AllocatorHandle) -> Result<()> {
     let paths: Vec<PathBuf> = sysa::paths::instance()
         .unit_search_paths

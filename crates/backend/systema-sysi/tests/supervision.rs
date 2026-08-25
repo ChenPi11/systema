@@ -26,7 +26,8 @@ use nix::unistd::Pid;
 use prost::Message;
 
 use sysa::proto::{
-    Envelope, ListUnitsResult, StartUnitsRequest, StartUnitsResult, UnitInfo, UnitStartResult,
+    DaemonReloadResult, Envelope, ListUnitsResult, StartUnitsRequest, StartUnitsResult, UnitInfo,
+    UnitStartResult,
 };
 
 /// Long-running shim: exits 0 on SIGTERM, otherwise sleeps forever.
@@ -232,6 +233,19 @@ fn fake_allocator(notify_dir: &Path, canned: Vec<UnitInfo>, sent: Arc<Mutex<Vec<
                     break;
                 };
                 let reply = match env.method.as_str() {
+                    "manager.daemon_reload" => {
+                        let result = DaemonReloadResult {
+                            success: true,
+                            message: String::new(),
+                        };
+                        Envelope {
+                            request_id: env.request_id,
+                            source: "system-a".to_string(),
+                            target: "system-sysi".to_string(),
+                            method: "manager.daemon_reload.result".to_string(),
+                            payload: result.encode_to_vec(),
+                        }
+                    }
                     "manager.list_units" => {
                         let mut units = canned.clone();
                         units.sort_by(|a, b| a.name.cmp(&b.name));

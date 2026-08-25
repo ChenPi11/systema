@@ -7,22 +7,13 @@
 //! 3. Spawn the workers **serially**: each worker is spawned, then
 //!    SysAInit waits for `WORKER_READY=<worker_id>` before spawning the
 //!    next one.
-//! 4. Spawn the one-shot finder chain and wait for each to exit.
-//!    Finders must complete after all workers are registered so that
-//!    the committed unit set is fully available for the control phase.
-//! 5. Control phase: ask System A to start the enabled units and
-//!    `default.target` (over the allocator IPC socket — no D-Bus needed).
-//! 6. Steady state: reap children, forward signals, and log notify events.
+//! 4. Control phase: call `daemon_reload` on System A (which spawns
+//!    System F to discover and commit unit files), then ask System A
+//!    to start the enabled units and `default.target`.
+//! 5. Steady state: reap children, forward signals, and log notify events.
 //!
-//! Supervision policy (deliberately minimal):
-//! - Processes are spawned once; there are no restarts.
-//! - A long-running process exiting on its own is fatal: SysAInit forwards
-//!   SIGTERM to the rest and exits with the dead process's exit code.
-//! - One-shot processes (the finder chain) may exit at any time.
-//! - Waiting for readiness is bounded by `ready_timeout`; on timeout
-//!   SysAInit logs an ERROR and exits with code 1.
-//! - SIGTERM/SIGINT initiate a graceful shutdown: SIGTERM to all children,
-//!   a grace period, then SIGKILL.
+//! The Finder (System F) is no longer a supervised process.  System A
+//! spawns it on-demand when a daemon-reload is requested (via IPC or D-Bus).
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixDatagram;
@@ -35,7 +26,10 @@ use nix::errno::Errno;
 use nix::sys::signal::{kill, signal, SigHandler, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use sysa::proto::{ListUnitsRequest, ListUnitsResult, StartUnitsRequest, StartUnitsResult};
+use sysa::proto::{
+    DaemonReloadRequest, DaemonReloadResult, ListUnitsRequest, ListUnitsResult, StartUnitsRequest,
+    StartUnitsResult,
+};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -353,60 +347,8 @@ async fn wait_ready(
 /// Returns `Ok(None)` when the process exits successfully (code 0),
 /// `Ok(Some(code))` when the caller must shut down (signal, other
 /// long-running child death, non-zero exit, or timeout).
-async fn wait_one_shot_exit(
-    ctx: &mut WaitCtx,
-    procs: &[Spawned],
-    grace: Duration,
-    ready_timeout: Duration,
-    pid: i32,
-    name: &str,
-) -> Result<Option<i32>> {
-    let deadline = tokio::time::Instant::now() + ready_timeout;
-    loop {
-        tokio::select! {
-            _ = ctx.terminate.recv() => {
-                info!("SIGTERM received; shutting down");
-                return Ok(Some(shutdown(procs, 0, grace).await));
-            }
-            _ = ctx.interrupt.recv() => {
-                info!("SIGINT received; shutting down");
-                return Ok(Some(shutdown(procs, 0, grace).await));
-            }
-            Some((reaped_pid, status)) = ctx.reaper_rx.recv() => {
-                if reaped_pid == pid {
-                    let code = status_code(&status);
-                    if code != 0 {
-                        error!(
-                            "One-shot {} (pid={pid}) exited with code {code}: {status:?}",
-                            name
-                        );
-                        return Ok(Some(code));
-                    }
-                    info!("One-shot {} (pid={pid}) exited successfully", name);
-                    return Ok(None);
-                }
-                if let Some(code) = handle_reaped(procs, reaped_pid, &status) {
-                    return Ok(Some(shutdown(procs, code, grace).await));
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                error!(
-                    "Timed out waiting for one-shot {} (pid={pid}) to exit after {ready_timeout:?}",
-                    name
-                );
-                return Ok(Some(1));
-            }
-        }
-    }
-}
-
-/// Phase 5 — the control plane: ask System A to start every enabled unit,
-/// plus `default.target` if it is not among them.
-///
-/// The exchange goes over the allocator IPC socket (`manager.list_units` /
-/// `manager.start_units`), so no D-Bus bus is required at boot.  Like the
-/// readiness waits this is fail-fast: any error or timeout is fatal
-/// (exit 1), because a boot that cannot start its units is a failed boot.
+/// Phase 3 — the control plane: call daemon-reload to discover unit files,
+/// then ask System A to start every enabled unit plus `default.target`.
 async fn control_phase(
     ctx: &mut WaitCtx,
     procs: &[Spawned],
@@ -421,6 +363,22 @@ async fn control_phase(
     let deadline = tokio::time::Instant::now() + ready_timeout;
     let sock_path = sysa::paths::instance().ipc_socket_path.to_string();
     let mut exchange = Box::pin(async {
+        // Trigger daemon-reload: System A spawns System F which discovers
+        // and commits all unit files.  This replaces the old one-shot
+        // Finder chain that SysAInit used to run directly.
+        info!("Control phase: triggering daemon-reload (unit file rescan)");
+        let reload = manager_call::<DaemonReloadRequest, DaemonReloadResult>(
+            &sock_path,
+            0,
+            "manager.daemon_reload",
+            DaemonReloadRequest {},
+        )
+        .await?;
+        if !reload.success {
+            anyhow::bail!("manager.daemon_reload failed: {}", reload.message);
+        }
+        info!("Control phase: daemon-reload complete");
+
         // One request per connection: the allocator server closes the
         // connection after replying to a single envelope.
         let list = manager_call::<ListUnitsRequest, ListUnitsResult>(
@@ -514,15 +472,13 @@ pub async fn run(
     log_dir: &std::path::Path,
     extra_flags: &HashMap<&'static str, Vec<String>>,
 ) -> Result<i32> {
-    // Partition the resolved set: the allocator (System A), the one-shot
-    // finder chain, and the long-running workers.
+    // Partition the resolved set: the allocator (System A) and the
+    // long-running workers.  The Finder (System F) is no longer run as
+    // a supervised process; System A spawns it on-demand via daemon-reload.
     let mut allocator_specs: Vec<&ResolvedProcess> = Vec::new();
-    let mut one_shots: Vec<&ResolvedProcess> = Vec::new();
     let mut workers: Vec<&ResolvedProcess> = Vec::new();
     for rp in resolved {
-        if rp.spec.kind == ProcessKind::OneShot {
-            one_shots.push(rp);
-        } else if rp.spec.name == "sysa" {
+        if rp.spec.name == "sysa" {
             allocator_specs.push(rp);
         } else {
             workers.push(rp);
@@ -638,37 +594,7 @@ pub async fn run(
         }
     }
 
-    // --- Phase 3: one-shot finder chain, wait for each to exit. ---
-    // Finders must complete after all workers are registered so that
-    // the committed unit set is fully available for the control phase.
-    for rp in &one_shots {
-        if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir, extra_flags) {
-            let code = shutdown(&procs, code, grace).await;
-            let _ = std::fs::remove_file(&sock_path);
-            drop(notify_thread);
-            drop(reaper);
-            return Ok(code);
-        }
-        let pid = procs.last().map(|p| p.pid).unwrap_or(0);
-        let what = format!("one-shot '{}' (pid={})", rp.spec.name, pid);
-        if let Some(code) = wait_one_shot_exit(
-            &mut ctx,
-            &procs,
-            grace,
-            ready_timeout,
-            pid,
-            &what,
-        )
-        .await?
-        {
-            let _ = std::fs::remove_file(&sock_path);
-            drop(notify_thread);
-            drop(reaper);
-            return Ok(code);
-        }
-    }
-
-    // --- Phase 4: control plane (start enabled units + default.target). ---
+    // --- Phase 3: control plane (daemon-reload + start enabled units). ---
     if let Some(code) = control_phase(&mut ctx, &procs, grace, ready_timeout).await? {
         let _ = std::fs::remove_file(&sock_path);
         drop(notify_thread);

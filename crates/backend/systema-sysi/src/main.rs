@@ -109,14 +109,12 @@ struct Args {
     sysr_flags: Option<String>,
     #[arg(long, allow_hyphen_values = true, help = "Extra flags for System M only")]
     sysm_flags: Option<String>,
-    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System F only")]
-    sysf_flags: Option<String>,
 }
 
 /// Canonical short names of every supervised worker (must mirror
 /// [`workers::default_workers`] + the finder chain).
 const WORKER_SHORT_NAMES: &[&str] = &[
-    "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm", "sysf",
+    "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm",
 ];
 
 impl Args {
@@ -132,7 +130,6 @@ impl Args {
             "sysd" => self.sysd_flags.as_ref()?,
             "sysr" => self.sysr_flags.as_ref()?,
             "sysm" => self.sysm_flags.as_ref()?,
-            "sysf" => self.sysf_flags.as_ref()?,
             _ => return None,
         })
     }

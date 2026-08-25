@@ -31,6 +31,9 @@ pub struct Paths {
     /// animation, ...).  System A broadcasts every boot/unit event to all
     /// sockets found in this directory.
     pub notify_dir: String,
+    /// Unix socket path for the SysA → SysF reload notification protocol.
+    /// System F listens here; System A connects to trigger a re-scan.
+    pub reload_socket: &'static str,
 }
 
 fn resolve(env: &str, default: &'static str) -> &'static str {
@@ -79,6 +82,7 @@ fn compute_paths() -> Paths {
             builtin::SYSTEMA_BIN_SEARCH_PATHS,
         ),
         notify_dir: resolve("SYSTEMA_NOTIFY_DIR", builtin::NOTIFY_DIR).to_string(),
+        reload_socket: resolve("SYSTEMA_RELOAD_SOCKET", builtin::RELOAD_SOCKET),
     }
 }
 

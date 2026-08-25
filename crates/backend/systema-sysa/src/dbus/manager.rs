@@ -1411,30 +1411,42 @@ impl ManagerInterface {
     // Reload / daemon management
     // ------------------------------------------------------------------
 
-    /// Reload systemd configuration (re-scan unit files).
+    /// Reload systemd configuration (re-scan unit files via System F).
+    ///
+    /// Delegates the actual rescan to [`ReloadTask`](crate::reload_task):
+    /// System A never scans unit files directly.  The full cycle is:
+    /// emit `Reloading` → notify System F (unix socket) → wait for finder
+    /// commit → inject default dependencies → sync workers → emit `Reloaded`.
     async fn reload(&self) -> zbus::fdo::Result<()> {
-        info!("D-Bus Reload: reloading unit files");
-        debug!("D-Bus Reload: triggering full unit file rescan");
+        info!("D-Bus Reload: scheduling unit file rescan via System F");
         // systemd emits Reloading twice (before and after the rescan);
         // logind's match_reloading holds off unit lookups in between.
         self.emit_reloading().await;
-        let alloc = self.allocator.clone();
-        let conn = self.conn.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::unit::loader::load_default_units(alloc.clone()).await {
-                tracing::error!("Reload failed: {}", e);
-            }
-            // Ask every worker for a fresh full snapshot so the runtime
-            // state cache reflects the reloaded unit set.
-            crate::scheduler::request_all_worker_syncs(alloc).await;
-            if let Some(conn) = conn.get() {
-                if let Ok(signal_ctx) =
-                    zbus::SignalContext::new(conn, "/org/freedesktop/systemd1")
-                {
-                    let _ = ManagerInterface::reloading(&signal_ctx).await;
-                }
-            }
-        });
+
+        let tx = {
+            let state = self.allocator.read();
+            state.reload_tx.clone()
+        };
+        let Some(tx) = tx else {
+            warn!("D-Bus Reload: ReloadTask not yet running");
+            self.emit_reloaded().await;
+            return Ok(());
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(crate::reload_task::ReloadRequest::ByTrigger(reply_tx))
+            .await
+            .is_err()
+        {
+            warn!("D-Bus Reload: ReloadTask channel closed");
+            self.emit_reloaded().await;
+            return Ok(());
+        }
+        // Block until the full reload cycle completes.
+        let _ = reply_rx.await;
+
+        self.emit_reloaded().await;
         Ok(())
     }
 
@@ -1446,6 +1458,17 @@ impl ManagerInterface {
         if let Ok(signal_ctx) = zbus::SignalContext::new(conn, "/org/freedesktop/systemd1") {
             let _ = ManagerInterface::reloading(&signal_ctx).await;
         }
+    }
+
+    /// Emit the `Reloaded` signal (post-reload completion).
+    ///
+    /// In the systemd D-Bus spec, `Reloading(boolean)` is emitted twice:
+    /// `true` before the rescan, `false` after.  This codebase defines a
+    /// single `reloading()` signal without arguments (matching systemd ≥
+    /// v240's simplified form), so we emit it a second time to mark
+    /// completion — the same semantics the original code relied on.
+    async fn emit_reloaded(&self) {
+        self.emit_reloading().await;
     }
 
     /// Reset the failed state of a unit.

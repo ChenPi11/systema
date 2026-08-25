@@ -23,3 +23,6 @@ target
 # Trae
 .trae/
 .marscode/
+
+# Freebuff
+.freebuff/

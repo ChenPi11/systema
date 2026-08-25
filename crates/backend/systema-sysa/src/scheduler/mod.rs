@@ -523,6 +523,9 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
                 .merge_units(&units)
                 .map_err(anyhow::Error::msg)?
         };
+        // Newly materialized units must also receive DefaultDependencies=
+        // (After=sysinit.target & co.), same as the finder commit path.
+        crate::unit::loader::inject_default_dependencies(allocator.clone());
         info!(
             "unit.define from {worker_id}: committed {created} new, {updated} updated unit(s)"
         );

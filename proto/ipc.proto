@@ -316,6 +316,16 @@ message StopUnitsResult {
     string message = 2;
 }
 
+// Request to trigger a daemon-reload (re-scan unit files via System F).
+message DaemonReloadRequest {}
+
+// Response to DaemonReloadRequest.
+message DaemonReloadResult {
+    bool success = 1;
+    // Human-readable message (empty on success).
+    string message = 2;
+}
+
 // Configuration for a .socket unit, sent inside UnitConfig.
 message SocketConfig {
     // Addresses to listen on — see SocketAddress below.
