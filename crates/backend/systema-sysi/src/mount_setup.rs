@@ -16,6 +16,7 @@
 //! `shm_open(3)`, and without a tmpfs at `/dev/shm` they abort on
 //! startup — a login session would die immediately after the greeter.
 
+use std::ffi::CString;
 use std::fs;
 
 use anyhow::{anyhow, Context};
@@ -97,7 +98,8 @@ fn mount_table_entry(
     // systemd's MNT_CHECK_WRITABLE: undo the mount when the filesystem
     // is not actually writable.
     // SAFETY: access(2) only touches errno and returns -1 on failure.
-    if unsafe { nix::libc::access(path.as_ptr().cast(), nix::libc::W_OK) } != 0 {
+    let c_path = CString::new(path).expect("mount point path must not contain interior NUL");
+    if unsafe { nix::libc::access(c_path.as_ptr(), nix::libc::W_OK) } != 0 {
         let err = std::io::Error::last_os_error();
         let _ = umount2(path, MntFlags::UMOUNT_NOFOLLOW);
         let _ = fs::remove_dir(path);
@@ -145,7 +147,8 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
     // systemd's MNT_CHECK_WRITABLE: undo the mount when the filesystem
     // is not actually writable.
     // SAFETY: access(2) only touches errno and returns -1 on failure.
-    if unsafe { nix::libc::access(CGROUP_PATH.as_ptr().cast(), nix::libc::W_OK) } != 0 {
+    let c_cgroup = CString::new(CGROUP_PATH).expect("cgroup path must not contain interior NUL");
+    if unsafe { nix::libc::access(c_cgroup.as_ptr(), nix::libc::W_OK) } != 0 {
         let err = std::io::Error::last_os_error();
         let _ = umount2(CGROUP_PATH, MntFlags::UMOUNT_NOFOLLOW);
         let _ = fs::remove_dir(CGROUP_PATH);
