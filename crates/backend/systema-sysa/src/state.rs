@@ -330,8 +330,7 @@ pub struct AllocatorState {
     /// Completion senders for pending `unit.define` requests — keyed by the
     /// request_id of the envelope sent to the worker.  The IPC receiver
     /// completes the channel when the worker's `unit.define_result` arrives.
-    pub unit_define_txs:
-        HashMap<u64, tokio::sync::oneshot::Sender<sysa::proto::UnitDefineResult>>,
+    pub unit_define_txs: HashMap<u64, tokio::sync::oneshot::Sender<sysa::proto::UnitDefineResult>>,
     /// Restart rate-limiting state, keyed by unit name.
     pub start_limit_state: HashMap<String, StartLimitState>,
     /// In-process event bus for pub/sub event distribution.
@@ -815,7 +814,9 @@ fn apply_ir_patch(ir: &UnitIR, uf: &mut UnitFile) {
         uf.unit.upholds.clone_from(&deps.upholds);
         uf.unit.on_success.clone_from(&deps.on_success);
         uf.unit.on_failure.clone_from(&deps.on_failure);
-        uf.unit.propagates_reload_to.clone_from(&deps.propagates_reload_to);
+        uf.unit
+            .propagates_reload_to
+            .clone_from(&deps.propagates_reload_to);
         uf.unit.default_dependencies = deps.default_dependencies;
     }
 
@@ -1231,10 +1232,8 @@ mod tests {
     }
 
     fn stage(state: &mut AllocatorState, uid: u32, irs: Vec<UnitIR>) {
-        let units: HashMap<String, UnitIR> = irs
-            .into_iter()
-            .map(|ir| (ir.id.clone(), ir))
-            .collect();
+        let units: HashMap<String, UnitIR> =
+            irs.into_iter().map(|ir| (ir.id.clone(), ir)).collect();
         state
             .init_staging_area(uid, "test", units)
             .expect("staging area created");
@@ -1246,7 +1245,10 @@ mod tests {
         stage(
             &mut state,
             7,
-            vec![mount_ir("tmp.mount", "/tmp"), mount_ir("boot.mount", "/boot")],
+            vec![
+                mount_ir("tmp.mount", "/tmp"),
+                mount_ir("boot.mount", "/boot"),
+            ],
         );
 
         let count = state.commit_staging(7, "test").unwrap();
@@ -1369,7 +1371,14 @@ mod tests {
         state.commit_staging(7, "test").unwrap();
         // Existing unit is patched without needing unit_type.
         assert_eq!(
-            state.units.get("tmp.mount").unwrap().mount.as_ref().unwrap().where_,
+            state
+                .units
+                .get("tmp.mount")
+                .unwrap()
+                .mount
+                .as_ref()
+                .unwrap()
+                .where_,
             "/tmp"
         );
     }
@@ -1390,7 +1399,9 @@ mod tests {
             .unit
             .wants
             .insert("display-manager.service".to_string());
-        state.units.insert("graphical.target".to_string(), graphical);
+        state
+            .units
+            .insert("graphical.target".to_string(), graphical);
 
         // Commit any unit to trigger the alias-table rebuild.
         stage(&mut state, 7, vec![mount_ir("tmp.mount", "/tmp")]);
@@ -1400,7 +1411,10 @@ mod tests {
             state.resolve_unit_name("display-manager.service"),
             "lightdm.service"
         );
-        assert_eq!(state.resolve_unit_name("lightdm.service"), "lightdm.service");
+        assert_eq!(
+            state.resolve_unit_name("lightdm.service"),
+            "lightdm.service"
+        );
         let wants = &state.units.get("graphical.target").unwrap().unit.wants;
         assert!(wants.contains("lightdm.service"));
         assert!(!wants.contains("display-manager.service"));
@@ -1423,9 +1437,10 @@ mod tests {
         state.units.insert("lightdm.service".to_string(), lightdm);
         // A real display-manager.service unit exists too: it must not be
         // hijacked by the alias mapping.
-        state
-            .units
-            .insert("display-manager.service".to_string(), UnitFile::new("display-manager.service"));
+        state.units.insert(
+            "display-manager.service".to_string(),
+            UnitFile::new("display-manager.service"),
+        );
 
         stage(&mut state, 7, vec![mount_ir("tmp.mount", "/tmp")]);
         state.commit_staging(7, "test").unwrap();
@@ -1495,8 +1510,13 @@ mod tests {
         let err = state
             .init_staging_area(9, "system-m mount discovery", HashMap::new())
             .unwrap_err();
-        assert!(err.contains("invalid staging area name"), "unexpected error: {err}");
-        assert!(!state.staging_areas.contains_key(&(9, "system-m mount discovery".to_string())));
+        assert!(
+            err.contains("invalid staging area name"),
+            "unexpected error: {err}"
+        );
+        assert!(!state
+            .staging_areas
+            .contains_key(&(9, "system-m mount discovery".to_string())));
     }
 
     #[test]
@@ -1548,14 +1568,30 @@ mod tests {
             .init_staging_area(8, "systema-sysd/discovery", HashMap::new())
             .unwrap();
 
-        assert!(state.get_staging_area(7, "systema-sysd/discovery").is_some());
-        assert!(state.get_staging_area(8, "systema-sysd/discovery").is_some());
-        assert_eq!(state.get_staging_areas_by_name("systema-sysd/discovery").len(), 2);
+        assert!(state
+            .get_staging_area(7, "systema-sysd/discovery")
+            .is_some());
+        assert!(state
+            .get_staging_area(8, "systema-sysd/discovery")
+            .is_some());
+        assert_eq!(
+            state
+                .get_staging_areas_by_name("systema-sysd/discovery")
+                .len(),
+            2
+        );
 
-        let err = state.commit_staging(7, "systema-sysm/discovery").unwrap_err();
+        let err = state
+            .commit_staging(7, "systema-sysm/discovery")
+            .unwrap_err();
         assert!(err.contains("no staging area"), "unexpected error: {err}");
-        assert_eq!(state.commit_staging(7, "systema-sysd/discovery").unwrap(), 0);
-        assert!(state.get_staging_area(8, "systema-sysd/discovery").is_some());
+        assert_eq!(
+            state.commit_staging(7, "systema-sysd/discovery").unwrap(),
+            0
+        );
+        assert!(state
+            .get_staging_area(8, "systema-sysd/discovery")
+            .is_some());
     }
 
     #[test]
@@ -1563,32 +1599,17 @@ mod tests {
         let mut sessions = HashMap::new();
         // First session of user 1000: count goes 0 → 1.
         assert_eq!(
-            track_session(
-                &mut sessions,
-                "session-1.scope",
-                "user-1000.slice",
-                true
-            ),
+            track_session(&mut sessions, "session-1.scope", "user-1000.slice", true),
             Some((1000, 1))
         );
         // A second session of the same user: 1 → 2.
         assert_eq!(
-            track_session(
-                &mut sessions,
-                "session-2.scope",
-                "user-1000.slice",
-                true
-            ),
+            track_session(&mut sessions, "session-2.scope", "user-1000.slice", true),
             Some((1000, 2))
         );
         // Re-reported active (e.g. resource re-apply): no change.
         assert_eq!(
-            track_session(
-                &mut sessions,
-                "session-1.scope",
-                "user-1000.slice",
-                true
-            ),
+            track_session(&mut sessions, "session-1.scope", "user-1000.slice", true),
             None
         );
     }
@@ -1600,21 +1621,11 @@ mod tests {
         track_session(&mut sessions, "session-2.scope", "user-1000.slice", true);
 
         assert_eq!(
-            track_session(
-                &mut sessions,
-                "session-1.scope",
-                "user-1000.slice",
-                false
-            ),
+            track_session(&mut sessions, "session-1.scope", "user-1000.slice", false),
             Some((1000, 1))
         );
         assert_eq!(
-            track_session(
-                &mut sessions,
-                "session-2.scope",
-                "user-1000.slice",
-                false
-            ),
+            track_session(&mut sessions, "session-2.scope", "user-1000.slice", false),
             Some((1000, 0))
         );
         assert!(!sessions.contains_key(&1000));
@@ -1649,12 +1660,7 @@ mod tests {
 
         // User 1000 logs out; user 2000 is untouched.
         assert_eq!(
-            track_session(
-                &mut sessions,
-                "session-1.scope",
-                "user-1000.slice",
-                false
-            ),
+            track_session(&mut sessions, "session-1.scope", "user-1000.slice", false),
             Some((1000, 0))
         );
         assert_eq!(sessions.get(&2000).map(|s| s.len()), Some(1));

@@ -270,20 +270,23 @@ fn spawn_reader(fd: RawFd, tracker: Arc<Mutex<Tracker>>) {
                 let mut cmsg_buf = cmsg_space!(UnixCredentials);
                 let (n, sender_pid) = {
                     let mut iov = [IoSliceMut::new(&mut buf)];
-                    let msg =
-                        match recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::MSG_DONTWAIT)
-                        {
-                            Ok(m) => m,
-                            Err(nix::errno::Errno::EAGAIN) => {
-                                std::thread::sleep(Duration::from_millis(10));
-                                continue;
-                            }
-                            Err(e) => {
-                                warn!("sd_notify recvmsg failed: {e}");
-                                std::thread::sleep(Duration::from_millis(100));
-                                continue;
-                            }
-                        };
+                    let msg = match recvmsg::<()>(
+                        fd,
+                        &mut iov,
+                        Some(&mut cmsg_buf),
+                        MsgFlags::MSG_DONTWAIT,
+                    ) {
+                        Ok(m) => m,
+                        Err(nix::errno::Errno::EAGAIN) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!("sd_notify recvmsg failed: {e}");
+                            std::thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+                    };
                     let pid = match msg.cmsgs() {
                         Ok(cmsgs) => cmsgs
                             .filter_map(|c| match c {
@@ -514,7 +517,12 @@ mod tests {
         let err = err.unwrap_err().to_string();
         assert!(err.contains("exited before READY=1"), "{err}");
         // The entry is cleaned up on failure.
-        assert!(!manager.tracker.lock().unwrap().by_pid.contains_key(&999_999_999));
+        assert!(!manager
+            .tracker
+            .lock()
+            .unwrap()
+            .by_pid
+            .contains_key(&999_999_999));
     }
 
     #[tokio::test]
@@ -527,12 +535,7 @@ mod tests {
         let tracker = manager.tracker.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            apply_message(
-                &tracker,
-                pid,
-                b"READY=1\nSTATUS=Reached basic.target.",
-            )
-            .unwrap();
+            apply_message(&tracker, pid, b"READY=1\nSTATUS=Reached basic.target.").unwrap();
         });
         manager.wait_ready("svc.service", pid, 10).await.unwrap();
         // The entry is cleaned up on success.

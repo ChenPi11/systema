@@ -26,8 +26,8 @@ use crate::unit::types::{
     ExitKind, MountSection, RestartPolicy, StartLimitAction, UnitFile, UnitKind, UnitSection,
 };
 use sysa::proto::{
-    AutomountConfig, MountConfig, PathConfig, ServiceConfig, SocketAddress, SocketConfig, TimerConfig,
-    DeviceConfig, UnitConfig, ScopeConfig, UnitDefineRequest, UnitDefineResult,
+    AutomountConfig, DeviceConfig, MountConfig, PathConfig, ScopeConfig, ServiceConfig,
+    SocketAddress, SocketConfig, TimerConfig, UnitConfig, UnitDefineRequest, UnitDefineResult,
 };
 
 use crate::scheduler::job_type::{job_type_collapse, JobType, UnitActiveState};
@@ -53,21 +53,38 @@ fn job_kind_from_type(t: JobType) -> Option<JobKind> {
 /// - `triggering` is only valid for stop jobs;
 /// - `restart-dependencies` is only valid for start jobs;
 /// - `isolate` requires `AllowIsolate=yes` on the unit.
-fn check_mode_constraints(mode: JobMode, kind: JobKind, unit_name: &str, allow_isolate: bool) -> Result<()> {
+fn check_mode_constraints(
+    mode: JobMode,
+    kind: JobKind,
+    unit_name: &str,
+    allow_isolate: bool,
+) -> Result<()> {
     if mode == JobMode::Triggering && kind != JobKind::Stop {
-        bail!("{}", l10n::fmt(l10n::t_("--job-mode=triggering is only valid for stop."), &[]));
+        bail!(
+            "{}",
+            l10n::fmt(
+                l10n::t_("--job-mode=triggering is only valid for stop."),
+                &[]
+            )
+        );
     }
     if mode == JobMode::RestartDependencies && kind != JobKind::Start {
-        bail!("{}", l10n::fmt(
-            l10n::t_("--job-mode=restart-dependencies is only valid for start."),
-            &[],
-        ));
+        bail!(
+            "{}",
+            l10n::fmt(
+                l10n::t_("--job-mode=restart-dependencies is only valid for start."),
+                &[],
+            )
+        );
     }
     if mode == JobMode::Isolate && !allow_isolate {
-        bail!("{}", l10n::fmt(
-            l10n::t_("Operation refused, unit {unit_name} may not be isolated."),
-            &[("unit_name", unit_name)],
-        ));
+        bail!(
+            "{}",
+            l10n::fmt(
+                l10n::t_("Operation refused, unit {unit_name} may not be isolated."),
+                &[("unit_name", unit_name)],
+            )
+        );
     }
     Ok(())
 }
@@ -309,7 +326,8 @@ pub async fn enqueue_job_type(
             Ok((job_id, JobKind::Nop))
         }
         other => {
-            let kind = job_kind_from_type(other).expect("collapsed job type dispatches to a worker");
+            let kind =
+                job_kind_from_type(other).expect("collapsed job type dispatches to a worker");
             let job_id = enqueue_job(allocator, unit_name, kind, mode).await?;
             Ok((job_id, kind))
         }
@@ -347,7 +365,10 @@ pub fn collect_missing_units(units: &HashMap<String, UnitFile>, root: &str) -> V
 
 /// Like [`collect_missing_units`] but walks the dependency closure from
 /// multiple roots (for multi-anchor transactions).
-pub fn collect_missing_units_multi(units: &HashMap<String, UnitFile>, roots: &[&str]) -> Vec<String> {
+pub fn collect_missing_units_multi(
+    units: &HashMap<String, UnitFile>,
+    roots: &[&str],
+) -> Vec<String> {
     let mut missing: Vec<String> = Vec::new();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stack: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
@@ -479,9 +500,7 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
             // The worker disconnected between grouping and send.
             let mut state = allocator.write();
             state.unit_define_txs.remove(&request_id);
-            bail!(
-                "Worker '{worker_id}' disconnected during unit.define (units: {names:?})"
-            );
+            bail!("Worker '{worker_id}' disconnected during unit.define (units: {names:?})");
         };
         if worker_tx.send(buf.freeze()).await.is_err() {
             let mut state = allocator.write();
@@ -519,16 +538,12 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
             })?;
         let (created, updated) = {
             let mut state = allocator.write();
-            state
-                .merge_units(&units)
-                .map_err(anyhow::Error::msg)?
+            state.merge_units(&units).map_err(anyhow::Error::msg)?
         };
         // Newly materialized units must also receive DefaultDependencies=
         // (After=sysinit.target & co.), same as the finder commit path.
         crate::unit::loader::inject_default_dependencies(allocator.clone());
-        info!(
-            "unit.define from {worker_id}: committed {created} new, {updated} updated unit(s)"
-        );
+        info!("unit.define from {worker_id}: committed {created} new, {updated} updated unit(s)");
     }
 
     Ok(())
@@ -630,7 +645,11 @@ pub async fn enqueue_job(
         // below never falls back to "service" for a slice/scope root.
         let unit_type = unit
             .map(|u| u.kind.worker_type().to_string())
-            .unwrap_or_else(|| UnitKind::from_extension(unit_name).worker_type().to_string());
+            .unwrap_or_else(|| {
+                UnitKind::from_extension(unit_name)
+                    .worker_type()
+                    .to_string()
+            });
         let has_worker = state
             .workers
             .values()
@@ -1013,7 +1032,10 @@ pub async fn enqueue_job(
                 .map(|j| j.id);
 
             if let Some(existing_jid) = existing_running_job_id {
-                debug!("Skipping {:?} for {} (existing job running)", step_kind, name);
+                debug!(
+                    "Skipping {:?} for {} (existing job running)",
+                    step_kind, name
+                );
                 if is_root {
                     return Ok(existing_jid);
                 }
@@ -1138,11 +1160,15 @@ pub async fn enqueue_job(
         let mut duplicate_job = false;
         {
             let mut state = allocator.write();
-            let existing_id: Option<u64> = state.jobs.values().find(|j| {
-                j.unit_name == *name
-                    && j.kind == step_kind
-                    && matches!(j.status, JobStatus::Running)
-            }).map(|j| j.id);
+            let existing_id: Option<u64> = state
+                .jobs
+                .values()
+                .find(|j| {
+                    j.unit_name == *name
+                        && j.kind == step_kind
+                        && matches!(j.status, JobStatus::Running)
+                })
+                .map(|j| j.id);
             if let Some(existing_id) = existing_id {
                 warn!(
                     "Job already exists for unit {} ({:?}, id={}); not dispatching a duplicate",
@@ -1204,8 +1230,14 @@ pub async fn enqueue_job(
         emit_job_new_after_lock(allocator.clone(), job_id, name, step_kind);
 
         // --- Timeout monitoring ---
-        let abort_handle =
-            spawn_job_timeout(allocator.clone(), task_id, job_id, name, step_kind, &unit_file);
+        let abort_handle = spawn_job_timeout(
+            allocator.clone(),
+            task_id,
+            job_id,
+            name,
+            step_kind,
+            &unit_file,
+        );
         if let Some(handle) = abort_handle {
             let mut state = allocator.write();
             if let Some(job) = state.jobs.get_mut(&job_id) {
@@ -2103,19 +2135,28 @@ fn execute_start_limit_action(action: &StartLimitAction, unit_name: &str) {
         StartLimitAction::Reboot
         | StartLimitAction::RebootForce
         | StartLimitAction::RebootImmediate => {
-            warn!("StartLimitAction={:?} for {}: rebooting system", action, unit_name);
+            warn!(
+                "StartLimitAction={:?} for {}: rebooting system",
+                action, unit_name
+            );
             let _ = std::process::Command::new("shutdown")
                 .args(["-r", "now", "StartLimitAction triggered by systema"])
                 .spawn();
         }
         StartLimitAction::Poweroff => {
-            warn!("StartLimitAction=poweroff for {}: powering off system", unit_name);
+            warn!(
+                "StartLimitAction=poweroff for {}: powering off system",
+                unit_name
+            );
             let _ = std::process::Command::new("shutdown")
                 .args(["-P", "now", "StartLimitAction triggered by systema"])
                 .spawn();
         }
         StartLimitAction::Exit => {
-            warn!("StartLimitAction=exit for {} (no-op, logging only)", unit_name);
+            warn!(
+                "StartLimitAction=exit for {} (no-op, logging only)",
+                unit_name
+            );
         }
     }
 }
@@ -2176,9 +2217,7 @@ fn check_conditions(unit: &UnitSection) -> bool {
     }
     for spec in &unit.condition_kernel_module_loaded {
         let (negate, module) = strip_negate(spec);
-        let loaded = std::path::Path::new("/sys/module")
-            .join(module)
-            .exists();
+        let loaded = std::path::Path::new("/sys/module").join(module).exists();
         if loaded == negate {
             return false;
         }
@@ -2671,7 +2710,9 @@ mod tests {
 
     #[test]
     fn test_check_mode_constraints_triggering_is_stop_only() {
-        assert!(check_mode_constraints(JobMode::Triggering, JobKind::Stop, "x.service", false).is_ok());
+        assert!(
+            check_mode_constraints(JobMode::Triggering, JobKind::Stop, "x.service", false).is_ok()
+        );
         for kind in [JobKind::Start, JobKind::Restart, JobKind::Reload] {
             assert!(check_mode_constraints(JobMode::Triggering, kind, "x.service", false).is_err());
         }
@@ -2679,10 +2720,13 @@ mod tests {
 
     #[test]
     fn test_check_mode_constraints_restart_dependencies_is_start_only() {
-        assert!(
-            check_mode_constraints(JobMode::RestartDependencies, JobKind::Start, "x.service", false)
-                .is_ok()
-        );
+        assert!(check_mode_constraints(
+            JobMode::RestartDependencies,
+            JobKind::Start,
+            "x.service",
+            false
+        )
+        .is_ok());
         for kind in [JobKind::Stop, JobKind::Restart, JobKind::Reload] {
             assert!(
                 check_mode_constraints(JobMode::RestartDependencies, kind, "x.service", false)
@@ -2693,14 +2737,28 @@ mod tests {
 
     #[test]
     fn test_check_mode_constraints_isolate_requires_allow_isolate() {
-        assert!(check_mode_constraints(JobMode::Isolate, JobKind::Start, "x.service", false).is_err());
-        assert!(check_mode_constraints(JobMode::Isolate, JobKind::Start, "x.service", true).is_ok());
+        assert!(
+            check_mode_constraints(JobMode::Isolate, JobKind::Start, "x.service", false).is_err()
+        );
+        assert!(
+            check_mode_constraints(JobMode::Isolate, JobKind::Start, "x.service", true).is_ok()
+        );
     }
 
     #[test]
     fn test_check_mode_constraints_plain_modes_always_pass() {
-        for mode in [JobMode::Replace, JobMode::Flush, JobMode::Queue, JobMode::Lenient] {
-            for kind in [JobKind::Start, JobKind::Stop, JobKind::Restart, JobKind::Reload] {
+        for mode in [
+            JobMode::Replace,
+            JobMode::Flush,
+            JobMode::Queue,
+            JobMode::Lenient,
+        ] {
+            for kind in [
+                JobKind::Start,
+                JobKind::Stop,
+                JobKind::Restart,
+                JobKind::Reload,
+            ] {
                 assert!(check_mode_constraints(mode, kind, "x.service", false).is_ok());
             }
         }
@@ -2741,8 +2799,8 @@ mod tests {
             WorkerEntry {
                 worker_id: "test-worker".to_string(),
                 unit_types: vec!["service".to_string()],
-                    supports_unit_define: false,
-                    ready: false,
+                supports_unit_define: false,
+                ready: false,
                 envelope_tx: tx,
             },
         );
@@ -2754,10 +2812,15 @@ mod tests {
         // recorded and completes as done without touching any worker
         // (systemd: JOB_NOP finishes immediately with JOB_DONE).
         let alloc = alloc_with_state("inactive");
-        let (job_id, kind) =
-            enqueue_job_type(alloc.clone(), "demo.service", JobType::TryRestart, false, JobMode::Replace)
-                .await
-                .unwrap();
+        let (job_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::TryRestart,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
         assert_eq!(kind, JobKind::Nop);
         let state = alloc.read();
         let job = state.jobs.get(&job_id).expect("nop job recorded");
@@ -2781,7 +2844,10 @@ mod tests {
         {
             let mut uf = UnitFile::new("session-1.scope");
             uf.transient = true;
-            alloc.write().units.insert("session-1.scope".to_string(), uf);
+            alloc
+                .write()
+                .units
+                .insert("session-1.scope".to_string(), uf);
         }
 
         let err = activate_transient_unit(alloc.clone(), "session-1.scope", JobMode::Replace)
@@ -2803,7 +2869,10 @@ mod tests {
         {
             let mut uf = UnitFile::new("session-1.scope");
             uf.transient = true;
-            alloc.write().units.insert("session-1.scope".to_string(), uf);
+            alloc
+                .write()
+                .units
+                .insert("session-1.scope".to_string(), uf);
         }
         {
             let mut state = alloc.write();
@@ -2878,10 +2947,15 @@ mod tests {
     #[tokio::test]
     async fn test_enqueue_job_type_try_reload_of_failed_unit_is_nop() {
         let alloc = alloc_with_state("failed");
-        let (job_id, kind) =
-            enqueue_job_type(alloc.clone(), "demo.service", JobType::TryReload, false, JobMode::Replace)
-                .await
-                .unwrap();
+        let (job_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::TryReload,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
         assert_eq!(kind, JobKind::Nop);
         assert!(matches!(
             alloc.read().jobs.get(&job_id).unwrap().status,
@@ -2929,12 +3003,20 @@ mod tests {
     async fn test_enqueue_job_type_active_try_restart_dispatches_restart() {
         let alloc = alloc_with_state("active");
         register_service_worker(&mut alloc.write());
-        let (job_id, kind) =
-            enqueue_job_type(alloc.clone(), "demo.service", JobType::TryRestart, false, JobMode::Replace)
-                .await
-                .unwrap();
+        let (job_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::TryRestart,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
         assert_eq!(kind, JobKind::Restart);
-        assert_eq!(alloc.read().jobs.get(&job_id).unwrap().kind, JobKind::Restart);
+        assert_eq!(
+            alloc.read().jobs.get(&job_id).unwrap().kind,
+            JobKind::Restart
+        );
     }
 
     #[tokio::test]
@@ -2987,9 +3069,7 @@ mod tests {
         let running: Vec<_> = state
             .jobs
             .values()
-            .filter(|j| {
-                j.unit_name == "demo.service" && matches!(j.status, JobStatus::Running)
-            })
+            .filter(|j| j.unit_name == "demo.service" && matches!(j.status, JobStatus::Running))
             .collect();
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].id, first_id);
@@ -3025,7 +3105,14 @@ mod tests {
             assert_eq!(kind, JobKind::Start);
             // The start completes successfully — this must NOT clear the
             // accumulated rate-limit state.
-            handle_task_result(alloc.clone(), job_id, true, "ok", "demo.service", JobKind::Start);
+            handle_task_result(
+                alloc.clone(),
+                job_id,
+                true,
+                "ok",
+                "demo.service",
+                JobKind::Start,
+            );
         }
 
         let err = enqueue_job_type(
@@ -3050,22 +3137,29 @@ mod tests {
         let alloc = alloc_with_state("active");
         {
             let mut state = alloc.write();
-            state.units.get_mut("demo.service").unwrap().service = Some(
-                crate::unit::types::ServiceSection {
+            state.units.get_mut("demo.service").unwrap().service =
+                Some(crate::unit::types::ServiceSection {
                     exec_reload: vec![crate::unit::types::ExecCommand::parse(
                         "/usr/bin/kill -HUP $MAINPID",
                     )],
                     ..Default::default()
-                },
-            );
+                });
             register_service_worker(&mut state);
         }
-        let (job_id, kind) =
-            enqueue_job_type(alloc.clone(), "demo.service", JobType::Restart, true, JobMode::Replace)
-                .await
-                .unwrap();
+        let (job_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::Restart,
+            true,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
         assert_eq!(kind, JobKind::Reload);
-        assert_eq!(alloc.read().jobs.get(&job_id).unwrap().kind, JobKind::Reload);
+        assert_eq!(
+            alloc.read().jobs.get(&job_id).unwrap().kind,
+            JobKind::Reload
+        );
     }
 
     #[tokio::test]
@@ -3073,10 +3167,15 @@ mod tests {
         // ReloadOrRestartUnit on an active unit without ExecReload → restart.
         let alloc = alloc_with_state("active");
         register_service_worker(&mut alloc.write());
-        let (job_id, kind) =
-            enqueue_job_type(alloc.clone(), "demo.service", JobType::Restart, true, JobMode::Replace)
-                .await
-                .unwrap();
+        let (job_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::Restart,
+            true,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
         assert_eq!(kind, JobKind::Restart);
         assert_eq!(
             alloc.read().jobs.get(&job_id).unwrap().kind,
@@ -3088,10 +3187,15 @@ mod tests {
     async fn test_enqueue_job_type_reload_or_start_of_inactive_unit_is_start() {
         let alloc = alloc_with_state("inactive");
         register_service_worker(&mut alloc.write());
-        let (job_id, kind) =
-            enqueue_job_type(alloc.clone(), "demo.service", JobType::ReloadOrStart, false, JobMode::Replace)
-                .await
-                .unwrap();
+        let (job_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::ReloadOrStart,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
         assert_eq!(kind, JobKind::Start);
         assert_eq!(alloc.read().jobs.get(&job_id).unwrap().kind, JobKind::Start);
     }
@@ -3172,7 +3276,9 @@ mod tests {
     #[test]
     fn test_fail_dependents_start_failure_propagates_requires_chain() {
         let mut state = AllocatorState::new();
-        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        state
+            .units
+            .insert("a.service".to_string(), make_unit("a.service"));
         let (bn, b) = unit_requires("b.service", &["a.service"]);
         state.units.insert(bn, b);
         let (cn, c) = unit_requires("c.service", &["b.service"]);
@@ -3184,15 +3290,30 @@ mod tests {
         fail_dependents(&mut state, "a.service", JobKind::Start);
 
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "b.service")
+                .unwrap()
+                .status,
             JobStatus::Failed(_)
         ));
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "c.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "c.service")
+                .unwrap()
+                .status,
             JobStatus::Failed(_)
         ));
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "a.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "a.service")
+                .unwrap()
+                .status,
             JobStatus::Running
         ));
     }
@@ -3200,7 +3321,9 @@ mod tests {
     #[test]
     fn test_fail_dependents_start_failure_ignores_non_start_jobs() {
         let mut state = AllocatorState::new();
-        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        state
+            .units
+            .insert("a.service".to_string(), make_unit("a.service"));
         let (bn, b) = unit_requires("b.service", &["a.service"]);
         state.units.insert(bn, b);
         state_with_job(&mut state, "a.service", JobKind::Start);
@@ -3210,7 +3333,12 @@ mod tests {
         fail_dependents(&mut state, "a.service", JobKind::Start);
 
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "b.service")
+                .unwrap()
+                .status,
             JobStatus::Running
         ));
     }
@@ -3218,7 +3346,9 @@ mod tests {
     #[test]
     fn test_fail_dependents_start_failure_propagates_binds_to() {
         let mut state = AllocatorState::new();
-        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        state
+            .units
+            .insert("a.service".to_string(), make_unit("a.service"));
         let (bn, b) = {
             let (n, mut u) = unit_requires("b.service", &["a.service"]);
             u.unit.requires.remove("a.service");
@@ -3232,7 +3362,12 @@ mod tests {
         fail_dependents(&mut state, "a.service", JobKind::Start);
 
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "b.service")
+                .unwrap()
+                .status,
             JobStatus::Failed(_)
         ));
     }
@@ -3240,7 +3375,9 @@ mod tests {
     #[test]
     fn test_fail_dependents_stop_failure_propagates_conflicts() {
         let mut state = AllocatorState::new();
-        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        state
+            .units
+            .insert("a.service".to_string(), make_unit("a.service"));
         let mut b = make_unit("b.service");
         b.unit.conflicts.insert("a.service".to_string());
         state.units.insert("b.service".to_string(), b);
@@ -3250,7 +3387,12 @@ mod tests {
         fail_dependents(&mut state, "a.service", JobKind::Stop);
 
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "b.service")
+                .unwrap()
+                .status,
             JobStatus::Failed(_)
         ));
     }
@@ -3258,7 +3400,9 @@ mod tests {
     #[test]
     fn test_fail_dependents_requires_does_not_propagate_on_stop_failure() {
         let mut state = AllocatorState::new();
-        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        state
+            .units
+            .insert("a.service".to_string(), make_unit("a.service"));
         let (bn, b) = unit_requires("b.service", &["a.service"]);
         state.units.insert(bn, b);
         state_with_job(&mut state, "a.service", JobKind::Stop);
@@ -3268,7 +3412,12 @@ mod tests {
         fail_dependents(&mut state, "a.service", JobKind::Stop);
 
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "b.service")
+                .unwrap()
+                .status,
             JobStatus::Running
         ));
     }
@@ -3276,7 +3425,9 @@ mod tests {
     #[test]
     fn test_fail_dependents_restart_failure_propagates_nothing() {
         let mut state = AllocatorState::new();
-        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        state
+            .units
+            .insert("a.service".to_string(), make_unit("a.service"));
         let (bn, b) = unit_requires("b.service", &["a.service"]);
         state.units.insert(bn, b);
         state_with_job(&mut state, "a.service", JobKind::Restart);
@@ -3286,7 +3437,12 @@ mod tests {
         fail_dependents(&mut state, "a.service", JobKind::Restart);
 
         assert!(matches!(
-            state.jobs.values().find(|j| j.unit_name == "b.service").unwrap().status,
+            state
+                .jobs
+                .values()
+                .find(|j| j.unit_name == "b.service")
+                .unwrap()
+                .status,
             JobStatus::Running
         ));
     }
@@ -3294,7 +3450,9 @@ mod tests {
     #[test]
     fn test_fail_dependents_completion_result_is_dependency() {
         let mut state = AllocatorState::new();
-        state.units.insert("a.service".to_string(), make_unit("a.service"));
+        state
+            .units
+            .insert("a.service".to_string(), make_unit("a.service"));
         let (bn, b) = unit_requires("b.service", &["a.service"]);
         state.units.insert(bn, b);
         state_with_job(&mut state, "a.service", JobKind::Start);
@@ -3340,7 +3498,9 @@ mod tests {
     #[test]
     fn binds_to_start_propagates_when_dependency_active() {
         let mut state = AllocatorState::new();
-        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        state
+            .units
+            .insert("dep.service".to_string(), make_unit("dep.service"));
         let (cn, c) = unit_binds_to("consumer.service", "dep.service");
         state.units.insert(cn, c);
         cached_active(&mut state, "dep.service");
@@ -3352,7 +3512,9 @@ mod tests {
     #[test]
     fn binds_to_start_propagation_skips_inactive_dependency() {
         let mut state = AllocatorState::new();
-        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        state
+            .units
+            .insert("dep.service".to_string(), make_unit("dep.service"));
         let (cn, c) = unit_binds_to("consumer.service", "dep.service");
         state.units.insert(cn, c);
 
@@ -3363,7 +3525,9 @@ mod tests {
     #[test]
     fn binds_to_start_propagation_skips_unit_with_running_job() {
         let mut state = AllocatorState::new();
-        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        state
+            .units
+            .insert("dep.service".to_string(), make_unit("dep.service"));
         let (cn, c) = unit_binds_to("consumer.service", "dep.service");
         state.units.insert(cn, c);
         cached_active(&mut state, "dep.service");
@@ -3377,7 +3541,9 @@ mod tests {
     fn binds_to_start_propagation_skips_restart_job_targets() {
         // An in-flight Restart also counts as running (gate B).
         let mut state = AllocatorState::new();
-        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        state
+            .units
+            .insert("dep.service".to_string(), make_unit("dep.service"));
         let (cn, c) = unit_binds_to("consumer.service", "dep.service");
         state.units.insert(cn, c);
         cached_active(&mut state, "dep.service");
@@ -3390,7 +3556,9 @@ mod tests {
     #[test]
     fn binds_to_start_propagation_skips_already_active_target() {
         let mut state = AllocatorState::new();
-        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        state
+            .units
+            .insert("dep.service".to_string(), make_unit("dep.service"));
         let (cn, c) = unit_binds_to("consumer.service", "dep.service");
         state.units.insert(cn, c);
         cached_active(&mut state, "dep.service");
@@ -3403,12 +3571,16 @@ mod tests {
     #[test]
     fn binds_to_start_propagation_ignores_failed_and_stop_jobs() {
         let mut state = AllocatorState::new();
-        state.units.insert("dep.service".to_string(), make_unit("dep.service"));
+        state
+            .units
+            .insert("dep.service".to_string(), make_unit("dep.service"));
         let (cn, c) = unit_binds_to("consumer.service", "dep.service");
         state.units.insert(cn, c);
         cached_active(&mut state, "dep.service");
 
-        assert!(binds_to_start_propagation(&state, "dep.service", false, JobKind::Start).is_empty());
+        assert!(
+            binds_to_start_propagation(&state, "dep.service", false, JobKind::Start).is_empty()
+        );
         assert!(binds_to_start_propagation(&state, "dep.service", true, JobKind::Stop).is_empty());
     }
 
@@ -3476,7 +3648,14 @@ mod tests {
             "reload" => JobKind::Reload,
             other => panic!("unexpected method {other}"),
         };
-        handle_task_result(alloc.clone(), env.request_id, true, "ok", &call.unit_name, kind);
+        handle_task_result(
+            alloc.clone(),
+            env.request_id,
+            true,
+            "ok",
+            &call.unit_name,
+            kind,
+        );
     }
 
     #[test]
@@ -3492,7 +3671,10 @@ mod tests {
         assert!(collect_missing_units(&units, "c.service").is_empty());
         // Drop a.service → walk reports it once.
         units.remove("a.service");
-        assert_eq!(collect_missing_units(&units, "c.service"), vec!["a.service"]);
+        assert_eq!(
+            collect_missing_units(&units, "c.service"),
+            vec!["a.service"]
+        );
     }
 
     #[test]
@@ -3593,8 +3775,8 @@ mod tests {
                 let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
                 match env.method.as_str() {
                     "unit.define" => {
-                        let req =
-                            UnitDefineRequest::decode(env.payload.as_slice()).expect("valid request");
+                        let req = UnitDefineRequest::decode(env.payload.as_slice())
+                            .expect("valid request");
                         assert_eq!(req.unit_names, vec!["user-1000.slice"]);
                         let units: HashMap<String, UnitIR> = HashMap::from([
                             (
@@ -3623,9 +3805,14 @@ mod tests {
             }
         });
 
-        enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
-            .await
-            .expect("scope with synthesized slice chain must enqueue");
+        enqueue_job(
+            alloc.clone(),
+            "session-1.scope",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect("scope with synthesized slice chain must enqueue");
 
         let state = alloc.read();
         // The chain is committed.
@@ -3635,7 +3822,10 @@ mod tests {
         // The transaction contains jobs for the scope and the whole chain.
         let mut job_units: Vec<&str> = state.jobs.values().map(|j| j.unit_name.as_str()).collect();
         job_units.sort();
-        assert_eq!(job_units, vec!["session-1.scope", "user-1000.slice", "user.slice"]);
+        assert_eq!(
+            job_units,
+            vec!["session-1.scope", "user-1000.slice", "user.slice"]
+        );
     }
 
     #[tokio::test]
@@ -3691,8 +3881,8 @@ mod tests {
                 let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
                 match env.method.as_str() {
                     "unit.define" => {
-                        let req =
-                            UnitDefineRequest::decode(env.payload.as_slice()).expect("valid request");
+                        let req = UnitDefineRequest::decode(env.payload.as_slice())
+                            .expect("valid request");
                         answered_fake.lock().unwrap().push(req.unit_names.clone());
                         let units: HashMap<String, UnitIR> = match req.unit_names[0].as_str() {
                             CHILD => HashMap::from([(
@@ -3722,9 +3912,14 @@ mod tests {
             }
         });
 
-        enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
-            .await
-            .expect("bounded retry must recover the missing parent");
+        enqueue_job(
+            alloc.clone(),
+            "session-1.scope",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect("bounded retry must recover the missing parent");
 
         // Exactly two unit.define rounds: the pre-scan for the parent, and
         // the bounded retry for the parent's parent discovered only during
@@ -3778,7 +3973,10 @@ mod tests {
         tokio::spawn(async move {
             while let Some(bytes) = slice_rx.recv().await {
                 let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
-                assert_eq!(env.method, "unit.define", "refused request happens before dispatch");
+                assert_eq!(
+                    env.method, "unit.define",
+                    "refused request happens before dispatch"
+                );
                 let tx = alloc_fake
                     .write()
                     .unit_define_txs
@@ -3786,15 +3984,21 @@ mod tests {
                     .expect("pending unit.define oneshot");
                 let _ = tx.send(UnitDefineResult {
                     success: false,
-                    error: "cannot synthesize definitions for non-slice units: [x.service]".to_string(),
+                    error: "cannot synthesize definitions for non-slice units: [x.service]"
+                        .to_string(),
                     units_json: vec![],
                 });
             }
         });
 
-        let err = enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
-            .await
-            .expect_err("refused unit.define must fail the transaction");
+        let err = enqueue_job(
+            alloc.clone(),
+            "session-1.scope",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect_err("refused unit.define must fail the transaction");
         assert!(err.to_string().contains("refused"), "{}", err);
         let state = alloc.read();
         assert!(!state.units.contains_key("user-1000.slice"));
@@ -3826,11 +4030,19 @@ mod tests {
             );
         }
 
-        let err = enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
-            .await
-            .expect_err("missing slice with no slice worker must fail");
+        let err = enqueue_job(
+            alloc.clone(),
+            "session-1.scope",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect_err("missing slice with no slice worker must fail");
         let msg = err.to_string();
-        assert!(msg.contains("No worker available for unit type 'slice'"), "{msg}");
+        assert!(
+            msg.contains("No worker available for unit type 'slice'"),
+            "{msg}"
+        );
         assert!(msg.contains("user-1000.slice"), "{msg}");
     }
 
@@ -3843,7 +4055,9 @@ mod tests {
             let mut state = alloc.write();
             let (n, scope) = make_scope_with_slice("session-1.scope", "user-1000.slice");
             state.units.insert(n, scope);
-            state.units.insert("user-1000.slice".to_string(), make_unit("user-1000.slice"));
+            state
+                .units
+                .insert("user-1000.slice".to_string(), make_unit("user-1000.slice"));
             let (scope_tx, mut scope_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
             tokio::spawn(async move { while scope_rx.recv().await.is_some() {} });
             state.workers.insert(
@@ -3875,16 +4089,28 @@ mod tests {
         tokio::spawn(async move {
             while let Some(bytes) = slice_rx.recv().await {
                 let env = Envelope::decode(&mut bytes.as_ref()).expect("valid envelope");
-                assert_ne!(env.method, "unit.define", "no unit.define when nothing is missing");
+                assert_ne!(
+                    env.method, "unit.define",
+                    "no unit.define when nothing is missing"
+                );
                 fake_worker_complete_call(&alloc_fake, &env);
             }
         });
 
-        enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
-            .await
-            .expect("fully loaded transaction must enqueue");
+        enqueue_job(
+            alloc.clone(),
+            "session-1.scope",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect("fully loaded transaction must enqueue");
         let state = alloc.read();
-        assert_eq!(state.unit_define_txs.len(), 0, "no pending unit.define requests");
+        assert_eq!(
+            state.unit_define_txs.len(),
+            0,
+            "no pending unit.define requests"
+        );
     }
 
     #[tokio::test]
@@ -3932,10 +4158,19 @@ mod tests {
             );
         }
 
-        let err = enqueue_job(alloc.clone(), "session-1.scope", JobKind::Start, JobMode::Replace)
-            .await
-            .expect_err("missing unit without a unit.define provider must fail");
-        assert!(err.to_string().contains("no-such-unit-42.service"), "{}", err);
+        let err = enqueue_job(
+            alloc.clone(),
+            "session-1.scope",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect_err("missing unit without a unit.define provider must fail");
+        assert!(
+            err.to_string().contains("no-such-unit-42.service"),
+            "{}",
+            err
+        );
         let state = alloc.read();
         assert!(
             state.unit_define_txs.is_empty(),
@@ -3958,9 +4193,14 @@ mod tests {
         let alloc = alloc_with_state("active");
         register_service_worker(&mut alloc.write());
 
-        let job_id = enqueue_job(alloc.clone(), "demo.service", JobKind::Start, JobMode::Replace)
-            .await
-            .expect("start of active unit succeeds");
+        let job_id = enqueue_job(
+            alloc.clone(),
+            "demo.service",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect("start of active unit succeeds");
 
         let state = alloc.read();
         assert!(job_id != 0);
@@ -3970,9 +4210,10 @@ mod tests {
             "no task may be dispatched for an already-active unit"
         );
         // No job may be left running for the unit.
-        assert!(!state.jobs.values().any(|j| {
-            j.unit_name == "demo.service" && matches!(j.status, JobStatus::Running)
-        }));
+        assert!(!state
+            .jobs
+            .values()
+            .any(|j| { j.unit_name == "demo.service" && matches!(j.status, JobStatus::Running) }));
         // No desired-state change was committed for the unit.
         assert_eq!(state.desired.get("demo.service"), None);
     }
@@ -3985,9 +4226,14 @@ mod tests {
         let alloc = alloc_with_state("active");
         register_service_worker(&mut alloc.write());
 
-        enqueue_job(alloc.clone(), "demo.service", JobKind::Restart, JobMode::Replace)
-            .await
-            .expect("restart of active unit succeeds");
+        enqueue_job(
+            alloc.clone(),
+            "demo.service",
+            JobKind::Restart,
+            JobMode::Replace,
+        )
+        .await
+        .expect("restart of active unit succeeds");
 
         let state = alloc.read();
         assert!(
@@ -4010,7 +4256,9 @@ mod tests {
             // foo.service requires demo.service; demo is already active.
             let (n, foo) = unit_requires("foo.service", &["demo.service"]);
             state.units.insert(n, foo);
-            state.units.insert("demo.service".to_string(), make_unit("demo.service"));
+            state
+                .units
+                .insert("demo.service".to_string(), make_unit("demo.service"));
             state.unit_states.insert(
                 "demo.service".to_string(),
                 CachedUnitState {
@@ -4041,9 +4289,14 @@ mod tests {
             );
         }
 
-        let job_id = enqueue_job(alloc.clone(), "foo.service", JobKind::Start, JobMode::Replace)
-            .await
-            .expect("start of foo succeeds");
+        let job_id = enqueue_job(
+            alloc.clone(),
+            "foo.service",
+            JobKind::Start,
+            JobMode::Replace,
+        )
+        .await
+        .expect("start of foo succeeds");
 
         let state = alloc.read();
         // No job may exist for demo.service (neither running nor done as a

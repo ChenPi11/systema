@@ -42,12 +42,14 @@ const PAM_DELETE_CRED: c_int = 0x0004;
 
 #[repr(C)]
 struct PamConv {
-    conv: Option<unsafe extern "C" fn(
-        num_msg: c_int,
-        msg: *const *const PamMessage,
-        resp: *mut *mut PamResponse,
-        appdata_ptr: *mut c_void,
-    ) -> c_int>,
+    conv: Option<
+        unsafe extern "C" fn(
+            num_msg: c_int,
+            msg: *const *const PamMessage,
+            resp: *mut *mut PamResponse,
+            appdata_ptr: *mut c_void,
+        ) -> c_int,
+    >,
     appdata_ptr: *mut c_void,
 }
 
@@ -74,7 +76,8 @@ type PamStartFn = unsafe extern "C" fn(
     pamh: *mut *mut c_void,
 ) -> c_int;
 type PamEndFn = unsafe extern "C" fn(pamh: *mut c_void, status: c_int) -> c_int;
-type PamSetItemFn = unsafe extern "C" fn(pamh: *mut c_void, item_type: c_int, item: *const c_void) -> c_int;
+type PamSetItemFn =
+    unsafe extern "C" fn(pamh: *mut c_void, item_type: c_int, item: *const c_void) -> c_int;
 type PamSetCredFn = unsafe extern "C" fn(pamh: *mut c_void, flags: c_int) -> c_int;
 type PamOpenSessionFn = unsafe extern "C" fn(pamh: *mut c_void, flags: c_int) -> c_int;
 type PamCloseSessionFn = unsafe extern "C" fn(pamh: *mut c_void, flags: c_int) -> c_int;
@@ -220,8 +223,8 @@ pub fn pam_setup(
 
     let service = CString::new(pam_name)
         .map_err(|_| format!("PAM service name '{pam_name}' contains a NUL byte"))?;
-    let user = CString::new(username)
-        .map_err(|_| format!("PAM user '{username}' contains a NUL byte"))?;
+    let user =
+        CString::new(username).map_err(|_| format!("PAM user '{username}' contains a NUL byte"))?;
 
     let conv = PamConv {
         conv: Some(pam_conv_stub),
@@ -235,8 +238,8 @@ pub fn pam_setup(
     }
 
     if let Some(tty) = tty {
-        let tty_c = CString::new(tty)
-            .map_err(|_| format!("PAM tty '{tty}' contains a NUL byte"))?;
+        let tty_c =
+            CString::new(tty).map_err(|_| format!("PAM tty '{tty}' contains a NUL byte"))?;
         let r = unsafe { (pam.set_item)(handle, PAM_TTY, tty_c.as_ptr().cast()) };
         if r != PAM_SUCCESS {
             debug!("pam_set_item(PAM_TTY, '{tty}') failed: {r}");
@@ -279,13 +282,7 @@ pub fn pam_setup(
         }
     }
 
-    Ok((
-        env,
-        PamSession {
-            pam,
-            handle,
-        },
-    ))
+    Ok((env, PamSession { pam, handle }))
 }
 
 impl PamSession {

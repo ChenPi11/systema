@@ -332,9 +332,7 @@ pub async fn ensure_loaded_from_disk_in(
     });
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("ensure_loaded_from_disk timed out loading '{name_err}'")
-        })?;
+        .map_err(|_| anyhow::anyhow!("ensure_loaded_from_disk timed out loading '{name_err}'"))?;
     result?
 }
 
@@ -547,10 +545,7 @@ enum Field {
 ///
 /// All targets are probed against the loaded unit-name snapshot; edges to
 /// missing units are skipped.
-fn add_type_default_dependencies(
-    unit: &mut UnitFile,
-    present: &std::collections::HashSet<String>,
-) {
+fn add_type_default_dependencies(unit: &mut UnitFile, present: &std::collections::HashSet<String>) {
     let has = |target: &str| present.contains(target);
     match unit.kind {
         crate::unit::types::UnitKind::Service => {
@@ -652,15 +647,9 @@ where
 
     // mount_is_extrinsic(): never manage the OS data or API filesystems.
     if matches!(where_.as_str(), "/" | "/usr" | "/etc")
-        || [
-            "/run/initramfs",
-            "/run/nextroot",
-            "/proc",
-            "/sys",
-            "/dev",
-        ]
-        .iter()
-        .any(|p| where_.starts_with(p))
+        || ["/run/initramfs", "/run/nextroot", "/proc", "/sys", "/dev"]
+            .iter()
+            .any(|p| where_.starts_with(p))
     {
         return;
     }
@@ -711,7 +700,12 @@ where
     };
     let netdev = fstab_test_option(&swap.options, "_netdev");
     if netdev {
-        add_default_dependency(unit, Field::After, TARGET_REMOTE_FS_PRE, has(TARGET_REMOTE_FS_PRE));
+        add_default_dependency(
+            unit,
+            Field::After,
+            TARGET_REMOTE_FS_PRE,
+            has(TARGET_REMOTE_FS_PRE),
+        );
         add_default_dependency(unit, Field::Before, TARGET_REMOTE_FS, has(TARGET_REMOTE_FS));
         add_default_dependency(unit, Field::After, TARGET_NETWORK, has(TARGET_NETWORK));
         add_default_dependency(
@@ -1058,7 +1052,13 @@ mod tests {
     #[test]
     fn test_mount_default_dependencies_local() {
         let units = run_injection(vec![
-            mount_unit("mnt-data.mount", "/mnt/data", "/dev/sda1", "ext4", "defaults"),
+            mount_unit(
+                "mnt-data.mount",
+                "/mnt/data",
+                "/dev/sda1",
+                "ext4",
+                "defaults",
+            ),
             target("local-fs-pre.target"),
             target("local-fs.target"),
             target("umount.target"),
@@ -1100,13 +1100,7 @@ mod tests {
     #[test]
     fn test_mount_default_dependencies_nofail_skips_before() {
         let units = run_injection(vec![
-            mount_unit(
-                "mnt-data.mount",
-                "/mnt/data",
-                "/dev/sda1",
-                "ext4",
-                "nofail",
-            ),
+            mount_unit("mnt-data.mount", "/mnt/data", "/dev/sda1", "ext4", "nofail"),
             target("local-fs-pre.target"),
             target("local-fs.target"),
             target("umount.target"),
@@ -1207,11 +1201,7 @@ mod tests {
         let mut swp = UnitFile::new("dev-sda2.swap");
         swp.kind = UnitKind::Swap;
         swp.swap = Some(SwapSection::default());
-        let units = run_injection(vec![
-            swp,
-            target("swap.target"),
-            target("umount.target"),
-        ]);
+        let units = run_injection(vec![swp, target("swap.target"), target("umount.target")]);
         let s = &units["dev-sda2.swap"];
         assert!(s.unit.before.contains("swap.target"));
         assert!(s.unit.before.contains("umount.target"));
@@ -1246,7 +1236,13 @@ mod tests {
     #[test]
     fn test_mount_device_dependency() {
         let units = run_injection(vec![
-            mount_unit("mnt-data.mount", "/mnt/data", "/dev/sda1", "ext4", "defaults"),
+            mount_unit(
+                "mnt-data.mount",
+                "/mnt/data",
+                "/dev/sda1",
+                "ext4",
+                "defaults",
+            ),
             {
                 let mut d = UnitFile::new("dev-sda1.device");
                 d.kind = UnitKind::Device;
@@ -1357,15 +1353,21 @@ mod tests {
         assert!(!state.units.contains_key("getty@tty3.service"));
         drop(state);
 
-        assert!(ensure_loaded_from_disk_in(alloc.clone(), &dirs, "hello.service")
-            .await
-            .expect("exact file must load"));
-        assert!(ensure_loaded_from_disk_in(alloc.clone(), &dirs, "getty@tty3.service")
-            .await
-            .expect("template instance must load"));
-        assert!(!ensure_loaded_from_disk_in(alloc.clone(), &dirs, "nope.slice")
-            .await
-            .expect("missing unit reports false"));
+        assert!(
+            ensure_loaded_from_disk_in(alloc.clone(), &dirs, "hello.service")
+                .await
+                .expect("exact file must load")
+        );
+        assert!(
+            ensure_loaded_from_disk_in(alloc.clone(), &dirs, "getty@tty3.service")
+                .await
+                .expect("template instance must load")
+        );
+        assert!(
+            !ensure_loaded_from_disk_in(alloc.clone(), &dirs, "nope.slice")
+                .await
+                .expect("missing unit reports false")
+        );
 
         let state = alloc.read();
         assert!(state.units.contains_key("hello.service"));
@@ -1403,8 +1405,11 @@ mod tests {
             "[Unit]\nDescription=Display manager\n[Service]\nExecStart=/usr/sbin/lightdm\n",
         )
         .unwrap();
-        std::os::unix::fs::symlink(dir.join("lightdm.service"), dir.join("display-manager.service"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("lightdm.service"),
+            dir.join("display-manager.service"),
+        )
+        .unwrap();
 
         let dirs = vec![dir.to_string_lossy().into_owned()];
         let unit = load_unit_flexible_in(&dirs, "display-manager.service").unwrap();
@@ -1428,7 +1433,10 @@ mod tests {
 
         let dirs = vec![dir.to_string_lossy().into_owned()];
         let err = load_unit_flexible_in(&dirs, "getty@.service").unwrap_err();
-        assert!(err.to_string().contains("template"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("template"),
+            "unexpected error: {err}"
+        );
         // Instances are still resolved through the template.
         let unit = load_unit_flexible_in(&dirs, "getty@tty3.service").unwrap();
         assert_eq!(unit.name, "getty@tty3.service");

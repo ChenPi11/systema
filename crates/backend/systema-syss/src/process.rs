@@ -22,8 +22,8 @@
 //! | `|`    | `VIA_SHELL`                | Run via `sh -c`                  |
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -54,10 +54,8 @@ use crate::state::{ServiceRegistry, ServiceState};
 /// offline); `SYSTEMD_OFFLINE=0` disables systemd's offline (`--root`)
 /// detection. Both are applied *after* the unit's `Environment=` settings so
 /// a unit cannot override them.
-const FORCED_SERVICE_ENV: &[(&str, &str)] = &[
-    ("SYSTEMCTL_FORCE_BUS", "1"),
-    ("SYSTEMD_OFFLINE", "0"),
-];
+const FORCED_SERVICE_ENV: &[(&str, &str)] =
+    &[("SYSTEMCTL_FORCE_BUS", "1"), ("SYSTEMD_OFFLINE", "0")];
 
 /// Directory where per-service stdout/stderr logs are captured.
 const SERVICE_LOG_DIR: &str = "/var/log/services";
@@ -73,10 +71,8 @@ fn ensure_service_log_dir() {
             warn!("Failed to create {}: {}", SERVICE_LOG_DIR, e);
         } else {
             // Ensure the directory is world-readable and traversable.
-            let _ = std::fs::set_permissions(
-                SERVICE_LOG_DIR,
-                std::fs::Permissions::from_mode(0o755),
-            );
+            let _ =
+                std::fs::set_permissions(SERVICE_LOG_DIR, std::fs::Permissions::from_mode(0o755));
         }
     });
 }
@@ -222,9 +218,7 @@ pub async fn start_service(
         xdg_runtime_dir_fallback(&svc.environment, &pam_env, creds.as_ref().map(|c| c.uid))
     {
         pam_env.push((key, value.clone()));
-        info!(
-            "Set XDG_RUNTIME_DIR={value} for {unit_name} (PAM did not provide it)"
-        );
+        info!("Set XDG_RUNTIME_DIR={value} for {unit_name} (PAM did not provide it)");
     }
 
     // Build environment lookup table (process env + unit Environment= +
@@ -241,9 +235,7 @@ pub async fn start_service(
     // Update state to Starting.
     {
         let mut reg = registry.lock();
-        let inst = reg
-            .entry(unit_name.clone())
-            .or_default();
+        let inst = reg.entry(unit_name.clone()).or_default();
         inst.state = ServiceState::Starting;
         inst.invocation_id = invocation_id.clone();
     }
@@ -288,10 +280,7 @@ pub async fn start_service(
     }
     // Set INVOCATION_ID if provided (systemd compatibility).
     if let Some(ref inv_id) = invocation_id {
-        if let (Ok(k), Ok(v)) = (
-            CString::new("INVOCATION_ID"),
-            CString::new(inv_id.as_str()),
-        ) {
+        if let (Ok(k), Ok(v)) = (CString::new("INVOCATION_ID"), CString::new(inv_id.as_str())) {
             child_envs.push((k, v));
         }
     }
@@ -401,11 +390,25 @@ pub async fn start_service(
         });
     }
 
-    // Update state to Running.
+    // Update state.  A `Type=oneshot` service must NOT be reported as
+    // "running"/active right after spawn: unlike systemd it would only
+    // become UNIT_ACTIVE after ExecStart has exited (SERVICE_EXITED with
+    // RemainAfterExit=true).  systemd keeps oneshot units in
+    // SERVICE_START/SERVICE_START_POST (i.e. UNIT_ACTIVATING) while the
+    // control process is still running (src/core/service.c:73-103).  The
+    // oneshot start path therefore stays in `Starting` here and lets
+    // `await_oneshot_exit` (in controller.rs) move it to Running/Dead/Failed
+    // once ExecStart actually exits.  Other service types are "Running" as
+    // soon as the main process is spawned.
+    let is_oneshot = svc.service_type.as_str() == "oneshot";
     {
         let mut reg = registry.lock();
         if let Some(inst) = reg.get_mut(&unit_name) {
-            inst.state = ServiceState::Running;
+            inst.state = if is_oneshot {
+                ServiceState::Starting
+            } else {
+                ServiceState::Running
+            };
             inst.main_pid = Some(pid);
         }
     }
@@ -561,21 +564,17 @@ fn resolve_credentials(user: &str, group: &str) -> Result<Option<Creds>> {
     let mut uid: Option<Uid> = None;
     let mut resolved_user: Option<String> = None;
     if let Some(u) = &username {
-        let found = match User::from_name(u)
-            .with_context(|| format!("lookup of user '{u}' failed"))?
-        {
-            Some(usr) => Some(usr),
-            // Numeric UID (systemd resolves `User=1000` via getpwuid).
-            None => u
-                .parse::<u32>()
-                .ok()
-                .and_then(|n| {
+        let found =
+            match User::from_name(u).with_context(|| format!("lookup of user '{u}' failed"))? {
+                Some(usr) => Some(usr),
+                // Numeric UID (systemd resolves `User=1000` via getpwuid).
+                None => u.parse::<u32>().ok().and_then(|n| {
                     User::from_uid(Uid::from_raw(n))
                         .with_context(|| format!("lookup of uid '{n}' failed"))
                         .ok()
                         .flatten()
                 }),
-        };
+            };
         let usr = found.ok_or_else(|| anyhow::anyhow!("user '{u}' not found"))?;
         uid = Some(usr.uid);
         resolved_user = Some(usr.name);
@@ -586,9 +585,7 @@ fn resolve_credentials(user: &str, group: &str) -> Result<Option<Creds>> {
 
     Ok(Some(Creds {
         uid: uid.unwrap_or(Uid::from_raw(0)).as_raw(),
-        gid: gid
-            .unwrap_or(Gid::from_raw(0))
-            .as_raw(),
+        gid: gid.unwrap_or(Gid::from_raw(0)).as_raw(),
         username: resolved_user,
     }))
 }
@@ -680,10 +677,7 @@ fn build_pre_exec(
                     // only Group= was set.
                     Some(username) => {
                         let uname = CString::new(username.as_str()).map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "NUL in username",
-                            )
+                            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in username")
                         })?;
                         if libc::initgroups(uname.as_ptr(), creds.gid) < 0 {
                             return Err(std::io::Error::last_os_error());
@@ -1260,10 +1254,7 @@ fn expand_specifiers(s: &str, name: &str) -> String {
 /// Build a lookup table from the unit's `Environment=` settings and the PAM
 /// environment (order: process env, unit env, PAM env, forced env — later
 /// entries win).
-fn build_env_table(
-    unit_env: &[String],
-    pam_env: &[(String, String)],
-) -> HashMap<String, String> {
+fn build_env_table(unit_env: &[String], pam_env: &[(String, String)]) -> HashMap<String, String> {
     let mut table: HashMap<String, String> = HashMap::new();
 
     for (key, val) in std::env::vars() {
@@ -1484,7 +1475,6 @@ fn expand_braced_expr(
             }
             Some(ch) if matches!(phase, Phase::Default) => match substitution {
                 Some((_opchar, ref mut val)) => {
-                    
                     val.push(ch);
                 }
                 None => {
@@ -1896,7 +1886,10 @@ mod tests {
             "SYSTEMD_OFFLINE=1".to_string(),
         ];
         let table = build_env_table(&unit_env, &[]);
-        assert_eq!(table.get("SYSTEMCTL_FORCE_BUS").map(String::as_str), Some("1"));
+        assert_eq!(
+            table.get("SYSTEMCTL_FORCE_BUS").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(table.get("SYSTEMD_OFFLINE").map(String::as_str), Some("0"));
     }
 
@@ -1918,7 +1911,10 @@ mod tests {
             ("SYSTEMD_OFFLINE".to_string(), "1".to_string()),
         ];
         let table = build_env_table(&[], &pam_env);
-        assert_eq!(table.get("SYSTEMCTL_FORCE_BUS").map(String::as_str), Some("1"));
+        assert_eq!(
+            table.get("SYSTEMCTL_FORCE_BUS").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(table.get("SYSTEMD_OFFLINE").map(String::as_str), Some("0"));
     }
 
@@ -1948,7 +1944,9 @@ mod tests {
         // name is what PAM receives (pam_systemd rejects numeric usernames).
         let me = nix::unistd::Uid::current();
         let pw = nix::unistd::User::from_uid(me).unwrap().unwrap();
-        let c = resolve_credentials(&me.as_raw().to_string(), "").unwrap().unwrap();
+        let c = resolve_credentials(&me.as_raw().to_string(), "")
+            .unwrap()
+            .unwrap();
         assert_eq!(c.uid, pw.uid.as_raw());
         assert_eq!(c.gid, pw.gid.as_raw());
         assert_eq!(c.username.as_deref(), Some(pw.name.as_str()));

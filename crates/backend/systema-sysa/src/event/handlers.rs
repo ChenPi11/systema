@@ -226,7 +226,10 @@ impl EventSubscriber for WorkerEventForwarder {
         // System R knows whether to apply the limits or release the entry,
         // and which process to move into the unit's cgroup.
         let decoded = UnitStatus::decode_from(&event.data);
-        let active_state = decoded.as_ref().map(|s| s.active_state.clone()).unwrap_or_default();
+        let active_state = decoded
+            .as_ref()
+            .map(|s| s.active_state.clone())
+            .unwrap_or_default();
         let main_pid = decoded.as_ref().map(|s| s.main_pid).unwrap_or(0);
         let Some(resource_event) =
             build_unit_resource_event(&self.allocator, &event.unit_name, &active_state, main_pid)
@@ -371,7 +374,9 @@ pub fn replay_active_units(
 
 /// Convert a parsed systemd resource-control block into the protobuf
 /// projection sent to System R.
-fn sd_resource_control_to_proto(rc: &crate::unit::types::ResourceControl) -> sysa::proto::ResourceConfig {
+fn sd_resource_control_to_proto(
+    rc: &crate::unit::types::ResourceControl,
+) -> sysa::proto::ResourceConfig {
     sysa::proto::ResourceConfig {
         cpu_quota: rc.cpu_quota.clone(),
         cpu_quota_period: rc.cpu_quota_period.clone(),
@@ -414,24 +419,24 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
     )
 }
 
-    #[cfg(test)]
-    mod tests {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-        use crate::state::CachedUnitState;
+    use crate::state::CachedUnitState;
 
-        use super::*;
+    use super::*;
 
-        fn unit_event(unit_name: &str) -> Event {
-            Event {
-                topic: EventTopic::UnitStateChange,
-                unit_name: unit_name.to_string(),
-                worker_id: "worker".to_string(),
-                timestamp: tokio::time::Instant::now(),
-                data: bytes::Bytes::new(),
-            }
+    fn unit_event(unit_name: &str) -> Event {
+        Event {
+            topic: EventTopic::UnitStateChange,
+            unit_name: unit_name.to_string(),
+            worker_id: "worker".to_string(),
+            timestamp: tokio::time::Instant::now(),
+            data: bytes::Bytes::new(),
         }
+    }
 
     #[test]
     fn replay_active_units_includes_the_root_slice() {
@@ -454,13 +459,19 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
                 controller: String::new(),
             },
         );
-        allocator
-            .write()
-            .units
-            .insert("demo.service".to_string(), crate::unit::types::UnitFile::new("demo.service"));
+        allocator.write().units.insert(
+            "demo.service".to_string(),
+            crate::unit::types::UnitFile::new("demo.service"),
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
-        replay_active_units(&allocator, "system-r-1", &tx, true, &std::collections::HashSet::new());
+        replay_active_units(
+            &allocator,
+            "system-r-1",
+            &tx,
+            true,
+            &std::collections::HashSet::new(),
+        );
 
         let mut names = std::collections::HashSet::new();
         while let Ok(buf) = rx.try_recv() {
@@ -469,7 +480,10 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
             names.insert(event.unit_name);
         }
         assert!(names.contains("-.slice"), "root slice replayed: {names:?}");
-        assert!(names.contains("demo.service"), "service replayed: {names:?}");
+        assert!(
+            names.contains("demo.service"),
+            "service replayed: {names:?}"
+        );
     }
 
     fn status(active: &str, last_exit_code: Option<i32>) -> UnitStatus {
@@ -534,9 +548,10 @@ fn restart_decision(status: &UnitStatus) -> Option<ExitKind> {
     #[test]
     fn live_instance_detected_for_active_states() {
         let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
-        for (name, active_state, pid) in
-            [("a.service", "active", 42u32), ("b.service", "activating", 0u32)]
-        {
+        for (name, active_state, pid) in [
+            ("a.service", "active", 42u32),
+            ("b.service", "activating", 0u32),
+        ] {
             alloc.write().unit_states.insert(
                 name.to_string(),
                 CachedUnitState {

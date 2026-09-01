@@ -370,12 +370,18 @@ impl Interface for Properties {
     ) -> DispatchResult<'call> {
         match name.as_str() {
             "GetAll" => DispatchResult::Async(Box::pin(async move {
-                self.handle_get_all(connection, msg)
-                    .await})),
-            "Get" => DispatchResult::Async(Box::pin(async move {
-                self.handle_get(connection, msg).await})),
-            "Set" => DispatchResult::Async(Box::pin(async move {
-                self.handle_set(connection, msg).await})),
+                self.handle_get_all(connection, msg).await
+            })),
+            "Get" => {
+                DispatchResult::Async(Box::pin(
+                    async move { self.handle_get(connection, msg).await },
+                ))
+            }
+            "Set" => {
+                DispatchResult::Async(Box::pin(
+                    async move { self.handle_set(connection, msg).await },
+                ))
+            }
             _ => DispatchResult::NotFound,
         }
     }
@@ -659,12 +665,18 @@ impl Interface for ManagerProperties {
     ) -> DispatchResult<'call> {
         match name.as_str() {
             "GetAll" => DispatchResult::Async(Box::pin(async move {
-                self.handle_get_all(connection, msg)
-                    .await})),
-            "Get" => DispatchResult::Async(Box::pin(async move {
-                self.handle_get(connection, msg).await})),
-            "Set" => DispatchResult::Async(Box::pin(async move {
-                self.handle_set(connection, msg).await})),
+                self.handle_get_all(connection, msg).await
+            })),
+            "Get" => {
+                DispatchResult::Async(Box::pin(
+                    async move { self.handle_get(connection, msg).await },
+                ))
+            }
+            "Set" => {
+                DispatchResult::Async(Box::pin(
+                    async move { self.handle_set(connection, msg).await },
+                ))
+            }
             _ => DispatchResult::NotFound,
         }
     }

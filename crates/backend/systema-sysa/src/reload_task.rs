@@ -39,10 +39,7 @@ impl ReloadTask {
     }
 
     /// Main loop: process reload requests until the channel closes.
-    async fn run(
-        allocator: AllocatorHandle,
-        mut rx: mpsc::Receiver<ReloadRequest>,
-    ) {
+    async fn run(allocator: AllocatorHandle, mut rx: mpsc::Receiver<ReloadRequest>) {
         info!("ReloadTask started");
         while let Some(req) = rx.recv().await {
             match req {
@@ -85,7 +82,9 @@ impl ReloadTask {
     /// This is the common tail of both the trigger and commit paths.
     fn apply_after_commit(allocator: &AllocatorHandle) {
         crate::unit::loader::inject_default_dependencies(allocator.clone());
-        tokio::spawn(crate::scheduler::request_all_worker_syncs(allocator.clone()));
+        tokio::spawn(crate::scheduler::request_all_worker_syncs(
+            allocator.clone(),
+        ));
     }
 
     /// Locate the `systema-sysf` binary and run it as a subprocess.
@@ -112,10 +111,7 @@ impl ReloadTask {
             info!("ReloadTask: System F completed successfully");
             Ok(())
         } else {
-            anyhow::bail!(
-                "System F exited with status: {}",
-                status
-            );
+            anyhow::bail!("System F exited with status: {}", status);
         }
     }
 

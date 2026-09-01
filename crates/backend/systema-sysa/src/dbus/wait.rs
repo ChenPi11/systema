@@ -60,23 +60,19 @@ mod tests {
 
     #[test]
     fn default_socket_path_is_standard() {
-        let _g = std::env::var("DBUS_SYSTEM_BUS_ADDRESS")
-            .ok()
-            .map(|v| {
-                std::env::remove_var("DBUS_SYSTEM_BUS_ADDRESS");
-                v
-            });
+        let _g = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").ok().map(|v| {
+            std::env::remove_var("DBUS_SYSTEM_BUS_ADDRESS");
+            v
+        });
         assert_eq!(system_bus_socket_path(), PathBuf::from(DEFAULT_SOCKET));
     }
 
     #[test]
     fn env_address_overrides_default() {
-        let _g = std::env::var("DBUS_SYSTEM_BUS_ADDRESS")
-            .ok()
-            .map(|v| {
-                std::env::remove_var("DBUS_SYSTEM_BUS_ADDRESS");
-                v
-            });
+        let _g = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").ok().map(|v| {
+            std::env::remove_var("DBUS_SYSTEM_BUS_ADDRESS");
+            v
+        });
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/tmp/x.sock,guid=123");
         assert_eq!(system_bus_socket_path(), PathBuf::from("/tmp/x.sock"));
     }

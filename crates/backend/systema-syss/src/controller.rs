@@ -213,11 +213,7 @@ impl ServiceController {
             )));
         }
         let timeout = svc.timeout_start_secs.max(1) as u64;
-        match self
-            .dbus
-            .wait_name_owned(bus_name, pid, timeout)
-            .await
-        {
+        match self.dbus.wait_name_owned(bus_name, pid, timeout).await {
             Ok(()) => {
                 info!(
                     "{} (PID {}): acquired D-Bus name {}",
@@ -226,10 +222,7 @@ impl ServiceController {
                 Ok(())
             }
             Err(e) => {
-                warn!(
-                    "{} (PID {}): dbus start failed: {}",
-                    unit_name, pid, e
-                );
+                warn!("{} (PID {}): dbus start failed: {}", unit_name, pid, e);
                 let _ = stop_service(self.registry.clone(), unit_name, 10).await;
                 self.publish_state(unit_name);
                 Err(anyhow!("{}", e))
@@ -249,8 +242,7 @@ impl ServiceController {
                 Some(s) => {
                     let dup = nix::unistd::dup(s.as_raw_fd()).ok();
                     dup.and_then(|fd| {
-                        let std_stream =
-                            unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+                        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
                         tokio::net::UnixStream::from_std(std_stream).ok()
                     })
                 }
@@ -354,8 +346,7 @@ impl UnitController for ServiceController {
         let listen_fds = self.request_listener_fds(&cfg.socket_units).await;
         #[cfg(not(unix))]
         let listen_fds = Vec::new();
-        let (_pid, child) =
-            start_service(self.registry.clone(), &cfg, inv_id, listen_fds).await?;
+        let (_pid, child) = start_service(self.registry.clone(), &cfg, inv_id, listen_fds).await?;
         {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
@@ -421,8 +412,7 @@ impl UnitController for ServiceController {
         let listen_fds = self.request_listener_fds(&cfg.socket_units).await;
         #[cfg(not(unix))]
         let listen_fds = Vec::new();
-        let (_pid, child) =
-            start_service(self.registry.clone(), &cfg, inv_id, listen_fds).await?;
+        let (_pid, child) = start_service(self.registry.clone(), &cfg, inv_id, listen_fds).await?;
         {
             let mut reg = self.registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
@@ -539,7 +529,9 @@ mod tests {
 
     #[tokio::test]
     async fn dbus_type_is_detected() {
-        assert!(ServiceController::is_dbus_type(&dbus_cfg("org.example.Daemon")));
+        assert!(ServiceController::is_dbus_type(&dbus_cfg(
+            "org.example.Daemon"
+        )));
         let mut cfg = dbus_cfg("org.example.Daemon");
         cfg.service.as_mut().unwrap().service_type = "simple".to_string();
         assert!(!ServiceController::is_dbus_type(&cfg));

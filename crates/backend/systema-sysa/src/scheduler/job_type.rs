@@ -84,10 +84,7 @@ impl UnitActiveState {
     /// `UNIT_IS_INACTIVE_OR_FAILED()` — `inactive`, `failed`. An `Unknown`
     /// state is never inactive-like.
     pub fn is_inactive_or_failed(self) -> bool {
-        matches!(
-            self,
-            UnitActiveState::Inactive | UnitActiveState::Failed
-        )
+        matches!(self, UnitActiveState::Inactive | UnitActiveState::Failed)
     }
 }
 
@@ -297,11 +294,26 @@ mod tests {
     #[test]
     fn active_state_from_str_mapping() {
         assert_eq!(UnitActiveState::from_active_state_str("active"), Active);
-        assert_eq!(UnitActiveState::from_active_state_str("reloading"), Reloading);
-        assert_eq!(UnitActiveState::from_active_state_str("refreshing"), Refreshing);
-        assert_eq!(UnitActiveState::from_active_state_str("activating"), Activating);
-        assert_eq!(UnitActiveState::from_active_state_str("deactivating"), Deactivating);
-        assert_eq!(UnitActiveState::from_active_state_str("maintenance"), Maintenance);
+        assert_eq!(
+            UnitActiveState::from_active_state_str("reloading"),
+            Reloading
+        );
+        assert_eq!(
+            UnitActiveState::from_active_state_str("refreshing"),
+            Refreshing
+        );
+        assert_eq!(
+            UnitActiveState::from_active_state_str("activating"),
+            Activating
+        );
+        assert_eq!(
+            UnitActiveState::from_active_state_str("deactivating"),
+            Deactivating
+        );
+        assert_eq!(
+            UnitActiveState::from_active_state_str("maintenance"),
+            Maintenance
+        );
         assert_eq!(UnitActiveState::from_active_state_str("inactive"), Inactive);
         // Workers emit "dead" as a sub-state; map it to inactive as well.
         assert_eq!(UnitActiveState::from_active_state_str("dead"), Inactive);
@@ -405,7 +417,16 @@ mod tests {
                 assert_eq!(job_type_lookup_merge(a, b), None);
             }
         }
-        for a in [Start, VerifyActive, Stop, Reload, Restart, TryRestart, TryReload, ReloadOrStart] {
+        for a in [
+            Start,
+            VerifyActive,
+            Stop,
+            Reload,
+            Restart,
+            TryRestart,
+            TryReload,
+            ReloadOrStart,
+        ] {
             for b in [TryRestart, TryReload, ReloadOrStart] {
                 if a != b {
                     assert_eq!(job_type_lookup_merge(a, b), None);
@@ -464,7 +485,15 @@ mod tests {
     #[test]
     fn collapse_leaves_transaction_types_untouched() {
         for t in [Start, VerifyActive, Stop, Reload, Restart, Nop] {
-            for s in [Active, Inactive, Failed, Activating, Deactivating, Maintenance, Unknown] {
+            for s in [
+                Active,
+                Inactive,
+                Failed,
+                Activating,
+                Deactivating,
+                Maintenance,
+                Unknown,
+            ] {
                 assert_eq!(job_type_collapse(t, s), t);
             }
         }
@@ -480,7 +509,14 @@ mod tests {
             for s in [Active, Reloading, Refreshing] {
                 assert!(job_type_is_redundant(t, s), "{t:?} redundant in {s:?}");
             }
-            for s in [Inactive, Failed, Activating, Deactivating, Maintenance, Unknown] {
+            for s in [
+                Inactive,
+                Failed,
+                Activating,
+                Deactivating,
+                Maintenance,
+                Unknown,
+            ] {
                 assert!(!job_type_is_redundant(t, s), "{t:?} not redundant in {s:?}");
             }
         }
@@ -490,8 +526,19 @@ mod tests {
     fn stop_is_redundant_when_inactive() {
         assert!(job_type_is_redundant(Stop, Inactive));
         assert!(job_type_is_redundant(Stop, Failed));
-        for s in [Active, Reloading, Refreshing, Activating, Deactivating, Maintenance, Unknown] {
-            assert!(!job_type_is_redundant(Stop, s), "Stop not redundant in {s:?}");
+        for s in [
+            Active,
+            Reloading,
+            Refreshing,
+            Activating,
+            Deactivating,
+            Maintenance,
+            Unknown,
+        ] {
+            assert!(
+                !job_type_is_redundant(Stop, s),
+                "Stop not redundant in {s:?}"
+            );
         }
     }
 
@@ -550,14 +597,8 @@ mod tests {
             job_type_merge_and_collapse(Start, Start, Unknown),
             Some(Start)
         );
-        assert_eq!(
-            job_type_merge_and_collapse(Stop, Stop, Unknown),
-            Some(Stop)
-        );
-        assert_eq!(
-            job_type_merge_and_collapse(Nop, Nop, Unknown),
-            Some(Nop)
-        );
+        assert_eq!(job_type_merge_and_collapse(Stop, Stop, Unknown), Some(Stop));
+        assert_eq!(job_type_merge_and_collapse(Nop, Nop, Unknown), Some(Nop));
     }
 
     #[test]
@@ -571,11 +612,26 @@ mod tests {
     #[test]
     fn merge_and_collapse_resolves_reload_or_start_by_state() {
         // Start ⊕ Reload → ReloadOrStart → collapse by state.
-        assert_eq!(job_type_merge_and_collapse(Start, Reload, Active), Some(Reload));
-        assert_eq!(job_type_merge_and_collapse(Start, Reload, Reloading), Some(Reload));
-        assert_eq!(job_type_merge_and_collapse(Start, Reload, Inactive), Some(Start));
-        assert_eq!(job_type_merge_and_collapse(Start, Reload, Failed), Some(Start));
-        assert_eq!(job_type_merge_and_collapse(Start, Reload, Unknown), Some(Start));
+        assert_eq!(
+            job_type_merge_and_collapse(Start, Reload, Active),
+            Some(Reload)
+        );
+        assert_eq!(
+            job_type_merge_and_collapse(Start, Reload, Reloading),
+            Some(Reload)
+        );
+        assert_eq!(
+            job_type_merge_and_collapse(Start, Reload, Inactive),
+            Some(Start)
+        );
+        assert_eq!(
+            job_type_merge_and_collapse(Start, Reload, Failed),
+            Some(Start)
+        );
+        assert_eq!(
+            job_type_merge_and_collapse(Start, Reload, Unknown),
+            Some(Start)
+        );
     }
 
     #[test]
@@ -596,18 +652,9 @@ mod tests {
 
     #[test]
     fn merge_and_collapse_nop_yields_to_the_other_job() {
-        assert_eq!(
-            job_type_merge_and_collapse(Nop, Stop, Active),
-            Some(Stop)
-        );
-        assert_eq!(
-            job_type_merge_and_collapse(Stop, Nop, Unknown),
-            Some(Stop)
-        );
-        assert_eq!(
-            job_type_merge_and_collapse(Nop, Start, Active),
-            Some(Start)
-        );
+        assert_eq!(job_type_merge_and_collapse(Nop, Stop, Active), Some(Stop));
+        assert_eq!(job_type_merge_and_collapse(Stop, Nop, Unknown), Some(Stop));
+        assert_eq!(job_type_merge_and_collapse(Nop, Start, Active), Some(Start));
     }
 
     // ------------------------------------------------------------------

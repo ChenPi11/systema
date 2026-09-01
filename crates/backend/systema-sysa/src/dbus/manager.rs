@@ -34,7 +34,11 @@ const JOB_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 /// The wait is asynchronous (never blocks the runtime) and bounded, so a
 /// job that never finishes — e.g. a hung oneshot — cannot wedge a caller
 /// forever.
-async fn wait_job_completion(allocator: &AllocatorHandle, job_id: u64, timeout: std::time::Duration) {
+async fn wait_job_completion(
+    allocator: &AllocatorHandle,
+    job_id: u64,
+    timeout: std::time::Duration,
+) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let terminal = {
@@ -292,8 +296,13 @@ fn apply_resource_property(
     value: &zvariant::OwnedValue,
 ) -> bool {
     match key {
-        "MemoryAccounting" | "CPUAccounting" | "TasksAccounting" | "MemoryPressureAccounting"
-        | "OOMPolicy" | "MemoryPressureThresholdUSec" | "Delegate" => true,
+        "MemoryAccounting"
+        | "CPUAccounting"
+        | "TasksAccounting"
+        | "MemoryPressureAccounting"
+        | "OOMPolicy"
+        | "MemoryPressureThresholdUSec"
+        | "Delegate" => true,
         "MemoryMin" => {
             set_byte_or_string(&mut rc.memory_min, value);
             true
@@ -428,10 +437,15 @@ impl ManagerInterface {
         self.load_unit_if_needed(&name).await?;
         self.ensure_unit_object(&name).await;
         let job_mode = parse_job_mode(mode)?;
-        let (job_id, collapsed) =
-            scheduler::enqueue_job_type(alloc.clone(), &name, job_type, reload_if_possible, job_mode)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let (job_id, collapsed) = scheduler::enqueue_job_type(
+            alloc.clone(),
+            &name,
+            job_type,
+            reload_if_possible,
+            job_mode,
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         if collapsed != JobKind::Nop {
             if let Some(d) = desired {
                 alloc.write().desired.insert(name.clone(), d);
@@ -460,10 +474,7 @@ impl ManagerInterface {
             if !state.units.contains_key(name) {
                 let uf = transient_unit_from_properties(name, properties, sender_pid);
                 if uf.kind == UnitKind::Scope {
-                    let entry = state
-                        .unit_states
-                        .entry(name.to_string())
-                        .or_default();
+                    let entry = state.unit_states.entry(name.to_string()).or_default();
                     entry.pids = uf
                         .scope
                         .as_ref()
@@ -489,19 +500,13 @@ impl ManagerInterface {
         let conn = self.conn.get()?;
         let proxy = zbus::fdo::DBusProxy::new(conn).await.ok()?;
         let bus_name = zbus::names::BusName::try_from(sender).ok()?;
-        proxy
-            .get_connection_unix_process_id(bus_name)
-            .await
-            .ok()
+        proxy.get_connection_unix_process_id(bus_name).await.ok()
     }
 }
 
 /// Shared implementation of scope abandonment (used by the Manager
 /// `AbandonScope` method and the per-unit `Scope.Abandon` method).
-pub async fn abandon_scope_impl(
-    allocator: &AllocatorHandle,
-    name: &str,
-) -> zbus::fdo::Result<()> {
+pub async fn abandon_scope_impl(allocator: &AllocatorHandle, name: &str) -> zbus::fdo::Result<()> {
     let (worker_tx, active_state) = {
         let state = allocator.read();
         if !state
@@ -777,7 +782,10 @@ impl ManagerInterface {
         let (event, bus) = {
             let state = self.allocator.read();
             let Some(cached) = state.unit_states.get(name) else {
-                debug!("SetUnitProperties: {} has no runtime state yet; limits cached in unit", name);
+                debug!(
+                    "SetUnitProperties: {} has no runtime state yet; limits cached in unit",
+                    name
+                );
                 return;
             };
             let status = sysa::controller::UnitStatus {
@@ -937,8 +945,14 @@ impl ManagerInterface {
     /// `systemctl try-restart`.
     async fn try_restart_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus TryRestartUnit: {} (mode={})", name, mode);
-        self.enqueue_transient(name, JobType::TryRestart, false, mode, Some(DesiredState::Active))
-            .await
+        self.enqueue_transient(
+            name,
+            JobType::TryRestart,
+            false,
+            mode,
+            Some(DesiredState::Active),
+        )
+        .await
     }
 
     /// Try-reload: reload the unit only if it is active; otherwise the job
@@ -957,8 +971,14 @@ impl ManagerInterface {
         mode: &str,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus ReloadOrRestartUnit: {} (mode={})", name, mode);
-        self.enqueue_transient(name, JobType::Restart, true, mode, Some(DesiredState::Active))
-            .await
+        self.enqueue_transient(
+            name,
+            JobType::Restart,
+            true,
+            mode,
+            Some(DesiredState::Active),
+        )
+        .await
     }
 
     /// Reload-or-try-restart: like reload-or-restart but a no-op when the
@@ -969,8 +989,14 @@ impl ManagerInterface {
         mode: &str,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus ReloadOrTryRestartUnit: {} (mode={})", name, mode);
-        self.enqueue_transient(name, JobType::TryRestart, true, mode, Some(DesiredState::Active))
-            .await
+        self.enqueue_transient(
+            name,
+            JobType::TryRestart,
+            true,
+            mode,
+            Some(DesiredState::Active),
+        )
+        .await
     }
 
     /// Enqueue a single job by explicit job type, mirroring systemd's
@@ -1062,15 +1088,10 @@ impl ManagerInterface {
             // Ensure the per-unit D-Bus object is registered before returning.
             self.ensure_unit_object(&name).await;
 
-            let (job_id, collapsed) = scheduler::enqueue_job_type(
-                alloc.clone(),
-                &name,
-                kind,
-                reload_if_possible,
-                mode,
-            )
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            let (job_id, collapsed) =
+                scheduler::enqueue_job_type(alloc.clone(), &name, kind, reload_if_possible, mode)
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
             // Track the desired state like the single-unit methods do.
             set_desired_state(&alloc, &name, collapsed);
@@ -1110,9 +1131,11 @@ impl ManagerInterface {
         let sender = header.sender().map(|s| s.as_str());
 
         // Create the transient unit (and any auxiliary units) in the allocator.
-        self.insert_transient_unit(name, &properties, sender).await?;
+        self.insert_transient_unit(name, &properties, sender)
+            .await?;
         for (aux_name, aux_props) in &aux_units {
-            self.insert_transient_unit(aux_name, aux_props, sender).await?;
+            self.insert_transient_unit(aux_name, aux_props, sender)
+                .await?;
         }
 
         let job_id = scheduler::activate_transient_unit(self.allocator.clone(), name, job_mode)
@@ -1142,9 +1165,11 @@ impl ManagerInterface {
 
         let mut jobs = Vec::with_capacity(units.len());
         for (name, properties) in units {
-            self.insert_transient_unit(&name, &properties, sender).await?;
+            self.insert_transient_unit(&name, &properties, sender)
+                .await?;
             for (aux_name, aux_props) in &aux_units {
-                self.insert_transient_unit(aux_name, aux_props, sender).await?;
+                self.insert_transient_unit(aux_name, aux_props, sender)
+                    .await?;
             }
             let job_id =
                 scheduler::activate_transient_unit(self.allocator.clone(), &name, job_mode)
@@ -1206,10 +1231,9 @@ impl ManagerInterface {
         let state = self.allocator.read();
         let result = build_unit_list(&state, |name, _s| {
             // Pattern filter (state filter is a no-op without runtime cache).
-            if !patterns.is_empty()
-                && !patterns.iter().any(|p| matches_glob(p, name)) {
-                    return false;
-                }
+            if !patterns.is_empty() && !patterns.iter().any(|p| matches_glob(p, name)) {
+                return false;
+            }
             true
         });
         debug!(
@@ -2053,16 +2077,37 @@ mod tests {
         // bus_unit_parse_job_type(): plain types.
         assert_eq!(parse_job_type("start").unwrap(), (JobType::Start, false));
         assert_eq!(parse_job_type("stop").unwrap(), (JobType::Stop, false));
-        assert_eq!(parse_job_type("restart").unwrap(), (JobType::Restart, false));
+        assert_eq!(
+            parse_job_type("restart").unwrap(),
+            (JobType::Restart, false)
+        );
         assert_eq!(parse_job_type("reload").unwrap(), (JobType::Reload, false));
-        assert_eq!(parse_job_type("try-restart").unwrap(), (JobType::TryRestart, false));
-        assert_eq!(parse_job_type("try-reload").unwrap(), (JobType::TryReload, false));
-        assert_eq!(parse_job_type("reload-or-start").unwrap(), (JobType::ReloadOrStart, false));
-        assert_eq!(parse_job_type("verify-active").unwrap(), (JobType::VerifyActive, false));
+        assert_eq!(
+            parse_job_type("try-restart").unwrap(),
+            (JobType::TryRestart, false)
+        );
+        assert_eq!(
+            parse_job_type("try-reload").unwrap(),
+            (JobType::TryReload, false)
+        );
+        assert_eq!(
+            parse_job_type("reload-or-start").unwrap(),
+            (JobType::ReloadOrStart, false)
+        );
+        assert_eq!(
+            parse_job_type("verify-active").unwrap(),
+            (JobType::VerifyActive, false)
+        );
         assert_eq!(parse_job_type("nop").unwrap(), (JobType::Nop, false));
         // The magic reload-or-* types carry the reload-if-possible flag.
-        assert_eq!(parse_job_type("reload-or-restart").unwrap(), (JobType::Restart, true));
-        assert_eq!(parse_job_type("reload-or-try-restart").unwrap(), (JobType::TryRestart, true));
+        assert_eq!(
+            parse_job_type("reload-or-restart").unwrap(),
+            (JobType::Restart, true)
+        );
+        assert_eq!(
+            parse_job_type("reload-or-try-restart").unwrap(),
+            (JobType::TryRestart, true)
+        );
     }
 
     #[test]
@@ -2076,13 +2121,25 @@ mod tests {
         assert_eq!(parse_job_mode("fail").unwrap(), JobMode::Fail);
         assert_eq!(parse_job_mode("lenient").unwrap(), JobMode::Lenient);
         assert_eq!(parse_job_mode("replace").unwrap(), JobMode::Replace);
-        assert_eq!(parse_job_mode("replace-irreversibly").unwrap(), JobMode::ReplaceIrreversibly);
+        assert_eq!(
+            parse_job_mode("replace-irreversibly").unwrap(),
+            JobMode::ReplaceIrreversibly
+        );
         assert_eq!(parse_job_mode("isolate").unwrap(), JobMode::Isolate);
         assert_eq!(parse_job_mode("flush").unwrap(), JobMode::Flush);
-        assert_eq!(parse_job_mode("ignore-dependencies").unwrap(), JobMode::IgnoreDependencies);
-        assert_eq!(parse_job_mode("ignore-requirements").unwrap(), JobMode::IgnoreRequirements);
+        assert_eq!(
+            parse_job_mode("ignore-dependencies").unwrap(),
+            JobMode::IgnoreDependencies
+        );
+        assert_eq!(
+            parse_job_mode("ignore-requirements").unwrap(),
+            JobMode::IgnoreRequirements
+        );
         assert_eq!(parse_job_mode("triggering").unwrap(), JobMode::Triggering);
-        assert_eq!(parse_job_mode("restart-dependencies").unwrap(), JobMode::RestartDependencies);
+        assert_eq!(
+            parse_job_mode("restart-dependencies").unwrap(),
+            JobMode::RestartDependencies
+        );
         // Legacy systema extension.
         assert_eq!(parse_job_mode("queue").unwrap(), JobMode::Queue);
     }
@@ -2181,8 +2238,14 @@ mod tests {
             ("Description".to_string(), sv("Session 1 of root")),
             ("Slice".to_string(), sv("system.slice")),
             ("DefaultDependencies".to_string(), bv(true)),
-            ("After".to_string(), strs(vec!["systemd-user-sessions.service"])),
-            ("Requires".to_string(), strs(vec!["systemd-user-sessions.service"])),
+            (
+                "After".to_string(),
+                strs(vec!["systemd-user-sessions.service"]),
+            ),
+            (
+                "Requires".to_string(),
+                strs(vec!["systemd-user-sessions.service"]),
+            ),
             ("PIDs".to_string(), u32s(vec![1234])),
         ]
     }
@@ -2257,7 +2320,10 @@ mod tests {
         assert_eq!(get_prop_str(&p, "Missing"), None);
         assert_eq!(get_prop_str(&p, "Flag"), None); // bool is not a string
         assert_eq!(get_prop_bool(&p, "Flag"), Some(true));
-        assert_eq!(get_prop_strs(&p, "List"), Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            get_prop_strs(&p, "List"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
         assert_eq!(get_prop_u32s(&p, "Pids"), Some(vec![1, 2]));
     }
 
@@ -2281,26 +2347,50 @@ mod tests {
         // The exact directive set logind's user_update_slice sends to
         // `user-<UID>.slice` on every login (logind-user.c).
         let mut rc = crate::unit::types::ResourceControl::default();
-        assert!(apply_resource_property(&mut rc, "MemoryAccounting", &bv(true)));
+        assert!(apply_resource_property(
+            &mut rc,
+            "MemoryAccounting",
+            &bv(true)
+        ));
         assert!(apply_resource_property(&mut rc, "CPUAccounting", &bv(true)));
-        assert!(apply_resource_property(&mut rc, "TasksAccounting", &bv(true)));
+        assert!(apply_resource_property(
+            &mut rc,
+            "TasksAccounting",
+            &bv(true)
+        ));
         // Byte-based memory limits arrive as `t`.
         assert!(apply_resource_property(&mut rc, "MemoryHigh", &tv(1 << 30)));
         assert_eq!(rc.memory_high, "1073741824");
         assert!(apply_resource_property(&mut rc, "MemoryMax", &tv(2 << 30)));
         assert_eq!(rc.memory_max, "2147483648");
-        assert!(apply_resource_property(&mut rc, "MemorySwapMax", &sv("infinity")));
+        assert!(apply_resource_property(
+            &mut rc,
+            "MemorySwapMax",
+            &sv("infinity")
+        ));
         assert_eq!(rc.memory_swap_max, "infinity");
         // CPU quota in µs of CPU time per second: 250000 → 25% of one CPU.
-        assert!(apply_resource_property(&mut rc, "CPUQuotaPerSecUSec", &tv(250_000)));
+        assert!(apply_resource_property(
+            &mut rc,
+            "CPUQuotaPerSecUSec",
+            &tv(250_000)
+        ));
         assert_eq!(rc.cpu_quota, "25%");
         assert!(apply_resource_property(&mut rc, "CPUWeight", &tv(50)));
         assert_eq!(rc.cpu_weight, 50);
         assert!(apply_resource_property(&mut rc, "TasksMax", &tv(100)));
         assert_eq!(rc.tasks_max, 100);
-        assert!(apply_resource_property(&mut rc, "TasksMax", &sv("infinity")));
+        assert!(apply_resource_property(
+            &mut rc,
+            "TasksMax",
+            &sv("infinity")
+        ));
         assert_eq!(rc.tasks_max, u32::MAX);
-        assert!(apply_resource_property(&mut rc, "OOMPolicy", &sv("continue")));
+        assert!(apply_resource_property(
+            &mut rc,
+            "OOMPolicy",
+            &sv("continue")
+        ));
         assert!(apply_resource_property(&mut rc, "AllowedCPUs", &sv("0-1")));
         assert_eq!(rc.allowed_cpus, "0-1");
         // Unknown properties are ignored, like the transient path.
@@ -2373,9 +2463,15 @@ mod tests {
         }
         let mgr = manager_for_test(alloc);
         let path = mgr.get_unit_by_pid(42).await.expect("scope pid resolves");
-        assert_eq!(path.as_str(), "/org/freedesktop/systemd1/unit/session_2d1_2escope");
+        assert_eq!(
+            path.as_str(),
+            "/org/freedesktop/systemd1/unit/session_2d1_2escope"
+        );
         let path = mgr.get_unit_by_pid(7).await.expect("main pid resolves");
-        assert_eq!(path.as_str(), "/org/freedesktop/systemd1/unit/nginx_2eservice");
+        assert_eq!(
+            path.as_str(),
+            "/org/freedesktop/systemd1/unit/nginx_2eservice"
+        );
         assert!(mgr.get_unit_by_pid(9999).await.is_err());
     }
 
@@ -2399,6 +2495,9 @@ mod tests {
         let mgr = manager_for_test(alloc);
         let fd = zvariant::OwnedFd::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) });
         let path = mgr.get_unit_by_pidfd(fd).await.expect("pidfd resolves");
-        assert_eq!(path.as_str(), "/org/freedesktop/systemd1/unit/session_2d1_2escope");
+        assert_eq!(
+            path.as_str(),
+            "/org/freedesktop/systemd1/unit/session_2d1_2escope"
+        );
     }
 }

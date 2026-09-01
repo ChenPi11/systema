@@ -84,10 +84,9 @@ pub fn scan_enabled_units(dirs: &[String]) -> HashSet<String> {
                     } else {
                         dir.join(&target)
                     };
-                    if let (Some(link_base), Some(target_base)) = (
-                        Path::new(&name).file_name(),
-                        resolved.file_name(),
-                    ) {
+                    if let (Some(link_base), Some(target_base)) =
+                        (Path::new(&name).file_name(), resolved.file_name())
+                    {
                         let link_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
                         let target_dir = resolved
                             .parent()
@@ -143,8 +142,16 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("sysa-enable-wants-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("multi-user.target.wants")).unwrap();
-        write_link(&tmp.join("multi-user.target.wants"), "foo.service", "../../usr/lib/systemd/system/foo.service");
-        write_link(&tmp.join("multi-user.target.wants"), "bar.timer", "/usr/lib/systemd/system/bar.timer");
+        write_link(
+            &tmp.join("multi-user.target.wants"),
+            "foo.service",
+            "../../usr/lib/systemd/system/foo.service",
+        );
+        write_link(
+            &tmp.join("multi-user.target.wants"),
+            "bar.timer",
+            "/usr/lib/systemd/system/bar.timer",
+        );
 
         let enabled = scan_enabled_units(&[tmp.to_string_lossy().to_string()]);
         assert!(enabled.contains("foo.service"));
@@ -157,7 +164,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("sysa-enable-req-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("sysinit.target.requires")).unwrap();
-        write_link(&tmp.join("sysinit.target.requires"), "foo.service", "/usr/lib/systemd/system/foo.service");
+        write_link(
+            &tmp.join("sysinit.target.requires"),
+            "foo.service",
+            "/usr/lib/systemd/system/foo.service",
+        );
 
         let enabled = scan_enabled_units(&[tmp.to_string_lossy().to_string()]);
         assert!(enabled.contains("foo.service"));
@@ -189,7 +200,11 @@ mod tests {
         std::fs::create_dir_all(tmp.join("lib")).unwrap();
         write_file(&tmp.join("lib"), "lightdm.service", "[Unit]\n[Service]\n");
         // display-manager.service → lightdm.service: an alias, not enablement.
-        write_link(&tmp.join("lib"), "display-manager.service", "lightdm.service");
+        write_link(
+            &tmp.join("lib"),
+            "display-manager.service",
+            "lightdm.service",
+        );
 
         let enabled = scan_enabled_units(&[tmp.join("lib").to_string_lossy().to_string()]);
         assert!(!enabled.contains("display-manager.service"));
@@ -202,7 +217,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("sysa-enable-tmpl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("getty.target.wants")).unwrap();
-        write_link(&tmp.join("getty.target.wants"), "getty@.service", "/usr/lib/systemd/system/getty@.service");
+        write_link(
+            &tmp.join("getty.target.wants"),
+            "getty@.service",
+            "/usr/lib/systemd/system/getty@.service",
+        );
 
         let enabled = scan_enabled_units(&[tmp.to_string_lossy().to_string()]);
         assert!(!enabled.contains("getty@.service"));

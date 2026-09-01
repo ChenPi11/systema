@@ -722,8 +722,10 @@ mod tests {
         let alloc = handle();
         {
             let mut s = alloc.write();
-            s.invocation_ids
-                .insert("demo.service".to_string(), "11111111111111111111111111111111".to_string());
+            s.invocation_ids.insert(
+                "demo.service".to_string(),
+                "11111111111111111111111111111111".to_string(),
+            );
             s.unit_states.insert(
                 "demo.service".to_string(),
                 CachedUnitState {
@@ -751,10 +753,10 @@ mod tests {
     #[test]
     fn invocation_id_falls_back_to_dispatched_until_worker_reports() {
         let alloc = handle();
-        alloc
-            .write()
-            .invocation_ids
-            .insert("demo.service".to_string(), "11111111111111111111111111111111".to_string());
+        alloc.write().invocation_ids.insert(
+            "demo.service".to_string(),
+            "11111111111111111111111111111111".to_string(),
+        );
         assert_eq!(
             obj(alloc).invocation_id(),
             uuid::Uuid::parse_str("11111111111111111111111111111111")
@@ -886,7 +888,10 @@ mod tests {
         assert_eq!(o.cpu_usage_n_sec(), 12_345_000);
         assert_eq!(o.tasks_current(), 2);
         assert_eq!(o.effective_tasks_max(), 512);
-        assert_eq!(o.get_processes(), vec![(String::new(), 42, "demo".to_string())]);
+        assert_eq!(
+            o.get_processes(),
+            vec![(String::new(), 42, "demo".to_string())]
+        );
     }
 
     #[test]

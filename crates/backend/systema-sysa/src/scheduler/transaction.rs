@@ -258,6 +258,31 @@ impl ReverseIndex {
                 }
             }
         }
+        // A unit that is ordered after a `.socket` must also run after the
+        // socket's activated service is *started*.  Real systemd guarantees
+        // this because socket activation wakes the service as soon as its
+        // first event arrives (e.g. an early kernel uevent activates udevd
+        // before `udevadm trigger` cold-plugs the rest).  System A has no
+        // such early activation: the only thing that starts the service is
+        // an explicit Start job, which can otherwise race the dependent unit
+        // and lose events (coldplug MODALIAS -> kmod load never fires because
+        // udevd is not yet bound to the kernel netlink socket).  Resolve each
+        // `.socket` ordering target to its `[Socket] Service=` unit (or the
+        // "foo.socket" -> "foo.service" convention) and order after it too.
+        for dep in out.clone().iter() {
+            if !dep.ends_with(".socket") {
+                continue;
+            }
+            let svc: Option<String> = units
+                .get(dep)
+                .and_then(|du| du.socket.as_ref())
+                .map(|s| s.service.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(dep.replace(".socket", ".service")));
+            if let Some(svc) = svc {
+                out.insert(svc);
+            }
+        }
         let mut v: Vec<String> = out.into_iter().collect();
         v.sort();
         v
@@ -301,7 +326,8 @@ fn state_of(states: &HashMap<String, UnitActiveState>, u: &str) -> UnitActiveSta
 /// systemd `job_type_is_conflicting()`: start/verify-active/reload jobs
 /// conflict with every non-positive job.
 fn job_type_is_conflicting(a: JobType, b: JobType) -> bool {
-    let positive = |t: JobType| matches!(t, JobType::Start | JobType::VerifyActive | JobType::Reload);
+    let positive =
+        |t: JobType| matches!(t, JobType::Start | JobType::VerifyActive | JobType::Reload);
     positive(a) != positive(b)
 }
 
@@ -390,7 +416,12 @@ impl Transaction {
     /// `job_dependency_new()`: record the edge subject → object, deduplicated
     /// with flags OR-ed in.
     fn add_edge(&mut self, subject: usize, object: usize, matters: bool, conflicts: bool) {
-        if self.get(subject).outgoing.iter().any(|e| e.object == object) {
+        if self
+            .get(subject)
+            .outgoing
+            .iter()
+            .any(|e| e.object == object)
+        {
             if let Some(e) = self
                 .get_mut(subject)
                 .outgoing
@@ -522,13 +553,25 @@ impl Transaction {
         if matches!(type_, JobType::Start | JobType::Restart) {
             for dep in section.requires.iter().chain(section.binds_to.iter()) {
                 self.add_job_and_dependencies(
-                    units, states, installed, rev, dep, JobType::Start, Some(job),
+                    units,
+                    states,
+                    installed,
+                    rev,
+                    dep,
+                    JobType::Start,
+                    Some(job),
                     MATTERS | (flags & IGNORE_ORDER),
                 )?;
             }
             for dep in section.wants.iter().chain(section.upholds.iter()) {
                 if let Err(e) = self.add_job_and_dependencies(
-                    units, states, installed, rev, dep, JobType::Start, Some(job),
+                    units,
+                    states,
+                    installed,
+                    rev,
+                    dep,
+                    JobType::Start,
+                    Some(job),
                     flags & IGNORE_ORDER,
                 ) {
                     warn!("Cannot add dependency job for {dep}: {e}");
@@ -540,7 +583,13 @@ impl Transaction {
             if let Some(svc) = &uf.service {
                 for dep in &svc.sockets {
                     if let Err(e) = self.add_job_and_dependencies(
-                        units, states, installed, rev, dep, JobType::Start, Some(job),
+                        units,
+                        states,
+                        installed,
+                        rev,
+                        dep,
+                        JobType::Start,
+                        Some(job),
                         flags & IGNORE_ORDER,
                     ) {
                         warn!("Cannot add socket activation job for {dep}: {e}");
@@ -549,7 +598,13 @@ impl Transaction {
             }
             for dep in &section.requisite {
                 self.add_job_and_dependencies(
-                    units, states, installed, rev, dep, JobType::VerifyActive, Some(job),
+                    units,
+                    states,
+                    installed,
+                    rev,
+                    dep,
+                    JobType::VerifyActive,
+                    Some(job),
                     MATTERS | (flags & IGNORE_ORDER),
                 )?;
             }
@@ -557,7 +612,13 @@ impl Transaction {
             // unit can never be active, so there is nothing to stop.
             for dep in &section.conflicts {
                 if let Err(e) = self.add_job_and_dependencies(
-                    units, states, installed, rev, dep, JobType::Stop, Some(job),
+                    units,
+                    states,
+                    installed,
+                    rev,
+                    dep,
+                    JobType::Stop,
+                    Some(job),
                     MATTERS | CONFLICTS | (flags & IGNORE_ORDER),
                 ) {
                     warn!("Cannot add conflict stop job for {dep}: {e}");
@@ -571,14 +632,24 @@ impl Transaction {
             let is_stop = type_ == JobType::Stop;
             for x in rev.propagate_stop(unit) {
                 let nt = job_type_collapse(
-                    if is_stop { JobType::Stop } else { JobType::TryRestart },
+                    if is_stop {
+                        JobType::Stop
+                    } else {
+                        JobType::TryRestart
+                    },
                     state_of(states, &x),
                 );
                 if nt == JobType::Nop {
                     continue;
                 }
                 self.add_job_and_dependencies(
-                    units, states, installed, rev, &x, nt, Some(job),
+                    units,
+                    states,
+                    installed,
+                    rev,
+                    &x,
+                    nt,
+                    Some(job),
                     MATTERS | (flags & IGNORE_ORDER),
                 )?;
             }
@@ -591,7 +662,13 @@ impl Transaction {
                     continue;
                 }
                 if let Err(e) = self.add_job_and_dependencies(
-                    units, states, installed, rev, dep, nt, Some(job),
+                    units,
+                    states,
+                    installed,
+                    rev,
+                    dep,
+                    nt,
+                    Some(job),
                     flags & IGNORE_ORDER,
                 ) {
                     warn!("Cannot add dependency reload job for {dep}: {e}");
@@ -631,7 +708,14 @@ impl Transaction {
                 continue;
             }
             if let Err(e) = self.add_job_and_dependencies(
-                units, states, installed, rev, name, JobType::Stop, Some(anchor), MATTERS,
+                units,
+                states,
+                installed,
+                rev,
+                name,
+                JobType::Stop,
+                Some(anchor),
+                MATTERS,
             ) {
                 warn!("Cannot add isolate stop job for {name}: {e}");
             }
@@ -690,11 +774,11 @@ impl Transaction {
                     if matters && mode != PlannerMode::Lenient {
                         continue;
                     }
-                    let stops_running = self.get(i).type_ == JobType::Stop
-                        && state.is_active_or_activating();
-                    let changes_existing = installed.get(&unit).is_some_and(|t| {
-                        job_type_is_conflicting(self.get(i).type_, *t)
-                    });
+                    let stops_running =
+                        self.get(i).type_ == JobType::Stop && state.is_active_or_activating();
+                    let changes_existing = installed
+                        .get(&unit)
+                        .is_some_and(|t| job_type_is_conflicting(self.get(i).type_, *t));
                     if !stops_running && !changes_existing {
                         continue;
                     }
@@ -817,13 +901,7 @@ impl Transaction {
     /// (`Dir::After` = a is assumed after b, `Dir::Before` = a is assumed
     /// before b). Returns >0 if a should run after b, <0 if a should run
     /// before b, 0 if independent.
-    fn job_compare(
-        a: JobType,
-        b: JobType,
-        a_ignore: bool,
-        b_ignore: bool,
-        dir: Dir,
-    ) -> i32 {
+    fn job_compare(a: JobType, b: JobType, a_ignore: bool, b_ignore: bool, dir: Dir) -> i32 {
         if a == JobType::Nop || b == JobType::Nop {
             return 0;
         }
@@ -1031,7 +1109,8 @@ impl Transaction {
                     let kc = self.conflicted_by(k);
                     if self.get(j).type_ == JobType::Stop && jc {
                         k
-                    } else if (self.get(k).type_ == JobType::Stop && kc) || self.get(j).type_ == JobType::Stop
+                    } else if (self.get(k).type_ == JobType::Stop && kc)
+                        || self.get(j).type_ == JobType::Stop
                     {
                         j
                     } else if self.get(k).type_ == JobType::Stop {
@@ -1113,7 +1192,10 @@ impl Transaction {
 
     /// `transaction_merge_jobs()`: ensure per-unit lists are mergeable, then
     /// merge each unit's jobs into one.
-    fn merge_jobs(&mut self, states: &HashMap<String, UnitActiveState>) -> Result<MergeOutcome, PlanError> {
+    fn merge_jobs(
+        &mut self,
+        states: &HashMap<String, UnitActiveState>,
+    ) -> Result<MergeOutcome, PlanError> {
         self.drop_nop();
         if self.ensure_mergeable(states, true)? {
             return Ok(MergeOutcome::Deleted);
@@ -1357,7 +1439,9 @@ pub fn build_plan_multi(
         flags |= PROPAGATE_START_AS_RESTART;
     }
     for (root, root_type) in roots {
-        tr.add_job_and_dependencies(units, states, installed, &rev, root, *root_type, None, flags)?;
+        tr.add_job_and_dependencies(
+            units, states, installed, &rev, root, *root_type, None, flags,
+        )?;
     }
 
     if mode == PlannerMode::Isolate {
@@ -1490,6 +1574,12 @@ mod tests {
         u
     }
 
+    fn with_socket_service(mut u: UnitFile, service: &str) -> UnitFile {
+        let s = u.socket.get_or_insert_with(Default::default);
+        s.service = service.to_string();
+        u
+    }
+
     fn map(units: Vec<UnitFile>) -> HashMap<String, UnitFile> {
         units.into_iter().map(|u| (u.name.clone(), u)).collect()
     }
@@ -1535,7 +1625,14 @@ mod tests {
             make_unit("a.service"),
             with_after(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         assert_eq!(names(&s), vec!["b.service"]);
         assert_eq!(s[0].job_type, Start);
         assert!(s[0].anchor);
@@ -1547,7 +1644,14 @@ mod tests {
             make_unit("a.service"),
             with_requires(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let mut names: Vec<&str> = names(&s);
         names.sort_unstable();
         assert_eq!(names, vec!["a.service", "b.service"]);
@@ -1565,7 +1669,14 @@ mod tests {
             make_unit("a.service"),
             with_wants(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, Start);
         assert!(!a.matters_to_anchor, "wants pull-ins must not matter");
@@ -1577,7 +1688,14 @@ mod tests {
             make_unit("a.service"),
             with_binds_to(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, Start);
         assert!(a.matters_to_anchor);
@@ -1589,7 +1707,14 @@ mod tests {
             make_unit("a.service"),
             with_upholds(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, Start);
         assert!(!a.matters_to_anchor);
@@ -1601,7 +1726,14 @@ mod tests {
             make_unit("a.service"),
             with_requisite(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, VerifyActive);
         assert!(a.matters_to_anchor);
@@ -1613,7 +1745,14 @@ mod tests {
             make_unit("a.service"),
             with_conflicts(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, Stop);
         assert!(a.matters_to_anchor);
@@ -1625,7 +1764,14 @@ mod tests {
             make_unit("a.service"),
             with_requires(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "a.service", Stop, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "a.service",
+            Stop,
+            Replace,
+        );
         let b = s.iter().find(|x| x.unit == "b.service").unwrap();
         assert_eq!(b.job_type, Stop);
         assert!(b.matters_to_anchor);
@@ -1637,7 +1783,14 @@ mod tests {
             make_unit("a.service"),
             with_part_of(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "a.service", Stop, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "a.service",
+            Stop,
+            Replace,
+        );
         let b = s.iter().find(|x| x.unit == "b.service").unwrap();
         assert_eq!(b.job_type, Stop);
     }
@@ -1648,7 +1801,14 @@ mod tests {
             make_unit("a.service"),
             with_requisite(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "a.service", Stop, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "a.service",
+            Stop,
+            Replace,
+        );
         let b = s.iter().find(|x| x.unit == "b.service").unwrap();
         assert_eq!(b.job_type, Stop);
     }
@@ -1659,7 +1819,14 @@ mod tests {
             make_unit("a.service"),
             with_reload_to(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Reload, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Reload,
+            Replace,
+        );
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, Reload);
     }
@@ -1672,13 +1839,23 @@ mod tests {
         ]);
         let mut states = HashMap::new();
         states.insert("a.service".to_string(), Inactive);
-        let s = steps(&units, &states, &HashMap::new(), "b.service", Reload, Replace);
+        let s = steps(
+            &units,
+            &states,
+            &HashMap::new(),
+            "b.service",
+            Reload,
+            Replace,
+        );
         assert_eq!(names(&s), vec!["b.service"]);
     }
 
     #[test]
     fn missing_dependency_unit_fails() {
-        let units = map(vec![with_requires(make_unit("b.service"), &["ghost.service"])]);
+        let units = map(vec![with_requires(
+            make_unit("b.service"),
+            &["ghost.service"],
+        )]);
         let err = build_plan(
             &units,
             &HashMap::new(),
@@ -1745,15 +1922,8 @@ mod tests {
         let units = map(vec![make_unit("a.service")]);
         let mut states = HashMap::new();
         states.insert("a.service".to_string(), Active);
-        let err = build_plan(
-            &units,
-            &states,
-            &HashMap::new(),
-            "a.service",
-            Stop,
-            Lenient,
-        )
-        .unwrap_err();
+        let err =
+            build_plan(&units, &states, &HashMap::new(), "a.service", Stop, Lenient).unwrap_err();
         assert_eq!(err, PlanError::Destructive);
     }
 
@@ -1779,7 +1949,14 @@ mod tests {
         let units = map(vec![make_unit("a.service")]);
         let mut installed = HashMap::new();
         installed.insert("a.service".to_string(), Stop);
-        let s = steps(&units, &HashMap::new(), &installed, "a.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &installed,
+            "a.service",
+            Start,
+            Replace,
+        );
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].job_type, Start);
     }
@@ -1794,11 +1971,21 @@ mod tests {
         let mut states = HashMap::new();
         states.insert("x.service".to_string(), Active);
         states.insert("y.service".to_string(), Inactive);
-        let s = steps(&units, &states, &HashMap::new(), "a.service", Start, Isolate);
+        let s = steps(
+            &units,
+            &states,
+            &HashMap::new(),
+            "a.service",
+            Start,
+            Isolate,
+        );
         let names: Vec<&str> = names(&s);
         assert!(names.contains(&"a.service"));
         assert!(names.contains(&"x.service"));
-        assert!(!names.contains(&"y.service"), "inactive unit without job stays");
+        assert!(
+            !names.contains(&"y.service"),
+            "inactive unit without job stays"
+        );
         let x = s.iter().find(|p| p.unit == "x.service").unwrap();
         assert_eq!(x.job_type, Stop);
         assert!(x.matters_to_anchor);
@@ -1809,7 +1996,14 @@ mod tests {
         let units = map(vec![make_unit("a.service"), make_unit("x.service")]);
         let mut installed = HashMap::new();
         installed.insert("x.service".to_string(), Start);
-        let s = steps(&units, &HashMap::new(), &installed, "a.service", Start, Isolate);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &installed,
+            "a.service",
+            Start,
+            Isolate,
+        );
         assert!(names(&s).contains(&"x.service"));
     }
 
@@ -1835,7 +2029,14 @@ mod tests {
         ]);
         let mut states = HashMap::new();
         states.insert("a.service".to_string(), Active);
-        let s = steps(&units, &states, &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &states,
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         assert_eq!(names(&s), vec!["b.service"]);
     }
 
@@ -1847,7 +2048,14 @@ mod tests {
         ]);
         let mut states = HashMap::new();
         states.insert("a.service".to_string(), Active);
-        let s = steps(&units, &states, &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &states,
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         assert_eq!(names(&s), vec!["b.service"]);
     }
 
@@ -1858,14 +2066,28 @@ mod tests {
             with_requires(make_unit("b.service"), &["a.service"]),
         ]);
         // Unknown state never marks a job redundant.
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         assert_eq!(s.len(), 2);
     }
 
     #[test]
     fn root_nop_yields_single_nop_step() {
         let units = map(vec![make_unit("a.service")]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "a.service", Nop, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "a.service",
+            Nop,
+            Replace,
+        );
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].job_type, Nop);
         assert!(s[0].anchor);
@@ -1879,9 +2101,19 @@ mod tests {
     fn duplicate_pull_ins_merge_to_single_job() {
         let units = map(vec![
             make_unit("a.service"),
-            with_requires(with_wants(make_unit("b.service"), &["a.service"]), &["a.service"]),
+            with_requires(
+                with_wants(make_unit("b.service"), &["a.service"]),
+                &["a.service"],
+            ),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let a = s.iter().filter(|x| x.unit == "a.service").count();
         assert_eq!(a, 1);
         assert_eq!(s.len(), 2);
@@ -1891,9 +2123,19 @@ mod tests {
     fn requisite_merges_into_start() {
         let units = map(vec![
             make_unit("a.service"),
-            with_requisite(with_requires(make_unit("b.service"), &["a.service"]), &["a.service"]),
+            with_requisite(
+                with_requires(make_unit("b.service"), &["a.service"]),
+                &["a.service"],
+            ),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, Start, "Start + VerifyActive merges into Start");
     }
@@ -1902,7 +2144,10 @@ mod tests {
     fn conflicting_requires_and_conflicts_fail() {
         let units = map(vec![
             make_unit("a.service"),
-            with_conflicts(with_requires(make_unit("b.service"), &["a.service"]), &["a.service"]),
+            with_conflicts(
+                with_requires(make_unit("b.service"), &["a.service"]),
+                &["a.service"],
+            ),
         ]);
         // Start and Stop for the same unit, both mattering: unfixable.
         let err = build_plan(
@@ -1925,13 +2170,23 @@ mod tests {
     fn plan_respects_ordering_edges() {
         let units = map(vec![
             make_unit("a.service"),
-            with_after(with_requires(make_unit("b.service"), &["a.service"]), &["a.service"]),
+            with_after(
+                with_requires(make_unit("b.service"), &["a.service"]),
+                &["a.service"],
+            ),
             with_after(
                 with_requires(make_unit("c.service"), &["a.service", "b.service"]),
                 &["b.service"],
             ),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "c.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "c.service",
+            Start,
+            Replace,
+        );
         let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
         // Requires= pulls units in but does not order them; only the
         // After= edges (b After= a, c After= b) create the wait chain.
@@ -1949,7 +2204,14 @@ mod tests {
                 &["svc.service"],
             ),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "root.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "root.service",
+            Start,
+            Replace,
+        );
         let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
         // Requires= does not order, but the socket must be bound before the
         // service spawns (System S requests listener fds at spawn time).
@@ -1963,9 +2225,71 @@ mod tests {
             make_unit("svc.socket"),
             with_binds_to(make_unit("svc.service"), &["svc.socket"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "svc.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "svc.service",
+            Start,
+            Replace,
+        );
         let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
         assert!(pos("svc.socket") < pos("svc.service"));
+    }
+
+    #[test]
+    fn after_socket_also_orders_after_socket_service() {
+        // A unit ordered `After=` a socket (e.g. systemd-udev-trigger.service
+        // `After=systemd-udevd-kernel.socket`) must also run after the
+        // socket's activated service is started, so the service (udevd) is
+        // already bound to its netlink socket and ready to consume the
+        // events the dependent unit produces (coldplug -> kmod).
+        // Explicit [Socket] Service= (as in systemd-udevd-kernel.socket ->
+        // Service=systemd-udevd.service): ordering after the socket must also
+        // order after that resolved service, so udevd is bound to its netlink
+        // socket before udevadm trigger cold-plugs devices.
+        let units = map(vec![
+            with_socket_service(make_unit("udevd-kernel.socket"), "udevd.service"),
+            make_unit("udevd.service"),
+            with_after(
+                with_requires(
+                    make_unit("udev-trigger.service"),
+                    &["udevd-kernel.socket", "udevd.service"],
+                ),
+                &["udevd-kernel.socket"],
+            ),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "udev-trigger.service",
+            Start,
+            Replace,
+        );
+        let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
+        assert!(pos("udevd.service") < pos("udev-trigger.service"));
+        assert!(pos("udevd-kernel.socket") < pos("udevd.service"));
+
+        // Convention-based resolution ("foo.socket" -> "foo.service").
+        let units = map(vec![
+            make_unit("trig.socket"),
+            make_unit("trig.service"),
+            with_after(
+                with_requires(make_unit("svc.service"), &["trig.socket", "trig.service"]),
+                &["trig.socket"],
+            ),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "svc.service",
+            Start,
+            Replace,
+        );
+        let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
+        assert!(pos("trig.service") < pos("svc.service"));
     }
 
     #[test]
@@ -1977,7 +2301,14 @@ mod tests {
             with_requires(make_unit("root.service"), &["a.service", "b.service"]),
             with_before(make_unit("a.service"), &["b.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "root.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "root.service",
+            Start,
+            Replace,
+        );
         let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
         // a Before= b means b must start after a.
         assert!(pos("a.service") < pos("b.service"));
@@ -1987,9 +2318,19 @@ mod tests {
     fn restart_job_does_not_wait_for_after_dependency() {
         let units = map(vec![
             make_unit("a.service"),
-            with_after(with_requires(make_unit("b.service"), &["a.service"]), &["a.service"]),
+            with_after(
+                with_requires(make_unit("b.service"), &["a.service"]),
+                &["a.service"],
+            ),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Restart, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Restart,
+            Replace,
+        );
         // job_compare(b=Restart, a=Start, AFTER) < 0: a restart (stop phase)
         // never waits for its After= dependencies. Both jobs are runnable
         // immediately and the serialization emits them in unit order.
@@ -2006,9 +2347,19 @@ mod tests {
         let units = map(vec![
             make_unit("a.service"),
             make_unit("c.service"),
-            with_after(with_conflicts(make_unit("b.service"), &["c.service"]), &["c.service"]),
+            with_after(
+                with_conflicts(make_unit("b.service"), &["c.service"]),
+                &["c.service"],
+            ),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "b.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "b.service",
+            Start,
+            Replace,
+        );
         let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
         // c gets a Stop (conflicts); b has After=c, so the stop runs first.
         let c = s.iter().find(|x| x.unit == "c.service").unwrap();
@@ -2030,7 +2381,14 @@ mod tests {
         ]);
         // root a: requires c (matters); wants b (does not matter).
         // b After= c and c After= b form a cycle; b does not matter → deleted.
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "a.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "a.service",
+            Start,
+            Replace,
+        );
         let names: Vec<&str> = names(&s);
         assert!(names.contains(&"a.service"));
         assert!(names.contains(&"c.service"));
@@ -2066,7 +2424,10 @@ mod tests {
         // a requires b pulls b into the plan; the After= pair then forms an
         // unfixable ordering cycle (both jobs matter).
         let units = map(vec![
-            with_requires(with_after(make_unit("a.service"), &["b.service"]), &["b.service"]),
+            with_requires(
+                with_after(make_unit("a.service"), &["b.service"]),
+                &["b.service"],
+            ),
             with_after(make_unit("b.service"), &["a.service"]),
         ]);
         let err = build_plan(
@@ -2090,7 +2451,14 @@ mod tests {
             with_after(make_unit("a.service"), &["b.service"]),
             with_after(make_unit("b.service"), &["a.service"]),
         ]);
-        let s = steps(&units, &HashMap::new(), &HashMap::new(), "a.service", Start, Replace);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "a.service",
+            Start,
+            Replace,
+        );
         assert_eq!(names(&s), vec!["a.service"]);
     }
 
@@ -2114,10 +2482,7 @@ mod tests {
             PlannerMode::from_job_mode(JobMode::IgnoreRequirements),
             IgnoreRequirements
         );
-        assert_eq!(
-            PlannerMode::from_job_mode(JobMode::Lenient),
-            Lenient
-        );
+        assert_eq!(PlannerMode::from_job_mode(JobMode::Lenient), Lenient);
         assert_eq!(
             PlannerMode::from_job_mode(JobMode::ReplaceIrreversibly),
             ReplaceIrreversibly
@@ -2161,7 +2526,10 @@ mod tests {
         // c.service is the "sysinit" equivalent
         let units = map(vec![
             with_before(make_unit("a.service"), &["b.service"]),
-            with_requires(with_after(make_unit("b.service"), &["c.service"]), &["c.service"]),
+            with_requires(
+                with_after(make_unit("b.service"), &["c.service"]),
+                &["c.service"],
+            ),
             make_unit("c.service"),
         ]);
         let s = steps_multi(
@@ -2173,12 +2541,18 @@ mod tests {
         );
         let n = names(&s);
         // c must come before b (Requires + After), a must come before b (Before)
-        assert!(n.iter().position(|&x| x == "c.service").unwrap()
-            < n.iter().position(|&x| x == "b.service").unwrap(),
-            "c must start before b: {:?}", n);
-        assert!(n.iter().position(|&x| x == "a.service").unwrap()
-            < n.iter().position(|&x| x == "b.service").unwrap(),
-            "a must start before b: {:?}", n);
+        assert!(
+            n.iter().position(|&x| x == "c.service").unwrap()
+                < n.iter().position(|&x| x == "b.service").unwrap(),
+            "c must start before b: {:?}",
+            n
+        );
+        assert!(
+            n.iter().position(|&x| x == "a.service").unwrap()
+                < n.iter().position(|&x| x == "b.service").unwrap(),
+            "a must start before b: {:?}",
+            n
+        );
         // Both anchors should be present
         assert!(s.iter().any(|s| s.unit == "a.service" && s.anchor));
         assert!(s.iter().any(|s| s.unit == "b.service" && s.anchor));
@@ -2220,19 +2594,36 @@ mod tests {
     fn nologin_race_requires_default_dependencies() {
         // Real unit graph on the VM rootfs.
         let tmpfiles = with_after(
-            with_before(make_unit("systemd-tmpfiles-setup.service"), &["sysinit.target"]),
-            &["local-fs.target", "systemd-sysusers.service", "systemd-journald.service"],
+            with_before(
+                make_unit("systemd-tmpfiles-setup.service"),
+                &["sysinit.target"],
+            ),
+            &[
+                "local-fs.target",
+                "systemd-sysusers.service",
+                "systemd-journald.service",
+            ],
         );
         let user_sessions = with_after(
             make_unit("systemd-user-sessions.service"),
-            &["remote-fs.target", "nss-user-lookup.target", "network.target", "home.mount"],
+            &[
+                "remote-fs.target",
+                "nss-user-lookup.target",
+                "network.target",
+                "home.mount",
+            ],
         );
         let sysinit = make_unit("sysinit.target");
         let remote_fs = make_unit("remote-fs.target");
 
         // Without injection: no edge between the two anchors -> no ordering
         // guarantee (this mirrors what the VM actually ran).
-        let units = map(vec![tmpfiles.clone(), user_sessions.clone(), sysinit.clone(), remote_fs]);
+        let units = map(vec![
+            tmpfiles.clone(),
+            user_sessions.clone(),
+            sysinit.clone(),
+            remote_fs,
+        ]);
         let s = steps_multi(
             &units,
             &HashMap::new(),
@@ -2243,12 +2634,26 @@ mod tests {
             ],
             Replace,
         );
-        assert_eq!(names(&s).len(), 2, "no pull-in without Requires: {:?}", names(&s));
+        assert_eq!(
+            names(&s).len(),
+            2,
+            "no pull-in without Requires: {:?}",
+            names(&s)
+        );
 
         // With injection: user-sessions gains Requires+After=sysinit.target,
         // tmpfiles keeps Before=sysinit.target -> strict ordering via sysinit.
-        let injected = with_requires(with_after(user_sessions, &["sysinit.target"]), &["sysinit.target"]);
-        let units = map(vec![tmpfiles, injected, sysinit, make_unit("local-fs.target"), make_unit("systemd-journald.service")]);
+        let injected = with_requires(
+            with_after(user_sessions, &["sysinit.target"]),
+            &["sysinit.target"],
+        );
+        let units = map(vec![
+            tmpfiles,
+            injected,
+            sysinit,
+            make_unit("local-fs.target"),
+            make_unit("systemd-journald.service"),
+        ]);
         let s = steps_multi(
             &units,
             &HashMap::new(),
@@ -2261,7 +2666,11 @@ mod tests {
         );
         let n = names(&s);
         assert!(n.contains(&"sysinit.target"), "sysinit pulled in: {:?}", n);
-        let pos = |u: &str| n.iter().position(|&x| x == u).unwrap_or_else(|| panic!("{u} not in plan {n:?}"));
+        let pos = |u: &str| {
+            n.iter()
+                .position(|&x| x == u)
+                .unwrap_or_else(|| panic!("{u} not in plan {n:?}"))
+        };
         assert!(
             pos("systemd-tmpfiles-setup.service") < pos("systemd-user-sessions.service"),
             "tmpfiles must complete before user-sessions: {n:?}",
@@ -2273,8 +2682,14 @@ mod tests {
     #[test]
     fn multi_anchor_shared_dependency() {
         let units = map(vec![
-            with_after(with_requires(make_unit("a.service"), &["shared.service"]), &["shared.service"]),
-            with_after(with_requires(make_unit("b.service"), &["shared.service"]), &["shared.service"]),
+            with_after(
+                with_requires(make_unit("a.service"), &["shared.service"]),
+                &["shared.service"],
+            ),
+            with_after(
+                with_requires(make_unit("b.service"), &["shared.service"]),
+                &["shared.service"],
+            ),
             make_unit("shared.service"),
         ]);
         let s = steps_multi(
@@ -2308,7 +2723,10 @@ mod tests {
         let units = map(vec![
             make_unit("control.socket"),
             make_unit("kernel.socket"),
-            with_sockets(make_unit("udevd.service"), &["control.socket", "kernel.socket"]),
+            with_sockets(
+                make_unit("udevd.service"),
+                &["control.socket", "kernel.socket"],
+            ),
         ]);
         let s = steps(
             &units,
@@ -2347,8 +2765,16 @@ mod tests {
             Replace,
         );
         let n = names(&s);
-        assert!(n.contains(&"my.socket"), "my.socket should be pulled in: {:?}", n);
-        assert!(n.contains(&"my.service"), "my.service should be in plan: {:?}", n);
+        assert!(
+            n.contains(&"my.socket"),
+            "my.socket should be pulled in: {:?}",
+            n
+        );
+        assert!(
+            n.contains(&"my.service"),
+            "my.service should be in plan: {:?}",
+            n
+        );
     }
 
     /// Sockets= and Requires= for the same socket unit merge into a single
@@ -2371,7 +2797,11 @@ mod tests {
             Replace,
         );
         let socket_count = s.iter().filter(|x| x.unit == "svc.socket").count();
-        assert_eq!(socket_count, 1, "svc.socket should appear once, got {}", socket_count);
+        assert_eq!(
+            socket_count, 1,
+            "svc.socket should appear once, got {}",
+            socket_count
+        );
     }
 
     /// Sockets= with After= ordering: socket units from both Requires= and
@@ -2382,7 +2812,10 @@ mod tests {
             make_unit("control.socket"),
             make_unit("kernel.socket"),
             with_after(
-                with_sockets(make_unit("udevd.service"), &["control.socket", "kernel.socket"]),
+                with_sockets(
+                    make_unit("udevd.service"),
+                    &["control.socket", "kernel.socket"],
+                ),
                 &["control.socket", "kernel.socket"],
             ),
             with_after(
