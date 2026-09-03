@@ -2293,6 +2293,107 @@ mod tests {
     }
 
     #[test]
+    fn after_socket_resolves_explicit_service_in_after_deps() {
+        // Direct check of after_deps(): a unit ordered After= a socket whose
+        // [Socket] Service= is explicit must also depend on that service.
+        let units = map(vec![
+            with_socket_service(make_unit("udevd-kernel.socket"), "udevd.service"),
+            make_unit("udevd.service"),
+            with_after(make_unit("udev-trigger.service"), &["udevd-kernel.socket"]),
+        ]);
+        let rev = ReverseIndex::build(&units);
+        let after = rev.after_deps(&units, "udev-trigger.service");
+        assert!(after.contains(&"udevd-kernel.socket".to_string()));
+        // Explicit Service= resolution: udevd-kernel.socket -> udevd.service.
+        assert!(after.contains(&"udevd.service".to_string()));
+    }
+
+    #[test]
+    fn after_socket_resolves_convention_service_in_after_deps() {
+        // Without an explicit [Socket] Service=, the "foo.socket" ->
+        // "foo.service" convention applies.
+        let units = map(vec![
+            make_unit("trig.socket"),
+            make_unit("trig.service"),
+            with_after(make_unit("svc.service"), &["trig.socket"]),
+        ]);
+        let rev = ReverseIndex::build(&units);
+        let after = rev.after_deps(&units, "svc.service");
+        assert!(after.contains(&"trig.socket".to_string()));
+        assert!(after.contains(&"trig.service".to_string()));
+    }
+
+    #[test]
+    fn sockets_directive_socket_also_resolves_to_activated_service() {
+        // A socket pulled in via [Service] Sockets= is an ordering target;
+        // the resolution step must also order after that socket's activated
+        // service (the service is started to consume events).
+        let units = map(vec![
+            with_socket_service(make_unit("kernel.socket"), "udevd.service"),
+            with_sockets(make_unit("udevd.service"), &["kernel.socket"]),
+            with_after(make_unit("udev-trigger.service"), &["kernel.socket"]),
+        ]);
+        let rev = ReverseIndex::build(&units);
+        let after = rev.after_deps(&units, "udev-trigger.service");
+        assert!(after.contains(&"kernel.socket".to_string()));
+        // kernel.socket -> Service=udevd.service, so trigger must also wait
+        // for udevd.service to be started.
+        assert!(after.contains(&"udevd.service".to_string()));
+    }
+
+    #[test]
+    fn after_plain_service_is_not_treated_as_socket() {
+        // The resolution only kicks in for `.socket` targets; a plain
+        // `After=some.service` is left exactly as declared.
+        let units = map(vec![
+            make_unit("plain.service"),
+            with_after(make_unit("svc.service"), &["plain.service"]),
+        ]);
+        let rev = ReverseIndex::build(&units);
+        let after = rev.after_deps(&units, "svc.service");
+        assert!(after.contains(&"plain.service".to_string()));
+        assert_eq!(after.len(), 1, "no extra deps beyond the declared After=");
+    }
+
+    #[test]
+    fn sockets_directive_orders_trigger_after_udevd() {
+        // End-to-end mirror of the real boot relationship:
+        //   systemd-udevd.service          Sockets=udevd-control.socket udevd-kernel.socket
+        //   systemd-udevd-kernel.socket    [Socket] Service=systemd-udevd.service
+        //   systemd-udev-trigger.service   After=udevd-control.socket udevd-kernel.socket
+        // The trigger must start after udevd is ready so its coldplug uevent
+        // (MODALIAS -> kmod bochs) is not dropped.
+        let units = map(vec![
+            with_wants(
+                with_after(make_unit("udev-trigger.service"), &[
+                    "udevd-control.socket",
+                    "udevd-kernel.socket",
+                ]),
+                &["udevd.service"],
+            ),
+            with_socket_service(make_unit("udevd-kernel.socket"), "udevd.service"),
+            make_unit("udevd-control.socket"),
+            with_sockets(make_unit("udevd.service"), &[
+                "udevd-control.socket",
+                "udevd-kernel.socket",
+            ]),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "udev-trigger.service",
+            Start,
+            Replace,
+        );
+        let pos = |n: &str| s.iter().position(|x| x.unit == n).unwrap();
+        // Both sockets, and hence udevd, must start before the trigger.
+        assert!(pos("udevd-control.socket") < pos("udev-trigger.service"));
+        assert!(pos("udevd-kernel.socket") < pos("udev-trigger.service"));
+        assert!(pos("udevd.service") < pos("udev-trigger.service"));
+    }
+
+    #[test]
     fn before_edges_are_normalized_into_after() {
         let units = map(vec![
             make_unit("a.service"),
