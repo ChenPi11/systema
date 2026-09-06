@@ -1509,6 +1509,25 @@ pub fn handle_task_result(
                 } else {
                     JobStatus::Failed(message.to_string())
                 };
+                // Revert cached state to inactive when a Start/Restart job
+                // directly fails.  This prevents unit_states from showing
+                // "active" for a unit whose own job failed.
+                if !success && matches!(kind, JobKind::Start | JobKind::Restart) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+                    let entry = state.unit_states.entry(unit_name.to_string()).or_default();
+                    if !matches!(entry.active_state.as_str(), "inactive" | "failed") {
+                        entry.active_enter_timestamp = 0;
+                    }
+                    entry.active_state = "inactive".to_string();
+                    entry.sub_state.clear();
+                    entry.invocation_id.clear();
+                    if entry.inactive_enter_timestamp == 0 {
+                        entry.inactive_enter_timestamp = now;
+                    }
+                }
             }
             if let Some(ref tx) = state.job_completion_tx {
                 let _ = tx.send(JobCompletion {
@@ -1711,6 +1730,27 @@ fn fail_dependents(state: &mut AllocatorState, failed: &str, kind: JobKind) {
                         abort.abort();
                     }
                     job.status = JobStatus::Failed(format!("dependency failed: {name}"));
+                }
+                // Revert cached state to inactive: the dependent's Start job
+                // just failed, so the unit is not actually active.  This
+                // prevents unit_states from showing "active" for a unit whose
+                // job failed (e.g. poweroff.target whose dependency
+                // systemd-poweroff.service failed).
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+                    let entry = state.unit_states.entry(dep.clone()).or_default();
+                    if !matches!(entry.active_state.as_str(), "inactive" | "failed") {
+                        entry.active_enter_timestamp = 0;
+                    }
+                    entry.active_state = "inactive".to_string();
+                    entry.sub_state.clear();
+                    entry.invocation_id.clear();
+                    if entry.inactive_enter_timestamp == 0 {
+                        entry.inactive_enter_timestamp = now;
+                    }
                 }
                 if let Some(ref tx) = state.job_completion_tx {
                     let _ = tx.send(JobCompletion {
@@ -3466,6 +3506,88 @@ mod tests {
         let completion = rx.try_recv().expect("completion emitted");
         assert_eq!(completion.unit_name, "b.service");
         assert_eq!(completion.result, JobResultKind::Dependency);
+    }
+
+    #[test]
+    fn test_fail_dependents_reverts_dependent_cache_to_inactive() {
+        // Regression test: poweroff.target Requires=systemd-poweroff.service;
+        // when the service's Start fails, fail_dependents fails the target's
+        // job AND must revert its cached state to inactive, otherwise
+        // systemctl sees a failed job while `unit_states` still claims the
+        // unit is "active".
+        let mut state = AllocatorState::new();
+        state
+            .units
+            .insert("systemd-poweroff.service".to_string(), make_unit("systemd-poweroff.service"));
+        let (bt, mut target) = unit_requires("poweroff.target", &["systemd-poweroff.service"]);
+        target.unit.after.insert("systemd-poweroff.service".to_string());
+        state.units.insert(bt, target);
+        state_with_job(&mut state, "systemd-poweroff.service", JobKind::Start);
+        state_with_job(&mut state, "poweroff.target", JobKind::Start);
+        // The target worker reported "active" before the dependency failed.
+        cached_active(&mut state, "poweroff.target");
+        cached_active(&mut state, "systemd-poweroff.service");
+
+        fail_dependents(&mut state, "systemd-poweroff.service", JobKind::Start);
+
+        let target_cache = state.unit_states.get("poweroff.target").unwrap();
+        assert_eq!(target_cache.active_state, "inactive");
+        assert!(target_cache.invocation_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_task_result_start_failure_reverts_cache_to_inactive() {
+        // A unit whose own Start job fails directly must not stay "active"
+        // in the cache (systemd: a failed start leaves the unit inactive).
+        let alloc = alloc_with_state("inactive");
+        {
+            let mut state = alloc.write();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            // Keep the worker side alive so dispatch doesn't fail with
+            // "Worker disconnected" before we report the task result.
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            state.workers.insert(
+                "test-worker".to_string(),
+                WorkerEntry {
+                    worker_id: "test-worker".to_string(),
+                    unit_types: vec!["service".to_string()],
+                    supports_unit_define: false,
+                    ready: false,
+                    envelope_tx: tx,
+                },
+            );
+        }
+        let (job_id, kind) = enqueue_job_type(
+            alloc.clone(),
+            "demo.service",
+            JobType::Start,
+            false,
+            JobMode::Replace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kind, JobKind::Start);
+        {
+            let mut state = alloc.write();
+            cached_active(&mut state, "demo.service");
+        }
+
+        handle_task_result(
+            alloc.clone(),
+            job_id,
+            false,
+            "ExecStart is empty for demo.service",
+            "demo.service",
+            JobKind::Start,
+        );
+
+        let state = alloc.read();
+        assert!(matches!(
+            state.jobs.get(&job_id).unwrap().status,
+            JobStatus::Failed(_)
+        ));
+        assert_eq!(state.unit_states.get("demo.service").unwrap().active_state, "inactive");
+        assert!(state.unit_states.get("demo.service").unwrap().invocation_id.is_empty());
     }
 
     // =========================================================================

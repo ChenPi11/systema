@@ -428,22 +428,38 @@ async fn handle_worker_session(
                                 &result.unit_name,
                                 kind,
                             );
-                            if !result.result.is_empty() {
-                                if let Some(unit_status) = UnitStatus::decode_from(&result.result) {
-                                    let mut state = alloc_for_recv.write();
-                                    let entry = state
-                                        .unit_states
-                                        .entry(result.unit_name.clone())
-                                        .or_default();
-                                    apply_state_to_cache(entry, &unit_status);
+                            // After the job is updated, check whether this
+                            // unit's Start/Restart job ended in Failed (e.g.
+                            // via dependency failure in `fail_dependents`).
+                            // If so, the unit did NOT successfully start and
+                            // the cache must reflect "inactive" regardless of
+                            // what the worker reports — the worker's
+                            // "active" status is stale (the worker started
+                            // the resource but the job-level transaction
+                            // failed).
+                            {
+                                let mut state = alloc_for_recv.write();
+                                if unit_has_failed_start_job(&state, &result.unit_name) {
+                                    revert_cache_to_inactive(&mut state, &result.unit_name);
+                                } else if !result.result.is_empty() {
+                                    if let Some(unit_status) =
+                                        UnitStatus::decode_from(&result.result)
+                                    {
+                                        let entry = state
+                                            .unit_states
+                                            .entry(result.unit_name.clone())
+                                            .or_default();
+                                        apply_state_to_cache(entry, &unit_status);
+                                    }
+                                } else {
+                                    drop(state);
+                                    update_cache_on_task_result(
+                                        &alloc_for_recv,
+                                        &result.unit_name,
+                                        kind,
+                                        result.success,
+                                    );
                                 }
-                            } else {
-                                update_cache_on_task_result(
-                                    &alloc_for_recv,
-                                    &result.unit_name,
-                                    kind,
-                                    result.success,
-                                );
                             }
                         } else {
                             warn!(
@@ -1773,6 +1789,43 @@ fn apply_state_to_cache(entry: &mut CachedUnitState, status: &UnitStatus) {
     }
 }
 
+/// Revert a unit's cached runtime state to `inactive`.
+///
+/// Called when a Start/Restart job ends in `Failed` (either directly or via
+/// dependency failure) so that the cache reflects the reality that the unit
+/// did not successfully start.  This prevents the `unit_states` entry from
+/// remaining `active` after a failed Start job.
+fn revert_cache_to_inactive(state: &mut crate::state::AllocatorState, unit_name: &str) {
+    let now = now_usec();
+    let entry = state.unit_states.entry(unit_name.to_string()).or_default();
+    if !matches!(entry.active_state.as_str(), "inactive" | "failed") {
+        entry.active_enter_timestamp = 0;
+    }
+    entry.active_state = "inactive".to_string();
+    entry.sub_state.clear();
+    entry.invocation_id.clear();
+    if entry.inactive_enter_timestamp == 0 {
+        entry.inactive_enter_timestamp = now;
+    }
+}
+
+/// Whether the unit currently has a terminal-Failed Start/Restart job.
+///
+/// Used to guard the `method.result` cache path: a worker may report a unit
+/// as `active` (e.g. a target worker that already set the target state) even
+/// though the unit's job failed (e.g. via dependency failure).  The stale
+/// worker status must not overwrite the failed-job reality back to `active`.
+fn unit_has_failed_start_job(state: &crate::state::AllocatorState, unit_name: &str) -> bool {
+    state.jobs.values().any(|j| {
+        j.unit_name == unit_name
+            && matches!(
+                j.kind,
+                crate::state::JobKind::Start | crate::state::JobKind::Restart
+            )
+            && matches!(j.status, crate::state::JobStatus::Failed(_))
+    })
+}
+
 /// Optimistically update the runtime cache when a task completes, based on
 /// what we know the new state should be.
 fn update_cache_on_task_result(
@@ -2268,5 +2321,82 @@ mod tests {
             resolve_socket_service(&state, "ghost.socket"),
             "ghost.service"
         );
+    }
+
+    #[test]
+    fn revert_cache_to_inactive_clears_active_entry() {
+        let mut state = crate::state::AllocatorState::new();
+        let entry = state.unit_states.entry("poweroff.target".to_string()).or_default();
+        entry.active_state = "active".to_string();
+        entry.sub_state = "running".to_string();
+        entry.invocation_id = "some-uuid".to_string();
+        entry.active_enter_timestamp = 123;
+        entry.inactive_enter_timestamp = 0;
+
+        revert_cache_to_inactive(&mut state, "poweroff.target");
+
+        let entry = state.unit_states.get("poweroff.target").unwrap();
+        assert_eq!(entry.active_state, "inactive");
+        assert_eq!(entry.sub_state, "");
+        assert_eq!(entry.invocation_id, "");
+        assert_eq!(entry.active_enter_timestamp, 0);
+        assert_ne!(entry.inactive_enter_timestamp, 0);
+    }
+
+    #[test]
+    fn revert_cache_to_inactive_preserves_failed_state_but_sets_inactive() {
+        // A failed start should leave the unit inactive (not "failed" cached
+        // state from the worker).
+        let mut state = crate::state::AllocatorState::new();
+        let entry = state.unit_states.entry("foo.service".to_string()).or_default();
+        entry.active_state = "failed".to_string();
+
+        revert_cache_to_inactive(&mut state, "foo.service");
+
+        assert_eq!(state.unit_states.get("foo.service").unwrap().active_state, "inactive");
+    }
+
+    #[test]
+    fn unit_has_failed_start_job_detects_failed_start() {
+        use crate::state::{Job, JobKind, JobStatus};
+
+        let mut state = crate::state::AllocatorState::new();
+        state.jobs.insert(
+            1,
+            Job {
+                id: 1,
+                unit_name: "poweroff.target".to_string(),
+                kind: JobKind::Start,
+                status: JobStatus::Failed("dependency failed: systemd-poweroff.service".to_string()),
+                timeout_abort: None,
+            },
+        );
+
+        assert!(unit_has_failed_start_job(&state, "poweroff.target"));
+        // A failed Restart job is also a failed start-type job.
+        state.jobs.insert(
+            4,
+            Job {
+                id: 4,
+                unit_name: "reloadable.service".to_string(),
+                kind: JobKind::Restart,
+                status: JobStatus::Failed("boom".to_string()),
+                timeout_abort: None,
+            },
+        );
+        assert!(unit_has_failed_start_job(&state, "reloadable.service"));
+        // Other unit / other kinds / non-terminal jobs are not flagged.
+        assert!(!unit_has_failed_start_job(&state, "systemd-poweroff.service"));
+        state.jobs.insert(
+            2,
+            Job {
+                id: 2,
+                unit_name: "other.service".to_string(),
+                kind: JobKind::Start,
+                status: JobStatus::Running,
+                timeout_abort: None,
+            },
+        );
+        assert!(!unit_has_failed_start_job(&state, "other.service"));
     }
 }
