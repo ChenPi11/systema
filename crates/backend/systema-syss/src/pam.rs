@@ -313,6 +313,7 @@ impl PamSession {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use super::*;
 
     #[test]

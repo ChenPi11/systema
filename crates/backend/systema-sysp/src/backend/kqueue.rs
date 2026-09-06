@@ -88,14 +88,15 @@ impl KqueueBackend {
             return None;
         }
 
-        let change = libc::kevent {
-            ident: fd as libc::uintptr_t,
-            filter: libc::EVFILT_VNODE,
-            flags: libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT,
-            fflags: VNODE_FFLAGS,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
+        // Built via zeroed() (not a struct literal) so the `ext` padding
+        // field added to `kevent` on FreeBSD 12+ needs no per-platform field.
+        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        change.ident = fd as libc::uintptr_t;
+        change.filter = libc::EVFILT_VNODE;
+        change.flags = libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT;
+        change.fflags = VNODE_FFLAGS;
+        change.data = 0;
+        change.udata = std::ptr::null_mut();
         // SAFETY: kevent() with one change; the fd and constants are valid.
         let n = unsafe {
             libc::kevent(
@@ -160,35 +161,46 @@ impl PathBackend for KqueueBackend {
     }
 
     async fn changes(&self) -> Vec<PathChange> {
-        let mut events: [libc::kevent; MAX_EVENTS] = unsafe { std::mem::zeroed() };
         let zero_timeout = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         loop {
-            // SAFETY: events array is MAX_EVENTS long and valid for write.
-            let n = unsafe {
-                libc::kevent(
-                    self.kq.as_raw_fd(),
-                    std::ptr::null(),
-                    0,
-                    events.as_mut_ptr(),
-                    MAX_EVENTS as i32,
-                    &zero_timeout,
-                )
-            };
-            if n > 0 {
-                return self.collect(&events[..n as usize]);
-            }
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::Interrupted
-                {
-                    // No events pending; poll again after a short pause.
+            // The kevent buffer holds a raw `udata` pointer and is therefore
+            // not `Send`, so it must not survive the `.await` below. The
+            // buffer is scoped to this block and dropped before the sleep.
+            let result = {
+                let mut events: [libc::kevent; MAX_EVENTS] =
+                    unsafe { std::mem::zeroed() };
+                // SAFETY: events array is MAX_EVENTS long and valid for write.
+                let n = unsafe {
+                    libc::kevent(
+                        self.kq.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        events.as_mut_ptr(),
+                        MAX_EVENTS as i32,
+                        &zero_timeout,
+                    )
+                };
+                if n > 0 {
+                    Some(self.collect(&events[..n as usize]))
                 } else {
-                    warn!("kqueue kevent() failed: {err}; retrying");
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::Interrupted
+                        {
+                            // No events pending; poll again after a short pause.
+                        } else {
+                            warn!("kqueue kevent() failed: {err}; retrying");
+                        }
+                    }
+                    None
                 }
+            };
+            if let Some(changes) = result {
+                return changes;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }

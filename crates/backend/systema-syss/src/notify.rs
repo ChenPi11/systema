@@ -35,13 +35,84 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use nix::cmsg_space;
 use nix::sys::socket::{
-    bind, recvmsg, setsockopt, socket, sockopt, AddressFamily, ControlMessageOwned, MsgFlags,
-    SockFlag, SockType, UnixAddr, UnixCredentials,
+    bind, recvmsg, socket, AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr, UnixCredentials,
 };
 use nix::sys::stat::{fchmod, Mode};
 use tracing::{debug, info, warn};
 
 use crate::process::{is_alive, pid_is_zombie};
+
+// The sd_notify sender-credential mechanism differs by platform: Linux
+// attaches per-message `SCM_CREDENTIALS` (enabled via `SO_PASSCRED`); the
+// BSDs carry `SCM_CREDS` (enabled via `LOCAL_CREDS`).  The reader logic is
+// otherwise identical, so only the socket option and the received
+// control-message variant are abstracted here.
+mod imp {
+    use std::os::unix::io::{AsRawFd, OwnedFd};
+
+    use nix::sys::socket::ControlMessageOwned;
+
+    /// Enable delivery of the sender's credentials on the notify socket.
+    pub fn enable_sender_credentials(fd: &OwnedFd) -> nix::Result<()> {
+        let one: nix::libc::c_int = 1;
+        // SAFETY: fd is a valid socket; LOCAL_CREDS is a boolean socket
+        // option on the BSDs (no-op elsewhere), SO_PASSCRED on Linux.
+        let ret = unsafe {
+            nix::libc::setsockopt(
+                fd.as_raw_fd(),
+                nix::libc::SOL_SOCKET,
+                credentials_option(),
+                &one as *const _ as *const nix::libc::c_void,
+                std::mem::size_of::<nix::libc::c_int>() as nix::libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(nix::errno::Errno::last())
+        }
+    }
+
+    /// Extract the sender PID from a received control message, if present.
+    pub fn sender_pid(c: &ControlMessageOwned) -> Option<u32> {
+        match c {
+            #[cfg(target_os = "linux")]
+            ControlMessageOwned::ScmCredentials(u) => Some(u.pid() as u32),
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            ControlMessageOwned::ScmCreds(u) => Some(u.pid() as u32),
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn credentials_option() -> nix::libc::c_int {
+        nix::libc::SO_PASSCRED
+    }
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    fn credentials_option() -> nix::libc::c_int {
+        nix::libc::LOCAL_CREDS
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    fn credentials_option() -> nix::libc::c_int {
+        0
+    }
+}
 
 /// `NOTIFY_SOCKET` value passed to notify-type services: `<runtime>/notify`
 /// (i.e. `/run/systemd/notify`), exactly where systemd binds its socket.
@@ -142,8 +213,10 @@ impl NotifyManager {
             warn!("Failed to chmod sd_notify socket '{path}': {e}");
         }
 
-        if let Err(e) = setsockopt(&fd, sockopt::PassCred, &true) {
-            warn!("Failed to enable SO_PASSCRED for sd_notify socket: {e}");
+        // Enable sender credentials (SO_PASSCRED on Linux, LOCAL_CREDS on
+        // the BSDs) so the reader can attribute each message to a service.
+        if let Err(e) = imp::enable_sender_credentials(&fd) {
+            warn!("Failed to enable sender credentials for sd_notify socket: {e}");
             return None;
         }
 
@@ -288,12 +361,7 @@ fn spawn_reader(fd: RawFd, tracker: Arc<Mutex<Tracker>>) {
                         }
                     };
                     let pid = match msg.cmsgs() {
-                        Ok(cmsgs) => cmsgs
-                            .filter_map(|c| match c {
-                                ControlMessageOwned::ScmCredentials(u) => Some(u.pid() as u32),
-                                _ => None,
-                            })
-                            .next(),
+                        Ok(cmsgs) => cmsgs.filter_map(|c| imp::sender_pid(&c)).next(),
                         Err(_) => None,
                     };
                     (msg.bytes, pid)

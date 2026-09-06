@@ -20,9 +20,104 @@ use std::ffi::CString;
 use std::fs;
 
 use anyhow::{anyhow, Context};
-use nix::errno::Errno;
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use tracing::{debug, info};
+
+// The nix mount API differs between Linux (mount/umount2/MsFlags) and the
+// BSDs (FreeBSD nmount/Nmount + unmount/MntFlags).  Platform-specific
+// primitives live in `imp` so the rest of this module stays portable.
+#[cfg(target_os = "linux")]
+mod imp {
+    use nix::errno::Errno;
+    use nix::mount::{mount, umount2, MntFlags, MsFlags};
+
+    /// Flags type accepted by the platform mount primitive.
+    pub type Flags = MsFlags;
+
+    /// Mount flags for the cgroup v2 hierarchy.
+    pub fn cgroup_flags() -> Flags {
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV
+    }
+    /// Mount flags for the /dev/shm tmpfs.
+    pub fn dev_shm_flags() -> Flags {
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_STRICTATIME
+    }
+    /// Mount flags for the /dev/pts devpts.
+    pub fn dev_pts_flags() -> Flags {
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC
+    }
+
+    /// Mount `fstype` at `path`.  Returns the `Errno` of a failed mount.
+    pub fn do_mount(
+        fstype: &str,
+        path: &str,
+        options: &str,
+        flags: Flags,
+    ) -> Result<(), Errno> {
+        mount(Some(fstype), path, Some(fstype), flags, Some(options))
+    }
+
+    /// Best-effort unmount of `path`.
+    pub fn do_unmount(path: &str) {
+        let _ = umount2(path, MntFlags::UMOUNT_NOFOLLOW);
+    }
+
+    /// True when `e` is `EBUSY` (target already occupied by another fs).
+    pub fn is_busy(e: &Errno) -> bool {
+        *e == Errno::EBUSY
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+mod imp {
+    use nix::errno::Errno;
+    use nix::mount::{unmount, MntFlags, Nmount};
+
+    /// Flags type accepted by the platform mount primitive.
+    pub type Flags = MntFlags;
+
+    /// Mount flags for the cgroup v2 hierarchy.
+    pub fn cgroup_flags() -> Flags {
+        MntFlags::MNT_NOSUID | MntFlags::MNT_NOEXEC
+    }
+    /// Mount flags for the /dev/shm tmpfs.
+    pub fn dev_shm_flags() -> Flags {
+        MntFlags::MNT_NOSUID | MntFlags::MNT_NOEXEC
+    }
+    /// Mount flags for the /dev/pts devpts.
+    pub fn dev_pts_flags() -> Flags {
+        MntFlags::MNT_NOSUID | MntFlags::MNT_NOEXEC
+    }
+
+    /// Mount `fstype` at `path`.  Returns the `Errno` of a failed mount.
+    ///
+    /// FreeBSD's `nmount(2)` takes `name=value` pairs; the Linux-style
+    /// `options` string is best-effort (it may be empty), the essential
+    /// `fstype`/`fspath` pair is always supplied.
+    pub fn do_mount(
+        fstype: &str,
+        path: &str,
+        options: &str,
+        _flags: Flags,
+    ) -> Result<(), Errno> {
+        let mut nm = Nmount::new();
+        nm.str_opt_owned("fstype", fstype)
+            .str_opt_owned("fspath", path);
+        if !options.is_empty() {
+            nm.str_opt_owned("options", options);
+        }
+        nm.nmount(MntFlags::empty()).map_err(|e| e.error())
+    }
+
+    /// Best-effort unmount of `path`.
+    pub fn do_unmount(path: &str) {
+        let _ = unmount(path, MntFlags::MNT_FORCE);
+    }
+
+    /// True when `e` is `EBUSY` (target already occupied by another fs).
+    pub fn is_busy(e: &Errno) -> bool {
+        *e == Errno::EBUSY
+    }
+}
 
 /// Path of the unified cgroup v2 hierarchy.
 const CGROUP_PATH: &str = "/sys/fs/cgroup";
@@ -72,7 +167,7 @@ fn mount_table_entry(
     fstype: &str,
     path: &str,
     options: &str,
-    flags: MsFlags,
+    flags: imp::Flags,
 ) -> anyhow::Result<()> {
     if !has_mount_privileges() {
         debug!("Running without mount privileges (rootless); not mounting {fstype} at {path}");
@@ -87,8 +182,8 @@ fn mount_table_entry(
     fs::create_dir_all(path)
         .with_context(|| format!("Cannot create mount point {path}"))?;
 
-    mount(Some(fstype), path, Some(fstype), flags, Some(options)).map_err(|e| {
-        if e == Errno::EBUSY {
+    imp::do_mount(fstype, path, options, flags).map_err(|e| {
+        if imp::is_busy(&e) {
             anyhow!("{path} is already occupied by another filesystem")
         } else {
             anyhow!("Cannot mount {fstype} at {path}: {e}")
@@ -101,7 +196,7 @@ fn mount_table_entry(
     let c_path = CString::new(path).expect("mount point path must not contain interior NUL");
     if unsafe { nix::libc::access(c_path.as_ptr(), nix::libc::W_OK) } != 0 {
         let err = std::io::Error::last_os_error();
-        let _ = umount2(path, MntFlags::UMOUNT_NOFOLLOW);
+        imp::do_unmount(path);
         let _ = fs::remove_dir(path);
         return Err(anyhow!("{fstype} mount at {path} is not writable, undoing: {err}"));
     }
@@ -129,15 +224,8 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
     fs::create_dir_all(CGROUP_PATH)
         .with_context(|| format!("Cannot create cgroup mount point {CGROUP_PATH}"))?;
 
-    mount(
-        Some("cgroup2"),
-        CGROUP_PATH,
-        Some("cgroup2"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-        Some(CGROUP_OPTIONS),
-    )
-    .map_err(|e| {
-        if e == Errno::EBUSY {
+    imp::do_mount("cgroup2", CGROUP_PATH, CGROUP_OPTIONS, imp::cgroup_flags()).map_err(|e| {
+        if imp::is_busy(&e) {
             anyhow!("{CGROUP_PATH} is already occupied by another filesystem (cgroup v1?); hybrid cgroup hierarchy is not supported")
         } else {
             anyhow!("Cannot mount cgroup2 at {CGROUP_PATH}: {e}")
@@ -150,7 +238,7 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
     let c_cgroup = CString::new(CGROUP_PATH).expect("cgroup path must not contain interior NUL");
     if unsafe { nix::libc::access(c_cgroup.as_ptr(), nix::libc::W_OK) } != 0 {
         let err = std::io::Error::last_os_error();
-        let _ = umount2(CGROUP_PATH, MntFlags::UMOUNT_NOFOLLOW);
+        imp::do_unmount(CGROUP_PATH);
         let _ = fs::remove_dir(CGROUP_PATH);
         return Err(anyhow!(
             "cgroup2 mount at {CGROUP_PATH} is not writable, undoing: {err}"
@@ -167,12 +255,7 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
 /// without it.  Never fatal: like systemd, the failure is logged by the
 /// caller and the boot continues.
 pub fn mount_dev_shm() -> anyhow::Result<()> {
-    mount_table_entry(
-        "tmpfs",
-        DEV_SHM_PATH,
-        DEV_SHM_OPTIONS,
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_STRICTATIME,
-    )
+    mount_table_entry("tmpfs", DEV_SHM_PATH, DEV_SHM_OPTIONS, imp::dev_shm_flags())
 }
 
 /// Mount devpts at `/dev/pts` (systemd's mount-table entry: devpts,
@@ -181,12 +264,7 @@ pub fn mount_dev_shm() -> anyhow::Result<()> {
 /// pseudo-terminal devpts must be remounted; harmless when already
 /// mounted by devtmpfs.  Never fatal.
 pub fn mount_dev_pts() -> anyhow::Result<()> {
-    mount_table_entry(
-        "devpts",
-        DEV_PTS_PATH,
-        DEV_PTS_OPTIONS,
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-    )
+    mount_table_entry("devpts", DEV_PTS_PATH, DEV_PTS_OPTIONS, imp::dev_pts_flags())
 }
 
 #[cfg(test)]

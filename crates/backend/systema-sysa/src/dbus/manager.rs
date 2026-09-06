@@ -2476,6 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn get_unit_by_pidfd_resolves_real_pidfd() {
         use std::os::fd::FromRawFd;
         // Open a pidfd for our own process (kernel ≥ 5.3).  When the
