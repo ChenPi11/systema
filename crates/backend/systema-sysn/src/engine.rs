@@ -343,7 +343,7 @@ mod tests {
 
     fn temp_watch_file() -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("sysp-engine-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sysn-engine-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(format!(
             "watch-{}.txt",

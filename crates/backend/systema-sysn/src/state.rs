@@ -42,7 +42,7 @@ impl PathState {
     }
 }
 
-/// One `.path` unit instance managed by System P.
+/// One `.path` unit instance managed by System N.
 pub struct PathInstance {
     pub state: PathState,
     /// Active configuration from System A.

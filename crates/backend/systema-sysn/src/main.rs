@@ -1,4 +1,4 @@
-//! system-p — System Path Worker
+//! system-n — System Notify Worker
 //!
 //! The path-trigger worker for System Alphabet. Responsibilities:
 //! - Connect to System A's IPC socket and register as the "path" worker.
@@ -22,7 +22,7 @@ use clap::Parser;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "systema-sysp", about = "System P — System Path Worker")]
+#[command(name = "systema-sysn", about = "System N — System Notify Worker")]
 struct Args {
     #[arg(long, short = 'D', help = "Enable debug-level logging")]
     debug: bool,
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     let args = {
         use clap::{CommandFactory, FromArgMatches};
         let cmd = Args::command()
-            .about(sysa::l10n::t_("System P — System Path Worker"))
+            .about(sysa::l10n::t_("System N — System Notify Worker"))
             .mut_arg("debug", |a| {
                 a.help(sysa::l10n::t_("Enable debug-level logging."))
             })
@@ -56,9 +56,9 @@ async fn main() -> Result<()> {
     };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     // Self-managed logging: <log-dir>/<name>.log, or stderr for "-".
-    sysa::logging::init(sysa::paths::instance().log_dir, "systema-sysp", log_level);
+    sysa::logging::init(sysa::paths::instance().log_dir, "systema-sysn", log_level);
 
-    info!("System P (System Path Worker) starting up");
+    info!("System N (System Notify Worker) starting up");
 
     ipc::run().await?;
 

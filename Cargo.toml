@@ -10,7 +10,7 @@ members = [
     "crates/backend/systema-sysk",
     "crates/backend/systema-sysc",
     "crates/backend/systema-sysd",
-    "crates/backend/systema-sysp",
+    "crates/backend/systema-sysn",
     "crates/backend/systema-syse",
     "crates/backend/systema-sysm/systema-sysm-common",
     "crates/backend/systema-sysm/systema-sysm.unix",

@@ -456,7 +456,7 @@ System A 从不实际发出该信号（见 1.3 节）。
 | `org.freedesktop.systemd1.Automount` | `.automount` 自动挂载 | ❌ 未注册 | System M(linux) worker 已实现，但无 D-Bus 专有接口 |
 | `org.freedesktop.systemd1.Socket` | `.socket` 套接字单元 | ⚠️ 已注册 | 属性 9 个：`Result` `NAccepted` `NConnections` `ControlPID` `XAttrEntryPoint` `XAttrListen` `XAttrAccept` `CPUSetPartition` `OOMRules`（socket_obj.rs）；System K worker 已实现 |
 | `org.freedesktop.systemd1.Timer` | `.timer` 定时器单元 | ❌ 未注册 | System C worker 已实现（单调/日历调度）；`systemctl list-timers` 不可用 |
-| `org.freedesktop.systemd1.Path` | `.path` 路径监控单元 | ❌ 未注册 | System P worker 已实现（inotify） |
+| `org.freedesktop.systemd1.Path` | `.path` 路径监控单元 | ❌ 未注册 | System N worker 已实现（inotify） |
 | `org.freedesktop.systemd1.Swap` | `.swap` 交换分区单元 | ❌ 未注册 | 解析支持，但**无对应 worker** |
 | `org.freedesktop.systemd1.Slice` | `.slice` 资源切片单元 | ⚠️ 已注册 | 属性 2 个：`CPUSetPartition` `OOMRules`（slice_obj.rs）；System R worker 已实现 |
 | `org.freedesktop.systemd1.Scope` | `.scope` 作用域单元 | ⚠️ 已注册（属性不可达） | 属性 4 个：`Controller` `TimeoutStopUSec` `RuntimeMaxUSec` `Result`；方法 `Abandon`（scope_obj.rs:74）；**⚠️ 自定义 Properties 分发（properties.rs）未处理 Scope 接口，`Get`/`GetAll(Scope)` 返回 `UnknownInterface`** |

@@ -101,8 +101,8 @@ struct Args {
     sysc_flags: Option<String>,
     #[arg(long, allow_hyphen_values = true, help = "Extra flags for System K only")]
     sysk_flags: Option<String>,
-    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System P only")]
-    sysp_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System N only")]
+    sysn_flags: Option<String>,
     #[arg(long, allow_hyphen_values = true, help = "Extra flags for System D only")]
     sysd_flags: Option<String>,
     #[arg(long, allow_hyphen_values = true, help = "Extra flags for System R only")]
@@ -114,7 +114,7 @@ struct Args {
 /// Canonical short names of every supervised worker (must mirror
 /// [`workers::default_workers`] + the finder chain).
 const WORKER_SHORT_NAMES: &[&str] = &[
-    "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm",
+    "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm",
 ];
 
 impl Args {
@@ -126,7 +126,7 @@ impl Args {
             "syst" => self.syst_flags.as_ref()?,
             "sysc" => self.sysc_flags.as_ref()?,
             "sysk" => self.sysk_flags.as_ref()?,
-            "sysp" => self.sysp_flags.as_ref()?,
+            "sysn" => self.sysn_flags.as_ref()?,
             "sysd" => self.sysd_flags.as_ref()?,
             "sysr" => self.sysr_flags.as_ref()?,
             "sysm" => self.sysm_flags.as_ref()?,

@@ -43,7 +43,7 @@ const DEFAULT_WORKERS: &[&str] = &[
     "systema-syst",
     "systema-sysc",
     "systema-sysk",
-    "systema-sysp",
+    "systema-sysn",
     "systema-sysd",
     "systema-sysr",
     "systema-sysm.linux",
@@ -56,7 +56,7 @@ const WORKER_IDS: &[&str] = &[
     "system-t-1",
     "system-c-1",
     "system-k-1",
-    "system-p-1",
+    "system-n-1",
     "system-d-1",
     "system-r-1",
     "system-m-1",
@@ -64,7 +64,7 @@ const WORKER_IDS: &[&str] = &[
 
 /// Short names in spawn order (`DEFAULT_WORKERS[1..]`).
 const SHORT_NAMES: &[&str] = &[
-    "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm",
+    "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm",
 ];
 
 fn shim_dir(tag: &str) -> PathBuf {

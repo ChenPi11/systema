@@ -1,5 +1,5 @@
 //! Path unit controller: implements [`UnitController`] for every `.path`
-//! unit registered with System P.
+//! unit registered with System N.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use crate::engine::{
 use crate::spec::{PathSpec, PathSpecKind};
 use crate::state::{PathInstance, PathState};
 
-/// Path controller owning every `.path` unit registered with System P.
+/// Path controller owning every `.path` unit registered with System N.
 pub struct PathController {
     shared: Arc<EngineShared>,
 }

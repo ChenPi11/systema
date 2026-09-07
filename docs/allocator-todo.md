@@ -197,7 +197,7 @@ System A 与以下 Worker 通过 IPC 交互，以下是 System A 侧对各 Worke
 | **System E**（External Process Worker） | ✅ 已实现 | `crates/backend/systema-syse`：scope 单元（PIDs 包装、cgroup.events、RuntimeMaxSec、Abandon） |
 | **System T**（Target Worker） | ✅ 已实现 | `crates/backend/systema-syst`：独立进程，target 状态跟踪（原内嵌于 System A） |
 | **System C**（Cron/Timer Worker） | ✅ 已实现 | `crates/backend/systema-sysc`：timer 单元（单调 + 日历调度，`timer.fired`） |
-| **System P**（Path Worker） | ✅ 已实现 | `crates/backend/systema-sysp`：path 单元（PathExists/Glob/Changed/Modified、DirectoryNotEmpty，inotify） |
+| **System N**（Notify Worker） | ✅ 已实现 | `crates/backend/systema-sysn`：path 单元（PathExists/Glob/Changed/Modified、DirectoryNotEmpty，inotify） |
 | **System K**（Socket Worker） | ✅ 已实现 | `crates/backend/systema-sysk`：socket 单元（TCP/Unix 监听、fd 传递）；socket activation 仅 inetd 式（无 LISTEN_FDS/LISTEN_PID 环境、不关联配对 service） |
 | **System D**（Device Worker） | ✅ 已实现 | `crates/backend/systema-sysd`：device 单元（/dev + sysfs 发现、netlink、match 规则） |
 | **System M**（Mount Worker） | ✅ 已实现 | `crates/backend/systema-sysm`（+ `.linux` flavor）：mount / automount 单元 |

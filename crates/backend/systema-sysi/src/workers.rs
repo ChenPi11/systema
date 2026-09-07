@@ -100,9 +100,9 @@ fn default_workers() -> Vec<WorkerSpec> {
             false,
         ),
         WorkerSpec::new(
-            "sysp",
-            "systema-sysp",
-            Some("system-p-1"),
+            "sysn",
+            "systema-sysn",
+            Some("system-n-1"),
             ProcessKind::LongRunning,
             false,
         ),
@@ -281,7 +281,7 @@ mod tests {
         let set = build_worker_set_for(Platform::Linux, &[]).unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr", "sysm"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm"]
         );
         assert_eq!(set.len(), 10);
         assert!(set.iter().all(|s| s.kind == ProcessKind::LongRunning));
@@ -292,7 +292,7 @@ mod tests {
         let set = build_worker_set_for(Platform::Other, &[]).unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysd", "sysr"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr"]
         );
     }
 
@@ -301,7 +301,7 @@ mod tests {
         let set = build_worker_set_for(Platform::Linux, &skip(&["sysd", "sysc"])).unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysk", "sysp", "sysr", "sysm"]
+            vec!["sysa", "syss", "syse", "syst", "sysk", "sysn", "sysr", "sysm"]
         );
     }
 
@@ -314,7 +314,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysp", "sysr"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysr"]
         );
     }
 

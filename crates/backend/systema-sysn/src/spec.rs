@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn exists_predicate_on_temp_file() {
-        let tmp = std::env::temp_dir().join(format!("sysp-exists-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sysn-exists-{}", std::process::id()));
         let spec = PathSpec {
             kind: PathSpecKind::Exists,
             path: tmp.display().to_string(),
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn directory_not_empty_skips_dotfiles() {
-        let tmp = std::env::temp_dir().join(format!("sysp-dne-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sysn-dne-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let spec = PathSpec {
             kind: PathSpecKind::DirectoryNotEmpty,
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn glob_predicate_matches_files_in_dir() {
-        let tmp = std::env::temp_dir().join(format!("sysp-glob-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sysn-glob-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let pattern = tmp.join("*.log").display().to_string();
         let spec = PathSpec {
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn signature_changes_on_write() {
-        let tmp = std::env::temp_dir().join(format!("sysp-sig-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sysn-sig-{}", std::process::id()));
         std::fs::write(&tmp, b"one").unwrap();
         let before = stat_signature(&tmp).unwrap();
         std::fs::write(&tmp, b"two").unwrap();

@@ -1,11 +1,11 @@
 [package]
-name = "systema-sysp"
+name = "systema-sysn"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "systema-sysp"
+name = "systema-sysn"
 path = "src/main.rs"
 
 [dependencies]

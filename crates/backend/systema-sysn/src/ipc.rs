@@ -1,9 +1,9 @@
-//! IPC entry point for the System P worker.
+//! IPC entry point for the System N worker.
 //!
 //! Registers with System A as the `path` worker and owns every `.path` unit.
 //! The worker subscribes to unit events for **all** units so it can observe
 //! when a triggered target unit terminates: `event.publish` envelopes carry a
-//! [`UnitResourceEvent`] whose `active_state` tells System P to re-arm the
+//! [`UnitResourceEvent`] whose `active_state` tells System N to re-arm the
 //! path unit (and immediately re-check level-triggered conditions).
 //!
 //! On every connection the worker opens a short reconciliation window while
@@ -26,7 +26,7 @@ use crate::controller::PathController;
 use crate::engine::{on_target_inactive, spawn_engine, EngineShared};
 use crate::state::PathState;
 
-const WORKER_ID: &str = "system-p-1";
+const WORKER_ID: &str = "system-n-1";
 const WORKER_UNIT_TYPES: &[&str] = &["path"];
 /// How long to collect the replay of active units sent by System A right
 /// after (re)subscribing before reconciling `Running` path units.
@@ -52,7 +52,7 @@ impl Reconcile {
     }
 }
 
-/// Run the System P worker IPC loop (reconnecting on failure) until the
+/// Run the System N worker IPC loop (reconnecting on failure) until the
 /// process is stopped.
 pub async fn run() -> Result<()> {
     let backend = crate::backend::default_backend()?;
@@ -75,7 +75,7 @@ pub async fn run() -> Result<()> {
                 // Subscribe to events for every unit so target terminations
                 // are observed; System A replays active units on subscribe.
                 event_pub.subscribe_units(&[]);
-                debug!("System P subscribed to unit events (all)");
+                debug!("System N subscribed to unit events (all)");
                 *reconcile_factory.lock().unwrap() = Some(Reconcile::begin());
                 PathController::new(shared_factory.clone())
             },

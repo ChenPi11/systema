@@ -465,7 +465,7 @@ message PathConfig {
     uint32 trigger_limit_burst = 10;
 }
 
-// Sent by System P (the path worker) to System A when a monitored path
+// Sent by System N (the path worker) to System A when a monitored path
 // condition is satisfied, asking System A to activate the path unit's target.
 message PathFired {
     // The path unit that fired, e.g. "foo.path".
