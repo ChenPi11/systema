@@ -1756,6 +1756,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "systema-unitstatectl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "serde_json",
+ "sysa",
+ "sysa-pager",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "temp-dir"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"

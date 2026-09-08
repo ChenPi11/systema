@@ -3531,11 +3531,15 @@ mod tests {
         // systemctl sees a failed job while `unit_states` still claims the
         // unit is "active".
         let mut state = AllocatorState::new();
-        state
-            .units
-            .insert("systemd-poweroff.service".to_string(), make_unit("systemd-poweroff.service"));
+        state.units.insert(
+            "systemd-poweroff.service".to_string(),
+            make_unit("systemd-poweroff.service"),
+        );
         let (bt, mut target) = unit_requires("poweroff.target", &["systemd-poweroff.service"]);
-        target.unit.after.insert("systemd-poweroff.service".to_string());
+        target
+            .unit
+            .after
+            .insert("systemd-poweroff.service".to_string());
         state.units.insert(bt, target);
         state_with_job(&mut state, "systemd-poweroff.service", JobKind::Start);
         state_with_job(&mut state, "poweroff.target", JobKind::Start);
@@ -3601,8 +3605,16 @@ mod tests {
             state.jobs.get(&job_id).unwrap().status,
             JobStatus::Failed(_)
         ));
-        assert_eq!(state.unit_states.get("demo.service").unwrap().active_state, "inactive");
-        assert!(state.unit_states.get("demo.service").unwrap().invocation_id.is_empty());
+        assert_eq!(
+            state.unit_states.get("demo.service").unwrap().active_state,
+            "inactive"
+        );
+        assert!(state
+            .unit_states
+            .get("demo.service")
+            .unwrap()
+            .invocation_id
+            .is_empty());
     }
 
     // =========================================================================

@@ -340,8 +340,14 @@ mod tests {
     #[test]
     fn find_all_merges_duplicate_canonical_names_and_their_aliases() {
         let mut map = HashMap::new();
-        merge_unit_ir(&mut map, &unit_file("lightdm.service", &["display-manager.service"]));
-        merge_unit_ir(&mut map, &unit_file("lightdm.service", &["lightdm-extra.service"]));
+        merge_unit_ir(
+            &mut map,
+            &unit_file("lightdm.service", &["display-manager.service"]),
+        );
+        merge_unit_ir(
+            &mut map,
+            &unit_file("lightdm.service", &["lightdm-extra.service"]),
+        );
         // The first definition is kept; aliases are the union.
         assert_eq!(map.len(), 1);
         let merged = map.get("lightdm.service").unwrap();

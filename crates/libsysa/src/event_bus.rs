@@ -125,7 +125,10 @@ impl EventBus {
             }
         }
 
-        if let Some(handles) = self.subscribers.get(&EventTopic::Unit(event.unit_name.clone())) {
+        if let Some(handles) = self
+            .subscribers
+            .get(&EventTopic::Unit(event.unit_name.clone()))
+        {
             for handle in handles {
                 handle.subscriber.on_event(event).await;
             }
@@ -151,7 +154,10 @@ impl EventBus {
             }
         }
 
-        if let Some(handles) = self.subscribers.get(&EventTopic::Unit(event.unit_name.clone())) {
+        if let Some(handles) = self
+            .subscribers
+            .get(&EventTopic::Unit(event.unit_name.clone()))
+        {
             for handle in handles {
                 let sub = handle.subscriber.clone();
                 let ev = event.clone();

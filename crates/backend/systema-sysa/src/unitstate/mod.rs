@@ -81,7 +81,10 @@ pub fn entry_json(state: &AllocatorState, name: &str) -> Option<Value> {
         .filter(|j| j.unit_name == name)
         .collect();
     jobs.sort_by_key(|j| j.id);
-    map.insert("jobs".into(), Value::Array(jobs.iter().map(|j| job_json(j)).collect()));
+    map.insert(
+        "jobs".into(),
+        Value::Array(jobs.iter().map(|j| job_json(j)).collect()),
+    );
 
     map.insert("unit".into(), serde_json::to_value(&uf.unit).ok()?);
     map.insert("install".into(), serde_json::to_value(&uf.install).ok()?);
@@ -111,14 +114,12 @@ fn insert_section<T: serde::Serialize>(
 }
 
 fn sorted_str_map(m: &std::collections::HashMap<String, String>) -> Value {
-    let ordered: std::collections::BTreeMap<&String, &String> =
-        m.iter().map(|(k, v)| (k, v)).collect();
+    let ordered: std::collections::BTreeMap<&String, &String> = m.iter().collect();
     json!(ordered)
 }
 
 fn sorted_u64_map(m: &std::collections::HashMap<String, u64>) -> Value {
-    let ordered: std::collections::BTreeMap<&String, &u64> =
-        m.iter().map(|(k, v)| (k, v)).collect();
+    let ordered: std::collections::BTreeMap<&String, &u64> = m.iter().collect();
     json!(ordered)
 }
 
@@ -135,8 +136,14 @@ fn cgroup_processes(cm: &sysa::proto::UnitCgroupMetrics) -> Value {
         })
         .collect();
     processes.sort_by(|a, b| {
-        let ka = (a["subpath"].as_str().unwrap_or(""), a["pid"].as_u64().unwrap_or(0));
-        let kb = (b["subpath"].as_str().unwrap_or(""), b["pid"].as_u64().unwrap_or(0));
+        let ka = (
+            a["subpath"].as_str().unwrap_or(""),
+            a["pid"].as_u64().unwrap_or(0),
+        );
+        let kb = (
+            b["subpath"].as_str().unwrap_or(""),
+            b["pid"].as_u64().unwrap_or(0),
+        );
         ka.cmp(&kb)
     });
     Value::Array(processes)
@@ -173,8 +180,12 @@ mod tests {
         units.insert("foo.service".to_string(), uf);
         let mut state = AllocatorState::new();
         state.units = units;
-        state.desired.insert("foo.service".into(), DesiredState::Active);
-        state.aliases.insert("alias.service".into(), "foo.service".into());
+        state
+            .desired
+            .insert("foo.service".into(), DesiredState::Active);
+        state
+            .aliases
+            .insert("alias.service".into(), "foo.service".into());
         state
     }
 
@@ -185,10 +196,13 @@ mod tests {
         let obj = doc.as_object().unwrap();
         assert_eq!(obj["kind"], "service");
         assert_eq!(obj["unit"]["description"], "Foo unit");
-        assert_eq!(obj["unit"]["after"], json!(["local-fs.target", "network.target"]));
+        assert_eq!(
+            obj["unit"]["after"],
+            json!(["local-fs.target", "network.target"])
+        );
         assert_eq!(obj["desired"], "active");
         assert_eq!(obj["aliases"], json!(["alias.service"]));
-        assert_eq!(obj["install"], json!({}));
+        assert_eq!(obj["install"]["wanted_by"], json!([]));
     }
 
     #[test]

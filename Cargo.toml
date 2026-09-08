@@ -23,6 +23,7 @@ members = [
     "crates/backend/systema-sysp/systema-sysp.linux",
     "crates/sysa-pager",
     "crates/frontend/systema-stagingctl",
+    "crates/frontend/systema-unitstatectl",
 ]
 resolver = "2"
 

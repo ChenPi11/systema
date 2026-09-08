@@ -82,10 +82,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "sysa-notify-unit-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sysa-notify-unit-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

@@ -232,7 +232,10 @@ impl ReverseIndex {
                 r.part_of.entry(p.clone()).or_default().push(name.clone());
             }
             for c in &uf.unit.conflicts {
-                r.conflicted_by.entry(c.clone()).or_default().push(name.clone());
+                r.conflicted_by
+                    .entry(c.clone())
+                    .or_default()
+                    .push(name.clone());
             }
         }
         r
@@ -1907,7 +1910,10 @@ mod tests {
             Ok(p) => {
                 eprintln!("PLAN OK: {:?}", names(&p.steps));
                 for s in &p.steps {
-                    eprintln!("  {} {:?} matters={}", s.unit, s.job_type, s.matters_to_anchor);
+                    eprintln!(
+                        "  {} {:?} matters={}",
+                        s.unit, s.job_type, s.matters_to_anchor
+                    );
                 }
             }
             Err(e) => {
@@ -1915,8 +1921,14 @@ mod tests {
             }
         }
         let rev = ReverseIndex::build(&units);
-        eprintln!("after_deps(udevd.service): {:?}", rev.after_deps(&units, "udevd.service"));
-        eprintln!("before_deps(udevd.service): {:?}", rev.before_deps(&units, "udevd.service"));
+        eprintln!(
+            "after_deps(udevd.service): {:?}",
+            rev.after_deps(&units, "udevd.service")
+        );
+        eprintln!(
+            "before_deps(udevd.service): {:?}",
+            rev.before_deps(&units, "udevd.service")
+        );
         eprintln!(
             "after_deps(udevd-control.socket): {:?}",
             rev.after_deps(&units, "udevd-control.socket")
@@ -2534,18 +2546,18 @@ mod tests {
         // (MODALIAS -> kmod bochs) is not dropped.
         let units = map(vec![
             with_wants(
-                with_after(make_unit("udev-trigger.service"), &[
-                    "udevd-control.socket",
-                    "udevd-kernel.socket",
-                ]),
+                with_after(
+                    make_unit("udev-trigger.service"),
+                    &["udevd-control.socket", "udevd-kernel.socket"],
+                ),
                 &["udevd.service"],
             ),
             with_socket_service(make_unit("udevd-kernel.socket"), "udevd.service"),
             make_unit("udevd-control.socket"),
-            with_sockets(make_unit("udevd.service"), &[
-                "udevd-control.socket",
-                "udevd-kernel.socket",
-            ]),
+            with_sockets(
+                make_unit("udevd.service"),
+                &["udevd-control.socket", "udevd-kernel.socket"],
+            ),
         ]);
         let s = steps(
             &units,

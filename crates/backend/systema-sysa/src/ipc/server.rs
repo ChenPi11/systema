@@ -24,7 +24,7 @@ use sysa::proto::{
     ListUnitsResult, MethodResult, PathFired, RegisterAck, RegisterUnits, StagingAreaEntry,
     StagingQuery, StagingQueryResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest,
     StopUnitsResult, TimerFired, UnitDefineResult, UnitInfo, UnitRegistrationAck, UnitStartResult,
-    UnitStateEof, UnitStateEntry, UnitStateListRequest, UnitStateUpdate, UnitStateUpdateAck,
+    UnitStateEntry, UnitStateEof, UnitStateListRequest, UnitStateUpdate, UnitStateUpdateAck,
     UnitSyncReport, WorkerRegistration,
 };
 
@@ -1363,26 +1363,36 @@ async fn handle_admin_unitstate(
                 &[("uid", &client_uid.to_string()), ("sys_uid", &sys_uid.to_string())],
             ),
         };
-        let eof_env =
-            make_envelope(next_request_id(), "system-a", "", "admin.unitstate.eof", eof)?;
+        let eof_env = make_envelope(
+            next_request_id(),
+            "system-a",
+            "",
+            "admin.unitstate.eof",
+            eof,
+        )?;
         send_envelope(&mut framed, &eof_env).await?;
         return Ok(());
     }
 
     let _req = UnitStateListRequest::decode(env.payload.as_slice())?;
 
-    let names = crate::unitstate::unit_names(&*allocator.read());
+    let names = crate::unitstate::unit_names(&allocator.read());
     let mut total = 0u32;
     for name in names {
         // Collect the JSON synchronously (short read-lock) and send async.
-        let json = crate::unitstate::entry_json(&*allocator.read(), &name)
+        let json = crate::unitstate::entry_json(&allocator.read(), &name)
             .and_then(|doc| serde_json::to_vec(&doc).ok());
         let Some(json) = json else {
             continue;
         };
         let entry = UnitStateEntry { name, json };
-        let entry_env =
-            make_envelope(next_request_id(), "system-a", "", "admin.unitstate.entry", entry)?;
+        let entry_env = make_envelope(
+            next_request_id(),
+            "system-a",
+            "",
+            "admin.unitstate.entry",
+            entry,
+        )?;
         send_envelope(&mut framed, &entry_env).await?;
         total += 1;
     }
@@ -1391,7 +1401,13 @@ async fn handle_admin_unitstate(
         total,
         message: String::new(),
     };
-    let eof_env = make_envelope(next_request_id(), "system-a", "", "admin.unitstate.eof", eof)?;
+    let eof_env = make_envelope(
+        next_request_id(),
+        "system-a",
+        "",
+        "admin.unitstate.eof",
+        eof,
+    )?;
     send_envelope(&mut framed, &eof_env).await?;
     Ok(())
 }
@@ -2386,7 +2402,10 @@ mod tests {
     #[test]
     fn revert_cache_to_inactive_clears_active_entry() {
         let mut state = crate::state::AllocatorState::new();
-        let entry = state.unit_states.entry("poweroff.target".to_string()).or_default();
+        let entry = state
+            .unit_states
+            .entry("poweroff.target".to_string())
+            .or_default();
         entry.active_state = "active".to_string();
         entry.sub_state = "running".to_string();
         entry.invocation_id = "some-uuid".to_string();
@@ -2408,12 +2427,18 @@ mod tests {
         // A failed start should leave the unit inactive (not "failed" cached
         // state from the worker).
         let mut state = crate::state::AllocatorState::new();
-        let entry = state.unit_states.entry("foo.service".to_string()).or_default();
+        let entry = state
+            .unit_states
+            .entry("foo.service".to_string())
+            .or_default();
         entry.active_state = "failed".to_string();
 
         revert_cache_to_inactive(&mut state, "foo.service");
 
-        assert_eq!(state.unit_states.get("foo.service").unwrap().active_state, "inactive");
+        assert_eq!(
+            state.unit_states.get("foo.service").unwrap().active_state,
+            "inactive"
+        );
     }
 
     #[test]
@@ -2427,7 +2452,9 @@ mod tests {
                 id: 1,
                 unit_name: "poweroff.target".to_string(),
                 kind: JobKind::Start,
-                status: JobStatus::Failed("dependency failed: systemd-poweroff.service".to_string()),
+                status: JobStatus::Failed(
+                    "dependency failed: systemd-poweroff.service".to_string(),
+                ),
                 timeout_abort: None,
             },
         );
@@ -2446,7 +2473,10 @@ mod tests {
         );
         assert!(unit_has_failed_start_job(&state, "reloadable.service"));
         // Other unit / other kinds / non-terminal jobs are not flagged.
-        assert!(!unit_has_failed_start_job(&state, "systemd-poweroff.service"));
+        assert!(!unit_has_failed_start_job(
+            &state,
+            "systemd-poweroff.service"
+        ));
         state.jobs.insert(
             2,
             Job {
@@ -2458,5 +2488,66 @@ mod tests {
             },
         );
         assert!(!unit_has_failed_start_job(&state, "other.service"));
+    }
+
+    /// Stream a single `name` → YAML-able unit-state document from a fake
+    /// `admin.unitstate` request driven over a socketpair.
+    async fn stream_unitstate(
+        allocator: AllocatorHandle,
+        client_uid: u32,
+    ) -> (Vec<(String, Vec<u8>)>, UnitStateEof) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let server = frame_stream(server);
+        let mut client = frame_stream(client);
+        let req = req_env("admin.unitstate", UnitStateListRequest {});
+        send_envelope(&mut client, &req).await.unwrap();
+
+        let handler_fut = Box::pin(handle_admin_unitstate(server, req, allocator, client_uid));
+        tokio::select! {
+            r = handler_fut => r.unwrap(),
+            e = client.next() => panic!("handler closed without EOF: {e:?}"),
+        };
+
+        let mut entries = Vec::new();
+        let mut eof = None;
+        while let Some(env) = recv_envelope(&mut client).await.unwrap() {
+            match env.method.as_str() {
+                "admin.unitstate.entry" => {
+                    let entry = UnitStateEntry::decode(env.payload.as_slice()).unwrap();
+                    entries.push((entry.name, entry.json));
+                }
+                "admin.unitstate.eof" => {
+                    eof = Some(UnitStateEof::decode(env.payload.as_slice()).unwrap());
+                    break;
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        }
+        (entries, eof.expect("EOF sentinel"))
+    }
+
+    #[tokio::test]
+    async fn admin_unitstate_streams_every_unit_sorted() {
+        let allocator = test_allocator();
+        let (entries, eof) = stream_unitstate(allocator, 0).await;
+        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, vec!["-.slice", "default.target", "foo.service"]);
+        for (_, json) in &entries {
+            let doc: serde_json::Value = serde_json::from_slice(json).unwrap();
+            assert!(doc["kind"].is_string());
+            assert!(doc["unit"]["description"].is_string() || doc["unit"]["after"].is_array());
+        }
+        assert_eq!(eof.total, 3);
+        assert!(eof.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_unitstate_rejects_unprivileged_uid() {
+        let allocator = test_allocator();
+        // 0xdead is neither root nor system_uid().
+        let (entries, eof) = stream_unitstate(allocator.clone(), 0xdead00d).await;
+        assert!(entries.is_empty());
+        assert_eq!(eof.total, 0);
+        assert!(!eof.message.is_empty());
     }
 }

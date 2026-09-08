@@ -85,7 +85,8 @@ pub fn is_instance(name: &str) -> bool {
 /// Unescape the `\xNN` sequences used in escaped unit names
 /// (mirrors systemd's `unit_name_unescape`).  Used to expand the `%I`
 /// specifier, which is the instance name with escapes removed.
-pub fn unescape(name: &str) -> String {    let mut out = String::with_capacity(name.len());
+pub fn unescape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
     let mut chars = name.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -200,14 +201,20 @@ mod tests {
     fn user_slice_uid_parsing() {
         assert_eq!(parse_user_slice_uid("user-1000.slice"), Some(1000));
         assert_eq!(parse_user_slice_uid("user-0.slice"), Some(0));
-        assert_eq!(parse_user_slice_uid("user-2147483647.slice"), Some(2147483647));
+        assert_eq!(
+            parse_user_slice_uid("user-2147483647.slice"),
+            Some(2147483647)
+        );
         // Not a user slice: plain slices, templates, malformed names.
         assert_eq!(parse_user_slice_uid("system.slice"), None);
         assert_eq!(parse_user_slice_uid("user.slice"), None);
         assert_eq!(parse_user_slice_uid("user-.slice"), None);
         assert_eq!(parse_user_slice_uid("user-abc.slice"), None);
         assert_eq!(parse_user_slice_uid("user--1.slice"), None);
-        assert_eq!(parse_user_slice_uid("user-4294967295.slice"), Some(u32::MAX));
+        assert_eq!(
+            parse_user_slice_uid("user-4294967295.slice"),
+            Some(u32::MAX)
+        );
         assert_eq!(parse_user_slice_uid("user-4294967296.slice"), None); // overflows u32
         assert_eq!(parse_user_slice_uid("user-1000.service"), None);
     }

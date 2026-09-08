@@ -163,8 +163,7 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
                 // Environment= / EnvironmentFile= append to the accumulated lists.
                 for val in collect_key_lines(&processed, "service", "environment") {
                     if !val.is_empty() {
-                        svc.environment
-                            .push(expand_specifiers(&val, &unit.name));
+                        svc.environment.push(expand_specifiers(&val, &unit.name));
                     }
                 }
                 for val in collect_key_lines(&processed, "service", "environmentfile") {
@@ -273,12 +272,12 @@ fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
         }
         UnitKind::Device
             if (config.get("device", "property").is_some()
-                || config.get("device", "sysfspath").is_some())
-            => {
-                let mut device = unit.device.take().unwrap_or_default();
-                parse_device_section(&config, &mut device, &unit.name)?;
-                unit.device = Some(device);
-            }
+                || config.get("device", "sysfspath").is_some()) =>
+        {
+            let mut device = unit.device.take().unwrap_or_default();
+            parse_device_section(&config, &mut device, &unit.name)?;
+            unit.device = Some(device);
+        }
         _ => {}
     }
 
@@ -368,21 +367,9 @@ fn merge_append_keys(content: &str) -> String {
 fn is_append_key(section: &str, key: &str) -> bool {
     match section {
         "unit" => match key {
-            "documentation"
-            | "requires"
-            | "wants"
-            | "conflicts"
-            | "after"
-            | "before"
-            | "partof"
-            | "bindsto"
-            | "requisite"
-            | "upholds"
-            | "onsuccess"
-            | "onfailure"
-            | "propagatesreloadto"
-            | "propagatesstopto"
-            | "requiresmountsfor"
+            "documentation" | "requires" | "wants" | "conflicts" | "after" | "before"
+            | "partof" | "bindsto" | "requisite" | "upholds" | "onsuccess" | "onfailure"
+            | "propagatesreloadto" | "propagatesstopto" | "requiresmountsfor"
             | "wantsmountsfor" => true,
             k if k.starts_with("condition") || k.starts_with("assert") => true,
             _ => false,
@@ -1629,7 +1616,10 @@ SuccessAction=poweroff-force
             unit.unit.success_action,
             SuccessAction::PoweroffForce
         ));
-        assert_eq!(unit.unit.success_action.power_unit_name(), Some("poweroff.power"));
+        assert_eq!(
+            unit.unit.success_action.power_unit_name(),
+            Some("poweroff.power")
+        );
         assert_eq!(unit.unit.success_action.as_str(), "poweroff-force");
     }
 
@@ -1658,7 +1648,10 @@ SuccessAction=poweroff-force
 
     #[test]
     fn test_success_action_power_unit_mapping() {
-        assert_eq!(SuccessAction::Suspend.power_unit_name(), Some("suspend.power"));
+        assert_eq!(
+            SuccessAction::Suspend.power_unit_name(),
+            Some("suspend.power")
+        );
         assert_eq!(
             SuccessAction::Hibernate.power_unit_name(),
             Some("hibernate.power")
@@ -2448,15 +2441,15 @@ AllowedCPUs=0-3
 
     #[test]
     fn test_sockets_parsed_from_service_section() {
-        let content = "[Service]\nSockets=systemd-journald.socket systemd-journald-dev-log.socket\n";
+        let content =
+            "[Service]\nSockets=systemd-journald.socket systemd-journald-dev-log.socket\n";
         let unit = parse_unit("journald.service", content).unwrap();
         let svc = unit.service.unwrap();
         assert_eq!(svc.sockets.len(), 2);
         assert!(svc.sockets.contains(&"systemd-journald.socket".to_string()));
-        assert!(
-            svc.sockets
-                .contains(&"systemd-journald-dev-log.socket".to_string())
-        );
+        assert!(svc
+            .sockets
+            .contains(&"systemd-journald-dev-log.socket".to_string()));
     }
 
     #[test]

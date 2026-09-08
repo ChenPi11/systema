@@ -208,7 +208,12 @@ mod tests {
     #[test]
     fn fd_passes_over_stream_with_data() {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDONLY) };
+        let fd = unsafe {
+            libc::open(
+                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                libc::O_RDONLY,
+            )
+        };
         assert!(fd >= 0);
 
         let sender = std::thread::spawn(move || send_fd_sync(a.as_raw_fd(), fd).unwrap());

@@ -351,10 +351,7 @@ impl WorkerIpc {
             .with_context(|| {
                 crate::l10n::fmt(
                     crate::l10n::t_("Cannot connect to {path}."),
-                    &[(
-                        "path",
-                        crate::paths::instance().ipc_socket_path,
-                    )],
+                    &[("path", crate::paths::instance().ipc_socket_path)],
                 )
             })?;
 
@@ -485,7 +482,8 @@ impl WorkerIpc {
                         // the reader loop keeps servicing other envelopes
                         // (state acks, status/stop requests, ...) meanwhile;
                         // the result is sent by the task itself.
-                        let deferred = matches!(call.method.as_str(), "start" | "restart" | "reload");
+                        let deferred =
+                            matches!(call.method.as_str(), "start" | "restart" | "reload");
                         if deferred {
                             let controller = controller.clone();
                             let out_tx = out_tx.clone();
@@ -615,7 +613,10 @@ impl WorkerIpc {
 /// are invoked through a spawned task so the reader loop is never blocked.
 async fn run_method<C: UnitController>(controller: &C, call: &MethodCall) -> MethodResult {
     let result = match call.method.as_str() {
-        "status" => controller.status(&call.unit_name).await.map(|s| s.encode_to_vec()),
+        "status" => controller
+            .status(&call.unit_name)
+            .await
+            .map(|s| s.encode_to_vec()),
         "start" => controller
             .start(&call.unit_name, &call.args, &call.invocation_id)
             .await
@@ -640,17 +641,16 @@ async fn run_method<C: UnitController>(controller: &C, call: &MethodCall) -> Met
             // update from `update_cache_on_task_result()` with the
             // controller's actual state (critical for oneshot services
             // that have already exited by the time the start job completes).
-            let result = if payload.is_empty()
-                && matches!(call.method.as_str(), "start" | "restart")
-            {
-                controller
-                    .status(&call.unit_name)
-                    .await
-                    .map(|s| s.encode_to_vec())
-                    .unwrap_or(payload)
-            } else {
-                payload
-            };
+            let result =
+                if payload.is_empty() && matches!(call.method.as_str(), "start" | "restart") {
+                    controller
+                        .status(&call.unit_name)
+                        .await
+                        .map(|s| s.encode_to_vec())
+                        .unwrap_or(payload)
+                } else {
+                    payload
+                };
             MethodResult {
                 method: call.method.clone(),
                 unit_name: call.unit_name.clone(),

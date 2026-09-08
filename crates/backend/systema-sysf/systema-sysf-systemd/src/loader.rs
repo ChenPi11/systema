@@ -112,7 +112,12 @@ fn discover_one_in(dirs: &[String], name: &str) -> Result<Option<UnitFile>> {
                 match parse_unit_from_path_as(&path, name) {
                     Ok(unit) => return Ok(Some(unit)),
                     Err(e) => {
-                        warn!("Failed to parse template {} for {}: {}", path.display(), name, e);
+                        warn!(
+                            "Failed to parse template {} for {}: {}",
+                            path.display(),
+                            name,
+                            e
+                        );
                     }
                 }
             }
@@ -207,8 +212,7 @@ fn load_units_from_dir_recursive(
                 // dependency edge from `unit` to everything inside them;
                 // nested subdirectories inherit that implication.
                 let child_ctx = dep_dir_target(dir_name).or_else(|| ctx.clone());
-                count +=
-                    load_units_from_dir_recursive(&path, units, implicit, child_ctx)?;
+                count += load_units_from_dir_recursive(&path, units, implicit, child_ctx)?;
             }
         }
     }
@@ -326,7 +330,9 @@ mod tests {
         .unwrap();
 
         let dirs = vec![dir.to_string_lossy().into_owned()];
-        let unit = discover_one_in(&dirs, "getty@tty3.service").unwrap().unwrap();
+        let unit = discover_one_in(&dirs, "getty@tty3.service")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(unit.name, "getty@tty3.service");
         assert_eq!(unit.unit.description, "Getty on tty3");
@@ -345,7 +351,9 @@ mod tests {
         .unwrap();
 
         let dirs = vec![dir.to_string_lossy().into_owned()];
-        let unit = discover_one_in(&dirs, "getty@tty3.service").unwrap().unwrap();
+        let unit = discover_one_in(&dirs, "getty@tty3.service")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(unit.name, "getty@tty3.service");
         assert_eq!(unit.unit.description, "Exact instance");
@@ -355,8 +363,12 @@ mod tests {
     fn discover_one_missing_returns_none() {
         let dir = temp_dir("missing");
         let dirs = vec![dir.to_string_lossy().into_owned()];
-        assert!(discover_one_in(&dirs, "nonexistent.service").unwrap().is_none());
-        assert!(discover_one_in(&dirs, "getty@tty9.service").unwrap().is_none());
+        assert!(discover_one_in(&dirs, "nonexistent.service")
+            .unwrap()
+            .is_none());
+        assert!(discover_one_in(&dirs, "getty@tty9.service")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -389,7 +401,10 @@ mod tests {
         let unit = discover_one_in(&dirs, "poweroff.power").unwrap().unwrap();
         assert_eq!(unit.name, "poweroff.power");
         assert_eq!(unit.unit.description, "Power off");
-        assert_eq!(crate::types::UnitKind::from_extension(&unit.name), crate::types::UnitKind::Power);
+        assert_eq!(
+            crate::types::UnitKind::from_extension(&unit.name),
+            crate::types::UnitKind::Power
+        );
     }
 
     #[test]
@@ -472,8 +487,11 @@ mod tests {
             "[Unit]\nDescription=Display manager\n[Service]\nExecStart=/usr/sbin/lightdm\n",
         )
         .unwrap();
-        std::os::unix::fs::symlink(dir.join("lightdm.service"), dir.join("display-manager.service"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("lightdm.service"),
+            dir.join("display-manager.service"),
+        )
+        .unwrap();
 
         let mut units = Vec::new();
         let mut implicit = HashMap::new();
@@ -482,11 +500,12 @@ mod tests {
         // The symlink is never its own unit: every entry that came from it
         // carries the canonical name `lightdm.service` plus the alias.
         assert!(!units.iter().any(|u| u.name == "display-manager.service"));
-        assert!(units
-            .iter()
-            .any(|u| u.name == "lightdm.service"
-                && u.unit.description == "Display manager"
-                && u.install.alias.iter().any(|a| a == "display-manager.service")));
+        assert!(units.iter().any(|u| u.name == "lightdm.service"
+            && u.unit.description == "Display manager"
+            && u.install
+                .alias
+                .iter()
+                .any(|a| a == "display-manager.service")));
         // The symlink basename does not appear as a unit name anywhere.
         assert!(units.iter().all(|u| u.name != "display-manager.service"));
     }
@@ -511,7 +530,9 @@ mod tests {
         fs::create_dir_all(unit_dir.join("graphical.target.wants")).unwrap();
         std::os::unix::fs::symlink(
             unit_dir.join("lightdm.service"),
-            unit_dir.join("graphical.target.wants").join("display-manager.service"),
+            unit_dir
+                .join("graphical.target.wants")
+                .join("display-manager.service"),
         )
         .unwrap();
 
@@ -572,7 +593,9 @@ mod tests {
         let dirs = vec![dir.to_string_lossy().into_owned()];
         assert!(discover_one_in(&dirs, "getty@.service").unwrap().is_none());
         // Instances are still resolved through the template.
-        let unit = discover_one_in(&dirs, "getty@tty3.service").unwrap().unwrap();
+        let unit = discover_one_in(&dirs, "getty@tty3.service")
+            .unwrap()
+            .unwrap();
         assert_eq!(unit.name, "getty@tty3.service");
     }
 
@@ -586,17 +609,15 @@ mod tests {
             "[Unit]\nDescription=Getty on %I\n[Service]\nExecStart=/sbin/agetty %I\nTTYPath=/dev/%I\n",
         )
         .unwrap();
-        fs::write(
-            unit_dir.join("getty.target"),
-            "[Unit]\nDescription=Getty\n",
-        )
-        .unwrap();
+        fs::write(unit_dir.join("getty.target"), "[Unit]\nDescription=Getty\n").unwrap();
         // The enablement link instantiates the template: the symlink basename
         // is `getty@tty1.service`, NOT an alias of `getty@.service`.
         fs::create_dir_all(unit_dir.join("getty.target.wants")).unwrap();
         std::os::unix::fs::symlink(
             unit_dir.join("getty@.service"),
-            unit_dir.join("getty.target.wants").join("getty@tty1.service"),
+            unit_dir
+                .join("getty.target.wants")
+                .join("getty@tty1.service"),
         )
         .unwrap();
 

@@ -152,10 +152,17 @@ fn resolve_target(log_dir: &str, log_name: &str) -> LogTarget {
     let dir = Path::new(log_dir);
     let _ = std::fs::create_dir_all(dir);
     let path = dir.join(format!("{log_name}.log"));
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(_) => LogTarget::File(path),
         Err(e) => {
-            eprintln!("Cannot open log file {} ({e}); falling back to stderr", path.display());
+            eprintln!(
+                "Cannot open log file {} ({e}); falling back to stderr",
+                path.display()
+            );
             LogTarget::Stderr
         }
     }
@@ -229,10 +236,17 @@ pub fn init(log_dir: &str, log_name: &str, level: &str) -> LogTarget {
     let primary: Box<dyn Write + Send> = match &target {
         LogTarget::File(path) => {
             // Re-open independently: the probe handle above is dropped.
-            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
                 Ok(file) => Box::new(file),
                 Err(e) => {
-                    eprintln!("Cannot open log file {} ({e}); falling back to stderr", path.display());
+                    eprintln!(
+                        "Cannot open log file {} ({e}); falling back to stderr",
+                        path.display()
+                    );
                     Box::new(std::io::stderr())
                 }
             }
@@ -296,10 +310,7 @@ mod tests {
         // A path *under a file* can never be created nor opened.
         let blocker = std::env::temp_dir().join(format!("sysa-logblock-{}", std::process::id()));
         std::fs::write(&blocker, b"x").unwrap();
-        let target = resolve_target(
-            blocker.join("sub").to_str().unwrap(),
-            "unit-test",
-        );
+        let target = resolve_target(blocker.join("sub").to_str().unwrap(), "unit-test");
         assert_eq!(target, LogTarget::Stderr);
         let _ = std::fs::remove_file(&blocker);
     }
