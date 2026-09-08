@@ -1638,6 +1638,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "systema-sysp-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "prost",
+ "serde_json",
+ "sysa",
+ "systema-sysf",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "systema-sysp-linux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "libc",
+ "sysa",
+ "systema-sysp-common",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "systema-sysp-shim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "sysa",
+ "systema-sysp-common",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "systema-sysr"
 version = "0.1.0"
 dependencies = [
@@ -1683,6 +1725,7 @@ dependencies = [
  "futures",
  "nix",
  "parking_lot",
+ "prost",
  "serde",
  "serde_json",
  "sysa",

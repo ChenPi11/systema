@@ -988,7 +988,7 @@ pub async fn enqueue_job(
     }
 
     let primary_job_id = next_job_id();
-    let serial_mode = mode == JobMode::Replace;
+    let serial_mode = matches!(mode, JobMode::Replace | JobMode::ReplaceIrreversibly);
 
     // For serial execution, chain tasks so each waits for the previous.
     let mut serial_chain_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
@@ -1588,6 +1588,21 @@ pub fn handle_task_result(
             if success && matches!(kind, JobKind::Start | JobKind::Restart) {
                 for target in &unit.unit.on_success {
                     post_actions.push(PostAction::Start(target.clone()));
+                }
+                // --- SuccessAction= power transition ---
+                // systemd runs the SuccessAction of a unit that exits
+                // successfully (e.g. `systemd-poweroff.service` has
+                // `SuccessAction=poweroff-force`): the configured power
+                // transition is dispatched as a `.power` unit start, which
+                // routes to System P.
+                if let Some(power_unit) = unit.unit.success_action.power_unit_name() {
+                    info!(
+                        "SuccessAction={} for {}: triggering {}",
+                        unit.unit.success_action.as_str(),
+                        unit_name,
+                        power_unit
+                    );
+                    post_actions.push(PostAction::Start(power_unit.to_string()));
                 }
             }
             if !success {

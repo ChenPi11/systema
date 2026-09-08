@@ -166,7 +166,7 @@ fn handle_reaped(procs: &[Spawned], pid: i32, status: &WaitStatus) -> Option<i32
             Some(code)
         }
         None => {
-            warn!("Reaped unknown pid {pid}: {status:?}");
+            debug!("Reaped unknown pid {pid}: {status:?}");
             None
         }
     }
@@ -546,7 +546,7 @@ pub async fn run(
                 &mut bootlog,
                 grace,
                 ready_timeout,
-                "System A",
+                "System Allocator",
                 |kv| kv.get("MANAGER_READY").is_some(),
             )
             .await?

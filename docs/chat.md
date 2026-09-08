@@ -55,7 +55,7 @@ The user wants me to read `docs/prompt.md` and execute the tasks described in it
 21: | **System S** | System Service | 管理服务进程的生命周期：fork/exec、重启策略、cgroup/Job Object 限制、输出捕获、看门狗 | `ServiceState` 自动机 (DEAD, STARTING, RUNNING, FAILED ...) |
 22: | **System M** | System Mount | 管理文件系统挂载、自动挂载 | 挂载点状态 |
 23: | **System C** | System Cron | 管理定时器（单调/日历），触发定时任务 | 定时器列表、下一次触发时间 |
-24: | **System B** | System Boot | 负责管理引导/电源任务，如重启、关机、休眠、睡眠 | 电源、引导 |
+24: | **System P** | System Power | 负责管理电源任务，如重启、关机、休眠、睡眠 | 电源 |
 25: 
 26: 注：由于 Target 的特殊性，System T 不单独作为 Worker，而是内嵌在 System A 内部，负责 Target 的激活逻辑。
 27: 
@@ -461,7 +461,7 @@ The IPC protocol is defined in **`/home/chenpi11/Projects/systema/systema/proto/
 | **Worker reconnection** | Phase 2 | System A side doesn't attempt reconnection |
 | **System M (Mount)** | Phase 3 | Crate doesn't exist |
 | **System C (Cron/Timer)** | Phase 3 | Crate doesn't exist |
-| **System B (Boot/Power)** | Phase 3+ | Not implemented |
+| **System P (Power)** | ✅ 已实现 | `systema-sysp.linux`（libc `reboot(2)`）与 `systema-sysp.shim`（no-op）共享 `worker_ipc` 接口；目前仅 Start 触发电源操作 |
 | **D-Bus: many methods** | Phase 2+ | ~50 manager methods missing (CancelJob, KillUnit, FreezeUnit, EnableUnitFiles, etc.) |
 | **D-Bus: Job object** | Phase 2 | Job paths returned but no registered Job D-Bus objects |
 | **D-Bus: Target/Mount/Timer/Socket/Swap/Path/Scope/Device interfaces** | Phase 2+ | All unimplemented (stubs for Socket/Slice only) |
@@ -4598,7 +4598,7 @@ Now I have a comprehensive understanding. Let me also check the remaining parts 
 195: | **System T**（Target Worker） | ⚠️ 部分实现 | Target 内部激活逻辑已内嵌于 System A，无独立 Worker；但不能响应来自 Target 的事件 |
 196: | **System M**（Mount Worker） | ❌ 未实现 | `crates/system-m` 不存在 |
 197: | **System C**（Cron/Timer Worker） | ❌ 未实现 | `crates/system-c` 不存在 |
-198: | **System B**（Boot Worker） | ❌ 未实现 | `crates/system-b` 不存在 |
+198: | **System P**（Power Worker） | ⚠️ 部分实现 | `crates/backend/systema-sysp`（`.linux` 用 libc `reboot(2)`，`.shim` 为 no-op）；SysI 自动拉起：Linux 用 `systema-sysp.linux`，其他平台用 `systema-sysp.shim`；休眠/睡眠仍待与 System C/K 编排 |
 199: 
 200: ---
 201: 

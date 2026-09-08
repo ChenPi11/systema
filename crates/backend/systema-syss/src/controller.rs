@@ -75,6 +75,32 @@ impl ServiceController {
         }
     }
 
+    /// Whether the unit has nothing to run: an ExecStart-less "action"
+    /// service (no `[Service]` section or an empty `ExecStart=`).  In
+    /// systemd such units are valid only when they carry a `SuccessAction=`/
+    /// `FailureAction=` (e.g. `systemd-poweroff.service`, which exists purely
+    /// to trigger `poweroff-force` on success); starting them completes
+    /// immediately with no process being spawned.
+    fn is_noop_service(cfg: &UnitConfig) -> bool {
+        match cfg.service.as_ref() {
+            None => true,
+            Some(s) => s.exec_start.is_empty(),
+        }
+    }
+
+    /// Mark an ExecStart-less "action" service as started (no-process
+    /// equivalent of a oneshot that exits 0): the unit becomes active and
+    /// stays so, like `RemainAfterExit=yes`.
+    fn mark_noop_started(&self, unit_name: &str, invocation_id: Option<String>) {
+        let mut reg = self.registry.lock();
+        let inst = reg.entry(unit_name.to_string()).or_default();
+        inst.state = ServiceState::Running;
+        inst.main_pid = None;
+        inst.invocation_id = invocation_id;
+        drop(reg);
+        self.publish_state(unit_name);
+    }
+
     /// Whether the unit is `Type=oneshot` and thus the start job must wait
     /// for the ExecStart process to exit (like systemd).
     fn is_oneshot_type(cfg: &UnitConfig) -> bool {
@@ -342,6 +368,18 @@ impl UnitController for ServiceController {
         } else {
             Some(invocation_id.to_string())
         };
+        if Self::is_noop_service(&cfg) {
+            // ExecStart-less "action" service (e.g. systemd-poweroff.service,
+            // which only carries SuccessAction=poweroff-force).  There is
+            // nothing to spawn: the start job completes immediately, exactly
+            // like systemd, so the unit's SuccessAction can fire.
+            info!(
+                "{}: no ExecStart, start completes without spawning a process",
+                unit_name
+            );
+            self.mark_noop_started(unit_name, inv_id);
+            return Ok(());
+        }
         #[cfg(unix)]
         let listen_fds = self.request_listener_fds(&cfg.socket_units).await;
         #[cfg(not(unix))]
@@ -397,6 +435,18 @@ impl UnitController for ServiceController {
 
     async fn restart(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
         let cfg = decode_unit_config(config)?;
+        if Self::is_noop_service(&cfg) {
+            // ExecStart-less "action" service: restart is a no-op success
+            // (there was never a process to stop or start).
+            info!("{}: no ExecStart, restart completes without spawning a process", unit_name);
+            let inv_id = if invocation_id.is_empty() {
+                None
+            } else {
+                Some(invocation_id.to_string())
+            };
+            self.mark_noop_started(unit_name, inv_id);
+            return Ok(());
+        }
         let timeout = cfg
             .service
             .as_ref()
@@ -657,5 +707,57 @@ mod tests {
         let reg = ctrl.registry.lock();
         let inst = reg.get("oneshot-test.service").expect("unit should exist");
         assert_eq!(inst.state, ServiceState::Running);
+    }
+
+    #[tokio::test]
+    async fn noop_service_is_detected() {
+        // systemd-poweroff.service carries practically no [Service] section.
+        let mut cfg = oneshot_cfg();
+        cfg.service.as_mut().unwrap().exec_start = "/usr/bin/true".to_string();
+        assert!(
+            !ServiceController::is_noop_service(&cfg),
+            "oneshot with an ExecStart is not a no-op"
+        );
+        cfg.service = None;
+        assert!(
+            ServiceController::is_noop_service(&cfg),
+            "a unit with no configured service is a no-op"
+        );
+        cfg.service = Some(ServiceConfig {
+            service_type: "simple".to_string(),
+            exec_start: "/usr/bin/true".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            !ServiceController::is_noop_service(&cfg),
+            "ExecStart= set means there is something to run"
+        );
+        cfg.service.as_mut().unwrap().exec_start.clear();
+        assert!(
+            ServiceController::is_noop_service(&cfg),
+            "empty ExecStart= is a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_start_marks_running_without_spawning() {
+        use prost::Message;
+        let ctrl = controller();
+        let config = UnitConfig {
+            unit_name: "systemd-poweroff.service".to_string(),
+            ..Default::default()
+        };
+        let result = ctrl
+            .start(
+                "systemd-poweroff.service",
+                &config.encode_to_vec(),
+                "inv-1",
+            )
+            .await;
+        assert!(result.is_ok(), "no-op start must succeed: {result:?}");
+        let reg = ctrl.registry.lock();
+        let inst = reg.get("systemd-poweroff.service").expect("unit should exist");
+        assert_eq!(inst.state, ServiceState::Running);
+        assert_eq!(inst.main_pid, None);
     }
 }

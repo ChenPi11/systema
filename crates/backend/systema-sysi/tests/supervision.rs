@@ -47,6 +47,7 @@ const DEFAULT_WORKERS: &[&str] = &[
     "systema-sysd",
     "systema-sysr",
     "systema-sysm.linux",
+    "systema-sysp.linux",
 ];
 
 /// Worker IDs in spawn order, matching `build_worker_set` on Linux.
@@ -60,11 +61,12 @@ const WORKER_IDS: &[&str] = &[
     "system-d-1",
     "system-r-1",
     "system-m-1",
+    "system-p-1",
 ];
 
 /// Short names in spawn order (`DEFAULT_WORKERS[1..]`).
 const SHORT_NAMES: &[&str] = &[
-    "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm",
+    "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm", "sysp",
 ];
 
 fn shim_dir(tag: &str) -> PathBuf {

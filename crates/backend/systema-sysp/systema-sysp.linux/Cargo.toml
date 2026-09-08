@@ -1,0 +1,29 @@
+cargo-features = ["different-binary-name"]
+
+[package]
+name = "systema-sysp-linux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "systema-sysp-linux"
+filename = "systema-sysp.linux"
+path = "src/main.rs"
+
+# systema-sysp-linux is Linux-only.  All dependencies are gated behind
+# cfg(target_os = "linux") so that on other platforms this crate builds as a
+# dependency-free stub (see src/main.rs) instead of compiling Linux-only code.
+# The dependencies in Cargo.toml are gated the same way, so on non-Linux
+# platforms this crate is a dependency-free stub.
+[target.'cfg(target_os = "linux")'.dependencies]
+sysa = { path = "../../../libsysa" }
+systema-sysp-common = { path = "../systema-sysp-common" }
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+async-trait.workspace = true
+libc = "0.2"

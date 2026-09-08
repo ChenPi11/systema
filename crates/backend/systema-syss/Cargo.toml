@@ -27,3 +27,6 @@ zbus.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["process", "signal", "user", "fs", "socket", "uio"] }
+
+[dev-dependencies]
+prost.workspace = true

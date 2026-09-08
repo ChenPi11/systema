@@ -326,6 +326,37 @@ message DaemonReloadResult {
     string message = 2;
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Unit-state administration (root / systema-uid only)
+// ──────────────────────────────────────────────────────────────────
+
+// Request a stream of the System Allocator's *cached* unit state.
+//
+// The snapshot is read from the allocator's in-memory caches only (unit
+// files, runtime-state cache, cgroup metrics, jobs, workers); no worker is
+// contacted.  The server replies with one `admin.unitstate.entry` envelope
+// per unit followed by a single `admin.unitstate.eof` envelope.
+message UnitStateListRequest {}
+
+// One unit's cached state, streamed as an `admin.unitstate.entry` envelope.
+//
+// The payload is the unit's name plus a JSON dump of every cached property
+// (the full unit file, runtime state, cgroup metrics, live jobs, desired
+// state, owner).  The JSON schema is opaque to the worker protocol and is
+// consumed by `systema-unitstatectl`.
+message UnitStateEntry {
+    string name = 1;
+    bytes json = 2;
+}
+
+// Sentinel terminating an `admin.unitstate` stream.
+message UnitStateEof {
+    // Number of unit entries streamed (0 on failure).
+    uint32 total = 1;
+    // Human-readable message (empty on success).
+    string message = 2;
+}
+
 // Configuration for a .socket unit, sent inside UnitConfig.
 message SocketConfig {
     // Addresses to listen on — see SocketAddress below.

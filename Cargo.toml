@@ -18,6 +18,9 @@ members = [
     "crates/backend/systema-sysr/systema-sysr-common",
     "crates/backend/systema-sysr/systema-sysr.linux",
     "crates/backend/systema-sysr/systema-sysr",
+    "crates/backend/systema-sysp/systema-sysp-common",
+    "crates/backend/systema-sysp/systema-sysp.shim",
+    "crates/backend/systema-sysp/systema-sysp.linux",
     "crates/sysa-pager",
     "crates/frontend/systema-stagingctl",
 ]

@@ -138,6 +138,7 @@ fn convert_unit_kind(kind: &UnitKind) -> UnitType {
         UnitKind::Swap => UnitType::Swap,
         UnitKind::Path => UnitType::Path,
         UnitKind::Device => UnitType::Device,
+        UnitKind::Power => UnitType::Power,
         UnitKind::Unknown(s) => UnitType::Other(s.clone()),
     }
 }
@@ -156,6 +157,7 @@ fn convert_dependencies(uf: &UnitFile) -> DependencySet {
         on_success: uf.unit.on_success.clone(),
         on_failure: uf.unit.on_failure.clone(),
         propagates_reload_to: uf.unit.propagates_reload_to.clone(),
+        success_action: uf.unit.success_action.as_str().to_string(),
         default_dependencies: uf.unit.default_dependencies,
     }
 }

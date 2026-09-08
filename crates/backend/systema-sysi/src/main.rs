@@ -109,12 +109,14 @@ struct Args {
     sysr_flags: Option<String>,
     #[arg(long, allow_hyphen_values = true, help = "Extra flags for System M only")]
     sysm_flags: Option<String>,
+    #[arg(long, allow_hyphen_values = true, help = "Extra flags for System P only")]
+    sysp_flags: Option<String>,
 }
 
 /// Canonical short names of every supervised worker (must mirror
 /// [`workers::default_workers`] + the finder chain).
 const WORKER_SHORT_NAMES: &[&str] = &[
-    "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm",
+    "sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm", "sysp",
 ];
 
 impl Args {
@@ -130,6 +132,7 @@ impl Args {
             "sysd" => self.sysd_flags.as_ref()?,
             "sysr" => self.sysr_flags.as_ref()?,
             "sysm" => self.sysm_flags.as_ref()?,
+            "sysp" => self.sysp_flags.as_ref()?,
             _ => return None,
         })
     }
@@ -364,6 +367,16 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    /// Serializes tests that read or write `SYSTEMA_*_FLAGS` env vars: the
+    /// process-global environment is shared by all running tests, so a
+    /// writer test (set_var/remove_var) would race with a reader test unless
+    /// both take this lock.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
 
     #[test]
     fn split_flags_whitespace() {
@@ -384,6 +397,7 @@ mod tests {
 
     #[test]
     fn resolve_flags_precedence_specific_over_global() {
+        let _guard = env_lock().lock().unwrap();
         let args = Args::parse_from([
             "systema-sysi",
             "--log-dir",
@@ -399,6 +413,7 @@ mod tests {
 
     #[test]
     fn resolve_flags_env_fallbacks() {
+        let _guard = env_lock().lock().unwrap();
         std::env::set_var("SYSTEMA_SYSA_FLAGS", "--env-specific");
         std::env::set_var("SYSTEMA_WORKERS_FLAGS", "--env-global");
         let args = Args::parse_from(["systema-sysi", "--log-dir", "-"]);
@@ -411,6 +426,7 @@ mod tests {
 
     #[test]
     fn resolve_flags_arg_beats_env() {
+        let _guard = env_lock().lock().unwrap();
         std::env::set_var("SYSTEMA_SYSK_FLAGS", "--from-env");
         let args = Args::parse_from([
             "systema-sysi",
@@ -425,6 +441,7 @@ mod tests {
 
     #[test]
     fn resolve_flags_none_by_default() {
+        let _guard = env_lock().lock().unwrap();
         let args = Args::parse_from(["systema-sysi", "--log-dir", "-"]);
         assert!(resolve_flags(&args, "sysd").is_empty());
     }

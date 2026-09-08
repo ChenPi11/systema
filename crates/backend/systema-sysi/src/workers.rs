@@ -20,13 +20,16 @@ pub enum ProcessKind {
 pub struct WorkerSpec {
     /// Canonical short name used in `--skip-workers` (e.g. `"syss"`).
     pub name: &'static str,
-    /// Executable name to spawn (e.g. `"systema-syss"`).
+    /// Executable name to spawn; on non-Linux platforms `linux_binary` is
+    /// a dedicated override when present (e.g. `"systema-sysp.shim"`).
     pub binary: &'static str,
+    /// Linux-specific executable name that replaces `binary` on Linux.
+    pub linux_binary: Option<&'static str>,
     /// Worker ID registered with System A (`None` for System A itself).
     pub worker_id: Option<&'static str>,
     /// Supervision kind.
     pub kind: ProcessKind,
-    /// Only spawned on Linux (platform-gated binaries).
+    /// Only spawned on Linux (dropped on other platforms).
     pub linux_only: bool,
     /// Extra command-line arguments.
     pub args: &'static [&'static str],
@@ -46,15 +49,30 @@ impl WorkerSpec {
             worker_id,
             kind,
             linux_only,
+            linux_binary: None,
             args: &[],
         }
+    }
+
+    /// Give this worker a dedicated Linux executable (replacing `binary`
+    /// on Linux while `binary` stays in use on every other platform).
+    fn with_linux_binary(mut self, linux_binary: &'static str) -> Self {
+        self.linux_binary = Some(linux_binary);
+        self
+    }
+
+    /// True when `s` is this worker's short name or any of its executable
+    /// names, so `--skip-workers` accepts all spellings.
+    fn matches_name(&self, s: &str) -> bool {
+        s == self.name || s == self.binary || self.linux_binary == Some(s)
     }
 }
 
 /// The default set of long-running processes.
 ///
-/// System M ships a separate `.linux` flavor of its binary, so it is
-/// platform-gated; every other worker is portable.
+/// System M ships a dedicated `.linux` flavor and is dropped off Linux.
+/// System P ships both a `.linux` flavor and a portable `.shim`, so it is
+/// always supervised; the executable is selected per platform.
 fn default_workers() -> Vec<WorkerSpec> {
     vec![
         WorkerSpec::new(
@@ -127,6 +145,14 @@ fn default_workers() -> Vec<WorkerSpec> {
             ProcessKind::LongRunning,
             true,
         ),
+        WorkerSpec::new(
+            "sysp",
+            "systema-sysp.shim",
+            Some("system-p-1"),
+            ProcessKind::LongRunning,
+            false,
+        )
+        .with_linux_binary("systema-sysp.linux"),
     ]
 }
 
@@ -168,19 +194,25 @@ pub fn build_worker_set_for(
         if spec.linux_only && platform != Platform::Linux {
             continue;
         }
-        if skip
-            .iter()
-            .any(|s| s.as_str() == spec.name || s.as_str() == spec.binary)
-        {
+        if skip.iter().any(|s| spec.matches_name(s)) {
             continue;
         }
+        // Pick the executable for this platform so downstream resolution
+        // and logging always see the concrete binary.
+        let mut spec = spec;
+        if platform == Platform::Linux {
+            if let Some(linux_binary) = spec.linux_binary {
+                spec.binary = linux_binary;
+            }
+        }
+        spec.linux_binary = None;
         retained.push(spec);
     }
 
     if let Some(unknown) = skip.iter().find(|s| {
         !default_workers()
             .iter()
-            .any(|spec| s.as_str() == spec.name || s.as_str() == spec.binary)
+            .any(|spec| spec.matches_name(s))
     }) {
         anyhow::bail!("unknown worker name '{unknown}'");
     }
@@ -277,28 +309,34 @@ mod tests {
     }
 
     #[test]
-    fn default_set_contains_every_worker_on_linux() {
-        let set = build_worker_set_for(Platform::Linux, &[]).unwrap();
+    fn platform_selects_binaries() {
+        let linux = build_worker_set_for(Platform::Linux, &[]).unwrap();
         assert_eq!(
-            names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm"]
+            names(&linux),
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm", "sysp"]
         );
-        assert_eq!(set.len(), 10);
-        assert!(set.iter().all(|s| s.kind == ProcessKind::LongRunning));
-    }
+        assert_eq!(linux.len(), 11);
+        assert!(
+            linux.iter().all(|s| s.kind == ProcessKind::LongRunning)
+        );
+        fn binary_of<'a>(set: &'a [WorkerSpec], name: &'a str) -> &'a str {
+            set.iter().find(|s| s.name == name).unwrap().binary
+        }
+        // System M exists only on Linux; System P has a per-platform binary.
+        assert_eq!(binary_of(&linux, "sysm"), "systema-sysm.linux");
+        assert_eq!(binary_of(&linux, "sysp"), "systema-sysp.linux");
 
-    #[test]
-    fn platform_gated_workers_are_dropped_off_linux() {
-        let set = build_worker_set_for(Platform::Other, &[]).unwrap();
+        let other = build_worker_set_for(Platform::Other, &[]).unwrap();
         assert_eq!(
-            names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr"]
+            names(&other),
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysp"]
         );
+        assert_eq!(binary_of(&other, "sysp"), "systema-sysp.shim");
     }
 
     #[test]
     fn skip_accepts_short_names() {
-        let set = build_worker_set_for(Platform::Linux, &skip(&["sysd", "sysc"])).unwrap();
+        let set = build_worker_set_for(Platform::Linux, &skip(&["sysd", "sysc", "sysp"])).unwrap();
         assert_eq!(
             names(&set),
             vec!["sysa", "syss", "syse", "syst", "sysk", "sysn", "sysr", "sysm"]
@@ -309,13 +347,31 @@ mod tests {
     fn skip_accepts_full_binary_names() {
         let set = build_worker_set_for(
             Platform::Linux,
-            &skip(&["systema-sysd", "systema-sysm.linux"]),
+            &skip(&["systema-sysd", "systema-sysm.linux", "systema-sysp.linux"]),
         )
         .unwrap();
         assert_eq!(
             names(&set),
             vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysr"]
         );
+    }
+
+    #[test]
+    fn skip_accepts_linux_and_shim_spellings_everywhere() {
+        // Both executable spellings are recognized on every platform.
+        let linux = build_worker_set_for(
+            Platform::Linux,
+            &skip(&["systema-sysp.linux"]),
+        )
+        .unwrap();
+        assert!(!names(&linux).contains(&"sysp"));
+
+        let other = build_worker_set_for(
+            Platform::Other,
+            &skip(&["systema-sysp.shim"]),
+        )
+        .unwrap();
+        assert!(!names(&other).contains(&"sysp"));
     }
 
     #[test]
@@ -388,7 +444,7 @@ mod tests {
         let (resolved, missing) = resolve_set(&set, Some(&dir));
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].spec.name, "sysa");
-        assert_eq!(missing.len(), 9);
+        assert_eq!(missing.len(), 10);
         assert!(missing.iter().any(|m| m.name == "syss"));
         let _ = fs::remove_dir_all(&dir);
     }

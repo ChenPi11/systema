@@ -121,7 +121,7 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 | `Reload()` | ⚠️ 部分实现 | 已实现：发出 `Reloading` 信号 → 重扫单元文件 → 请求 worker 同步；不重新执行自身（`Reexecute`），异步执行无错误回报 |
 | `Reexecute()` | ❌ 未实现 | 重新执行守护进程自身（热重启） |
 | `Exit()` | ❌ 未实现 | 退出 systemd（仅限用户实例） |
-| `Reboot()` / `SoftReboot()` / `PowerOff()` / `Halt()` / `KExec()` | ❌ 未实现 | 系统电源管理（System B 未实现）；目前仅 `StartLimitAction=` 副作用会调用外部 `shutdown` 命令 |
+| `Reboot()` / `SoftReboot()` / `PowerOff()` / `Halt()` / `KExec()` | ❌ 未实现 | 系统电源管理由 System P（Power Worker）负责（`systema-sysp`，libc `reboot(2)`）；但 Manager 方法尚未接线到 `.power` 单元 |
 | `SwitchRoot(new_root, init)` | ❌ 未实现 | 切换根文件系统（initrd → 真实根） |
 | `EnqueueMarkedJobs()` | ❌ 未实现 | 将标记的单元加入作业队列 |
 
@@ -478,7 +478,7 @@ System A 从不实际发出该信号（见 1.3 节）。
 | `systemctl set-default / get-default` | ❌ | Set/GetDefaultTarget |
 | `systemctl set-environment / show-environment` | ❌ | SetEnvironment 等 |
 | `systemctl kill / freeze / thaw / clean` | ❌ | KillUnit / FreezeUnit 等 |
-| `systemctl reboot / poweroff / halt / kexec` | ❌ | System B 方法 |
+| `systemctl reboot / poweroff / halt / kexec` | ❌ | System P 方法（需接线到 `.power` 单元） |
 | `systemctl list-timers` | ❌ | Timer 接口 |
 | `systemd-analyze` | ❌ | Dump |
 | `journalctl` | ❌ | 无 journal 后端（journald 未实现） |

@@ -202,6 +202,14 @@ struct ReverseIndex {
     requisite: HashMap<String, Vec<String>>,
     /// Units that declare `PartOf= u`.
     part_of: HashMap<String, Vec<String>>,
+    /// Units that declare `Conflicts= u`.
+    ///
+    /// systemd stores this as the inverse `UNIT_ATOM_CONFLICTED_BY` edge:
+    /// when `u` is started, every unit that declared `Conflicts= u` gets a
+    /// Stop job.  The per-unit `Conflicts=` injection of `shutdown.target`
+    /// (`add_type_default_dependencies`) is what shuts the whole world down
+    /// when `shutdown.target` starts.
+    conflicted_by: HashMap<String, Vec<String>>,
 }
 
 impl ReverseIndex {
@@ -222,6 +230,9 @@ impl ReverseIndex {
             }
             for p in &uf.unit.part_of {
                 r.part_of.entry(p.clone()).or_default().push(name.clone());
+            }
+            for c in &uf.unit.conflicts {
+                r.conflicted_by.entry(c.clone()).or_default().push(name.clone());
             }
         }
         r
@@ -316,6 +327,12 @@ impl ReverseIndex {
         let mut v: Vec<String> = out.into_iter().collect();
         v.sort();
         v
+    }
+
+    /// Units that declare `Conflicts= u` (`UNIT_ATOM_CONFLICTED_BY`): they
+    /// must be stopped when `u` is started (`CONFLICTED_BY` dependency atom).
+    fn conflicted_by(&self, u: &str) -> Vec<String> {
+        self.conflicted_by.get(u).cloned().unwrap_or_default()
     }
 }
 
@@ -622,6 +639,27 @@ impl Transaction {
                     MATTERS | CONFLICTS | (flags & IGNORE_ORDER),
                 ) {
                     warn!("Cannot add conflict stop job for {dep}: {e}");
+                }
+            }
+            // Inverse Conflicts= (`UNIT_ATOM_CONFLICTED_BY`): every unit
+            // that declares `Conflicts=<this unit>` must be stopped when
+            // this unit is STARTED.  systemd injects `Conflicts=shutdown.target`
+            // into every default-dependencies unit, so starting
+            // `shutdown.target` stops the whole system — this is what makes
+            // poweroff/halt actually shut services down before the hardware
+            // power transition.
+            for u in rev.conflicted_by(unit) {
+                if let Err(e) = self.add_job_and_dependencies(
+                    units,
+                    states,
+                    installed,
+                    rev,
+                    &u,
+                    JobType::Stop,
+                    Some(job),
+                    MATTERS | CONFLICTS | (flags & IGNORE_ORDER),
+                ) {
+                    warn!("Cannot add inverse conflict stop job for {u}: {e}");
                 }
             }
         }
@@ -1756,6 +1794,137 @@ mod tests {
         let a = s.iter().find(|x| x.unit == "a.service").unwrap();
         assert_eq!(a.job_type, Stop);
         assert!(a.matters_to_anchor);
+    }
+
+    #[test]
+    fn inverse_conflicts_stop_units_that_declare_conflicts() {
+        // Starting `a.service` must stop every unit that declares
+        // `Conflicts=a.service` (systemd `UNIT_ATOM_CONFLICTED_BY`), not
+        // only the target's own forward Conflicts= list.
+        let units = map(vec![
+            make_unit("a.service"),
+            with_conflicts(make_unit("x.service"), &["a.service"]),
+            with_conflicts(make_unit("y.service"), &["a.service"]),
+        ]);
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "a.service",
+            Start,
+            Replace,
+        );
+        let x = s.iter().find(|x| x.unit == "x.service").unwrap();
+        let y = s.iter().find(|x| x.unit == "y.service").unwrap();
+        assert_eq!(x.job_type, Stop);
+        assert_eq!(y.job_type, Stop);
+        assert!(x.matters_to_anchor && y.matters_to_anchor);
+    }
+
+    #[test]
+    fn starting_shutdown_target_stops_active_services() {
+        // Mirror of the loader's default-dependencies injection: every
+        // default-dep unit declares `Conflicts=shutdown.target` and
+        // `Before=shutdown.target`.  Starting `shutdown.target` (as the
+        // poweroff transaction does via `systemd-poweroff.service`) must
+        // emit Stop jobs for the active services, ordered before the
+        // shutdown.target start.
+        let units = map(vec![
+            with_conflicts(
+                with_before(make_unit("sshd.service"), &["shutdown.target"]),
+                &["shutdown.target"],
+            ),
+            with_conflicts(
+                with_before(make_unit("nginx.service"), &["shutdown.target"]),
+                &["shutdown.target"],
+            ),
+            make_unit("shutdown.target"),
+        ]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("sshd.service".to_string(), Active);
+            m.insert("nginx.service".to_string(), Active);
+            m
+        };
+        let s = steps(
+            &units,
+            &states,
+            &HashMap::new(),
+            "shutdown.target",
+            Start,
+            Replace,
+        );
+        for svc in ["sshd.service", "nginx.service"] {
+            let step = s.iter().find(|x| x.unit == svc).unwrap();
+            assert_eq!(step.job_type, Stop, "{svc} should get a Stop job");
+            assert!(step.matters_to_anchor, "{svc} Stop must matter");
+        }
+        let shutdown = s.iter().find(|x| x.unit == "shutdown.target").unwrap();
+        assert_eq!(shutdown.job_type, Start);
+        for svc in ["sshd.service", "nginx.service"] {
+            let pos_svc = s.iter().position(|x| x.unit == svc).unwrap();
+            let pos_shutdown = s.iter().position(|x| x.unit == "shutdown.target").unwrap();
+            assert!(
+                pos_svc < pos_shutdown,
+                "{svc} stop must run before shutdown.target start (plan: {:?})",
+                names(&s)
+            );
+        }
+    }
+
+    #[test]
+    fn temp_socket_selfloop_repro() {
+        // Mirror of systemd-udevd.service: Sockets=udevd-control.socket,
+        // and the socket resolves back to udevd.service by convention.
+        let units = map(vec![
+            with_sockets(
+                with_conflicts(
+                    with_before(make_unit("udevd.service"), &["shutdown.target"]),
+                    &["shutdown.target"],
+                ),
+                &["udevd-control.socket"],
+            ),
+            with_conflicts(
+                with_before(make_unit("udevd-control.socket"), &["shutdown.target"]),
+                &["shutdown.target"],
+            ),
+            make_unit("shutdown.target"),
+        ]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("udevd.service".to_string(), Active);
+            m.insert("udevd-control.socket".to_string(), Active);
+            m
+        };
+        match build_plan(
+            &units,
+            &states,
+            &HashMap::new(),
+            "shutdown.target",
+            Start,
+            Replace,
+        ) {
+            Ok(p) => {
+                eprintln!("PLAN OK: {:?}", names(&p.steps));
+                for s in &p.steps {
+                    eprintln!("  {} {:?} matters={}", s.unit, s.job_type, s.matters_to_anchor);
+                }
+            }
+            Err(e) => {
+                eprintln!("PLAN ERR: {e:?}");
+            }
+        }
+        let rev = ReverseIndex::build(&units);
+        eprintln!("after_deps(udevd.service): {:?}", rev.after_deps(&units, "udevd.service"));
+        eprintln!("before_deps(udevd.service): {:?}", rev.before_deps(&units, "udevd.service"));
+        eprintln!(
+            "after_deps(udevd-control.socket): {:?}",
+            rev.after_deps(&units, "udevd-control.socket")
+        );
+        eprintln!(
+            "conflicted_by(shutdown.target): {:?}",
+            rev.conflicted_by("shutdown.target")
+        );
     }
 
     #[test]

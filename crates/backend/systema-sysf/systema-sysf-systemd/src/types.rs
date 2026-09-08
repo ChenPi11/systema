@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+use serde::Serialize;
+
 /// The kind of a systemd unit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UnitKind {
@@ -19,6 +21,7 @@ pub enum UnitKind {
     Swap,
     Path,
     Device,
+    Power,
     Unknown(String),
 }
 
@@ -37,6 +40,7 @@ impl UnitKind {
             "swap" => UnitKind::Swap,
             "path" => UnitKind::Path,
             "device" => UnitKind::Device,
+            "power" => UnitKind::Power,
             other => UnitKind::Unknown(other.to_string()),
         }
     }
@@ -55,8 +59,15 @@ impl UnitKind {
             UnitKind::Swap => "swap",
             UnitKind::Path => "path",
             UnitKind::Device => "device",
+            UnitKind::Power => "power",
             UnitKind::Unknown(s) => s.as_str(),
         }
+    }
+}
+
+impl Serialize for UnitKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.worker_type())
     }
 }
 
@@ -165,6 +176,22 @@ impl ExecCommand {
     }
 }
 
+impl Serialize for ExecCommand {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("ExecCommand", 9)?;
+        st.serialize_field("raw", &self.raw)?;
+        st.serialize_field("program", &self.program)?;
+        st.serialize_field("args", &self.args)?;
+        st.serialize_field("ignore_failure", &self.ignore_failure)?;
+        st.serialize_field("privileged", &self.privileged)?;
+        st.serialize_field("no_env_lookup", &self.no_env_lookup)?;
+        st.serialize_field("no_kill_on_stop", &self.no_kill_on_stop)?;
+        st.serialize_field("no_new_privileges", &self.no_new_privileges)?;
+        st.end()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shell-word splitter (private helper used by ExecCommand::parse)
 // ---------------------------------------------------------------------------
@@ -214,34 +241,167 @@ fn shell_words(s: &str) -> Vec<String> {
 // [Unit] section
 // ---------------------------------------------------------------------------
 
+/// The action taken when a unit exits successfully (`[Unit] SuccessAction=`).
+///
+/// In systemd, the `power*`/`reboot*`/`halt*`/`kexec*`/`suspend*`/`hibernate*`
+/// variants are executed by PID 1 when the unit terminates successfully
+/// (e.g. `systemd-poweroff.service` carries `SuccessAction=poweroff-force`,
+/// which is how `systemctl poweroff` actually powers the machine down).
+///
+/// In System A the power variants map to a `.power` unit
+/// ([`Self::power_unit_name`]); starting that unit is what dispatches the
+/// transition to System P.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SuccessAction {
+    #[default]
+    None,
+    Poweroff,
+    PoweroffForce,
+    PoweroffImmediate,
+    Reboot,
+    RebootForce,
+    RebootImmediate,
+    Halt,
+    HaltForce,
+    HaltImmediate,
+    Kexec,
+    KexecForce,
+    KexecImmediate,
+    Suspend,
+    SuspendForce,
+    SuspendImmediate,
+    Hibernate,
+    HibernateForce,
+    HibernateImmediate,
+    Exit,
+    ExitForce,
+    ExitImmediate,
+}
+
+impl SuccessAction {
+    /// Return the `.power` unit name for this action, or `None` if it does
+    /// not map to a power unit (e.g. `Exit`/`ExitForce`).
+    pub fn power_unit_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Poweroff | Self::PoweroffForce | Self::PoweroffImmediate => {
+                Some("poweroff.power")
+            }
+            Self::Reboot | Self::RebootForce | Self::RebootImmediate => Some("reboot.power"),
+            Self::Halt | Self::HaltForce | Self::HaltImmediate => Some("halt.power"),
+            Self::Kexec | Self::KexecForce | Self::KexecImmediate => Some("kexec.power"),
+            Self::Suspend | Self::SuspendForce | Self::SuspendImmediate => Some("suspend.power"),
+            Self::Hibernate | Self::HibernateForce | Self::HibernateImmediate => {
+                Some("hibernate.power")
+            }
+            Self::None | Self::Exit | Self::ExitForce | Self::ExitImmediate => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Poweroff => "poweroff",
+            Self::PoweroffForce => "poweroff-force",
+            Self::PoweroffImmediate => "poweroff-immediate",
+            Self::Reboot => "reboot",
+            Self::RebootForce => "reboot-force",
+            Self::RebootImmediate => "reboot-immediate",
+            Self::Halt => "halt",
+            Self::HaltForce => "halt-force",
+            Self::HaltImmediate => "halt-immediate",
+            Self::Kexec => "kexec",
+            Self::KexecForce => "kexec-force",
+            Self::KexecImmediate => "kexec-immediate",
+            Self::Suspend => "suspend",
+            Self::SuspendForce => "suspend-force",
+            Self::SuspendImmediate => "suspend-immediate",
+            Self::Hibernate => "hibernate",
+            Self::HibernateForce => "hibernate-force",
+            Self::HibernateImmediate => "hibernate-immediate",
+            Self::Exit => "exit",
+            Self::ExitForce => "exit-force",
+            Self::ExitImmediate => "exit-immediate",
+        }
+    }
+}
+
+impl From<&str> for SuccessAction {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().trim() {
+            "poweroff" => Self::Poweroff,
+            "poweroff-force" => Self::PoweroffForce,
+            "poweroff-immediate" => Self::PoweroffImmediate,
+            "reboot" => Self::Reboot,
+            "reboot-force" => Self::RebootForce,
+            "reboot-immediate" => Self::RebootImmediate,
+            "halt" => Self::Halt,
+            "halt-force" => Self::HaltForce,
+            "halt-immediate" => Self::HaltImmediate,
+            "kexec" => Self::Kexec,
+            "kexec-force" => Self::KexecForce,
+            "kexec-immediate" => Self::KexecImmediate,
+            "suspend" => Self::Suspend,
+            "suspend-force" => Self::SuspendForce,
+            "suspend-immediate" => Self::SuspendImmediate,
+            "hibernate" => Self::Hibernate,
+            "hibernate-force" => Self::HibernateForce,
+            "hibernate-immediate" => Self::HibernateImmediate,
+            "exit" => Self::Exit,
+            "exit-force" => Self::ExitForce,
+            "exit-immediate" => Self::ExitImmediate,
+            _ => Self::None,
+        }
+    }
+}
+
+impl Serialize for SuccessAction {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 /// Common `[Unit]` section fields shared by all unit types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UnitSection {
     pub description: String,
     pub documentation: Vec<String>,
     /// Units that must be active before this unit can start.
+    #[serde(with = "crate::types::sorted_set")]
     pub requires: HashSet<String>,
     /// Units that should be active before this unit starts (non-fatal).
+    #[serde(with = "crate::types::sorted_set")]
     pub wants: HashSet<String>,
     /// Units that conflict with this unit.
+    #[serde(with = "crate::types::sorted_set")]
     pub conflicts: HashSet<String>,
     /// Ordering: start after these units.
+    #[serde(with = "crate::types::sorted_set")]
     pub after: HashSet<String>,
     /// Ordering: start before these units.
+    #[serde(with = "crate::types::sorted_set")]
     pub before: HashSet<String>,
     /// If these units are stopped, also stop this unit.
+    #[serde(with = "crate::types::sorted_set")]
     pub part_of: HashSet<String>,
     /// Bind the lifecycle to these units (if they stop, stop this one).
+    #[serde(with = "crate::types::sorted_set")]
     pub binds_to: HashSet<String>,
     /// Like Requires but the dependency must already be active (not started).
+    #[serde(with = "crate::types::sorted_set")]
     pub requisite: HashSet<String>,
     /// Continuously maintain activation of these units.
+    #[serde(with = "crate::types::sorted_set")]
     pub upholds: HashSet<String>,
     /// Units to activate when this unit succeeds.
+    #[serde(with = "crate::types::sorted_set")]
     pub on_success: HashSet<String>,
     /// Units to activate when this unit fails.
+    #[serde(with = "crate::types::sorted_set")]
     pub on_failure: HashSet<String>,
+    /// Action to perform when the unit succeeds (e.g. `poweroff-force`).
+    pub success_action: SuccessAction,
     /// When this unit is reloaded, also reload these units.
+    #[serde(with = "crate::types::sorted_set")]
     pub propagates_reload_to: HashSet<String>,
     /// `RequiresMountsFor=` — require every mount unit covering these paths.
     pub requires_mounts_for: Vec<String>,
@@ -339,6 +499,7 @@ impl Default for UnitSection {
             upholds: HashSet::new(),
             on_success: HashSet::new(),
             on_failure: HashSet::new(),
+            success_action: SuccessAction::None,
             propagates_reload_to: HashSet::new(),
             requires_mounts_for: Vec::new(),
             wants_mounts_for: Vec::new(),
@@ -379,11 +540,14 @@ impl Default for UnitSection {
 // ---------------------------------------------------------------------------
 
 /// `[Install]` section.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct InstallSection {
     /// Targets that want this unit (used for enable/disable).
+    #[serde(with = "crate::types::sorted_set")]
     pub wanted_by: HashSet<String>,
+    #[serde(with = "crate::types::sorted_set")]
     pub required_by: HashSet<String>,
+    #[serde(with = "crate::types::sorted_set")]
     pub also: HashSet<String>,
     pub alias: Vec<String>,
 }
@@ -393,7 +557,7 @@ pub struct InstallSection {
 // ---------------------------------------------------------------------------
 
 /// `[Service]` section.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ServiceSection {
     pub service_type: ServiceType,
     pub exec_start: Vec<ExecCommand>,
@@ -472,6 +636,12 @@ impl From<&str> for ServiceType {
     }
 }
 
+impl Serialize for ServiceType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RestartPolicy {
     #[default]
@@ -512,6 +682,12 @@ impl From<&str> for RestartPolicy {
     }
 }
 
+impl Serialize for RestartPolicy {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 /// Describes what action to take when the start rate limit is exceeded.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StartLimitAction {
@@ -547,6 +723,12 @@ impl From<&str> for StartLimitAction {
             "exit" => StartLimitAction::Exit,
             _ => StartLimitAction::None,
         }
+    }
+}
+
+impl Serialize for StartLimitAction {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
     }
 }
 
@@ -626,13 +808,15 @@ impl UnitFile {
 // ---------------------------------------------------------------------------
 
 /// `[Mount]` section for `.mount` units.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MountSection {
     /// Device or remote filesystem to mount (`What=`).
     pub what: String,
     /// Mount point path (`Where=`).
+    #[serde(rename = "where")]
     pub where_: String,
     /// Filesystem type, e.g. `ext4`, `nfs` (`Type=`).
+    #[serde(rename = "type")]
     pub type_: String,
     /// Mount options passed to `mount(8)` (`Options=`).
     pub options: String,
@@ -653,9 +837,10 @@ pub struct MountSection {
 // ---------------------------------------------------------------------------
 
 /// `[Automount]` section for `.automount` units.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AutomountSection {
     /// Mount point path (`Where=`).
+    #[serde(rename = "where")]
     pub where_: String,
     /// Extra mount options passed to the autofs mount (`ExtraOptions=`).
     pub extra_options: String,
@@ -670,7 +855,7 @@ pub struct AutomountSection {
 // ---------------------------------------------------------------------------
 
 /// `[Timer]` section for `.timer` units.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct TimerSection {
     /// Run N seconds after the timer unit was activated (`OnActiveSec=`).
     pub on_active_sec: Option<u32>,
@@ -703,7 +888,7 @@ pub struct TimerSection {
 // ---------------------------------------------------------------------------
 
 /// `[Socket]` section for `.socket` units.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SocketSection {
     /// Stream (TCP / Unix stream) listening addresses (`ListenStream=`).
     pub listen_stream: Vec<String>,
@@ -755,7 +940,7 @@ pub struct SocketSection {
 // ---------------------------------------------------------------------------
 
 /// `[Swap]` section for `.swap` units.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SwapSection {
     /// Swap device or file (`What=`).
     pub what: String,
@@ -787,7 +972,7 @@ impl Default for SwapSection {
 ///
 /// Mirror of `systemd.resource-control(5)`. String values keep their
 /// original unit-file form (e.g. `"50%"`, `"1G"`, `"100ms"`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ResourceControl {
     /// CPU quota relative to one CPU (`CPUQuota=`), e.g. `"50%"` or `"100ms"`.
     pub cpu_quota: String,
@@ -838,7 +1023,7 @@ pub struct ResourceControl {
 /// Slices are cgroup-based resource management units. They don't have
 /// their own processes but group other units (services, scopes, etc.)
 /// for resource control.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SliceSection {
     /// Resource-control directives from the `[Slice]` section.
     pub rc: ResourceControl,
@@ -853,7 +1038,7 @@ pub struct SliceSection {
 /// Scopes are cgroup-based units that wrap externally created processes
 /// (not spawned by systemd). They are used for resource management of
 /// processes started by other means.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ScopeSection {
     /// Processes to include in the scope (`PIDs=`).
     pub pids: Vec<String>,
@@ -880,7 +1065,7 @@ pub struct ScopeSection {
 /// Device units represent device files in `/dev/`. They are typically
 /// created automatically by systemd when devices appear, but can also
 /// be defined in unit files for udev rule integration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DeviceSection {
     /// udev property name to match (`Property=`).
     pub property: Vec<String>,
@@ -897,7 +1082,7 @@ pub struct DeviceSection {
 // ---------------------------------------------------------------------------
 
 /// `[Path]` section for `.path` units.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PathSection {
     /// Activate when the path exists (`PathExists=`).
     pub path_exists: Vec<String>,
@@ -1050,5 +1235,24 @@ mod tests {
     fn shell_words_escaped() {
         let words = shell_words(r"foo\ bar baz");
         assert_eq!(words, vec!["foo bar", "baz"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serde helpers
+// ---------------------------------------------------------------------------
+
+/// `#[serde(with = "crate::types::sorted_set")]`
+///
+/// Serializes a `HashSet<String>` as a sorted array so that JSON/YAML dumps
+/// of the allocator cache are deterministic across runs.
+pub mod sorted_set {
+    use super::HashSet;
+    use serde::{Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(set: &HashSet<String>, s: S) -> Result<S::Ok, S::Error> {
+        let mut items: Vec<&String> = set.iter().collect();
+        items.sort();
+        items.serialize(s)
     }
 }

@@ -16,6 +16,7 @@ pub enum UnitType {
     Swap,
     Path,
     Device,
+    Power,
     /// Custom/unknown unit type from a foreign init system.
     Other(String),
 }
@@ -34,6 +35,7 @@ impl UnitType {
             UnitType::Swap => "swap",
             UnitType::Path => "path",
             UnitType::Device => "device",
+            UnitType::Power => "power",
             UnitType::Other(s) => s.as_str(),
         }
     }
@@ -66,6 +68,8 @@ pub struct DependencySet {
     pub on_failure: HashSet<String>,
     /// Reload propagation targets.
     pub propagates_reload_to: HashSet<String>,
+    /// Action to perform when the unit succeeds (e.g. `poweroff-force`).
+    pub success_action: String,
     pub default_dependencies: bool,
 }
 

@@ -536,6 +536,10 @@ fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
             })?;
             unit.device = Some(device);
         }
+        UnitKind::Power => {
+            // Power units have no dedicated section beyond [Unit]; the
+            // action is encoded in the unit name.
+        }
         other => {
             warn!("Unit kind {:?} not fully parsed", other);
         }
@@ -883,6 +887,9 @@ fn parse_unit_section(config: &Ini, unit: &mut UnitSection, name: &str) -> Resul
 
     let propagates_reload_to = get_str(config, "unit", "propagatesreloadto");
     unit.propagates_reload_to = split_list(&expand(&propagates_reload_to));
+
+    let success_action = get_str(config, "unit", "successaction");
+    unit.success_action = SuccessAction::from(success_action.as_str());
 
     let requires_mounts_for = get_str(config, "unit", "requiresmountsfor");
     if !requires_mounts_for.is_empty() {
@@ -1594,6 +1601,70 @@ BusName=org.example.Foo
         assert!(svc.exec_start[0].ignore_failure);
         assert!(svc.exec_start[0].privileged);
         assert_eq!(svc.exec_start[0].args, vec!["arg"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // SuccessAction= parsing (power-transition units)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_success_action_poweroff_force() {
+        // Mirrors the real systemd-poweroff.service on the host: no [Service]
+        // section, the power transition rides entirely on SuccessAction=.
+        let content = r#"
+[Unit]
+Description=System Power Off
+DefaultDependencies=no
+Requires=shutdown.target umount.target final.target
+After=shutdown.target umount.target final.target
+SuccessAction=poweroff-force
+"#;
+        let unit = parse_unit("systemd-poweroff.service", content).unwrap();
+        // The parser always materialises a `[Service]` section for service
+        // units; the point is it carries no ExecStart= (nothing to spawn),
+        // which is what makes the unit a no-op on the worker side.
+        let svc = unit.service.expect("service section synthesized");
+        assert!(svc.exec_start.is_empty());
+        assert!(matches!(
+            unit.unit.success_action,
+            SuccessAction::PoweroffForce
+        ));
+        assert_eq!(unit.unit.success_action.power_unit_name(), Some("poweroff.power"));
+        assert_eq!(unit.unit.success_action.as_str(), "poweroff-force");
+    }
+
+    #[test]
+    fn test_parse_success_action_all_variants() {
+        for (raw, variant) in [
+            ("reboot", SuccessAction::Reboot),
+            ("reboot-force", SuccessAction::RebootForce),
+            ("poweroff-immediate", SuccessAction::PoweroffImmediate),
+            ("halt-force", SuccessAction::HaltForce),
+            ("kexec", SuccessAction::Kexec),
+            ("suspend", SuccessAction::Suspend),
+            ("hibernate-force", SuccessAction::HibernateForce),
+            ("exit", SuccessAction::Exit),
+            ("exit-force", SuccessAction::ExitForce),
+        ] {
+            let content = format!("[Unit]\nSuccessAction={raw}\n");
+            let unit = parse_unit("x.service", &content).unwrap();
+            assert_eq!(unit.unit.success_action, variant, "raw={raw}");
+        }
+        // Unknown values resolve to None (no transition).
+        let content = "[Unit]\nSuccessAction=not-a-thing\n";
+        let unit = parse_unit("x.service", content).unwrap();
+        assert_eq!(unit.unit.success_action, SuccessAction::None);
+    }
+
+    #[test]
+    fn test_success_action_power_unit_mapping() {
+        assert_eq!(SuccessAction::Suspend.power_unit_name(), Some("suspend.power"));
+        assert_eq!(
+            SuccessAction::Hibernate.power_unit_name(),
+            Some("hibernate.power")
+        );
+        assert_eq!(SuccessAction::None.power_unit_name(), None);
+        assert_eq!(SuccessAction::ExitForce.power_unit_name(), None);
     }
 
     #[test]

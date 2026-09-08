@@ -1,0 +1,22 @@
+cargo-features = ["different-binary-name"]
+
+[package]
+name = "systema-sysp-shim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "systema-sysp-shim"
+filename = "systema-sysp.shim"
+path = "src/main.rs"
+
+[dependencies]
+sysa = { path = "../../../libsysa" }
+systema-sysp-common = { path = "../systema-sysp-common" }
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

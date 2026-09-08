@@ -24,7 +24,8 @@ use sysa::proto::{
     ListUnitsResult, MethodResult, PathFired, RegisterAck, RegisterUnits, StagingAreaEntry,
     StagingQuery, StagingQueryResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest,
     StopUnitsResult, TimerFired, UnitDefineResult, UnitInfo, UnitRegistrationAck, UnitStartResult,
-    UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    UnitStateEof, UnitStateEntry, UnitStateListRequest, UnitStateUpdate, UnitStateUpdateAck,
+    UnitSyncReport, WorkerRegistration,
 };
 
 use crate::dbus::manager::load_unit_sync;
@@ -266,6 +267,7 @@ async fn handle_worker(
         "finder.commit_units" => handle_finder_commit(framed, env, allocator, client_uid).await,
         "staging.query" => handle_finder_query(framed, env, allocator, client_uid).await,
         "admin.staging" => handle_admin_staging(framed, env, allocator, client_uid).await,
+        "admin.unitstate" => handle_admin_unitstate(framed, env, allocator, client_uid).await,
         "manager.list_units" => handle_manager_list_units(framed, env, allocator, client_uid).await,
         "manager.start_units" => {
             handle_manager_start_units(framed, env, allocator, client_uid).await
@@ -276,7 +278,7 @@ async fn handle_worker(
         }
         other => {
             anyhow::bail!(sysa::l10n::fmt(
-                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', 'manager.list_units', 'manager.start_units', 'manager.stop_units', or 'manager.daemon_reload', got '{method}'"),
+                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', 'admin.unitstate', 'manager.list_units', 'manager.start_units', 'manager.stop_units', or 'manager.daemon_reload', got '{method}'"),
                 &[("method", other)],
             ))
         }
@@ -1333,6 +1335,64 @@ async fn handle_admin_staging(
         result,
     )?;
     send_envelope(&mut framed, &ack_env).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit-state administration (root / systema-uid only)
+// ---------------------------------------------------------------------------
+
+/// `admin.unitstate` — stream the System Allocator's cached unit state.
+///
+/// Only reads the allocator's in-memory caches; no worker is contacted.
+/// The snapshot is streamed as one `admin.unitstate.entry` envelope per
+/// unit followed by a single `admin.unitstate.eof` sentinel.  Access is
+/// restricted to root or the UID running System A.
+async fn handle_admin_unitstate(
+    mut framed: sysa::ipc::EnvelopeFramed,
+    env: Envelope,
+    allocator: AllocatorHandle,
+    client_uid: u32,
+) -> Result<()> {
+    let sys_uid = system_uid();
+    if client_uid != 0 && client_uid != sys_uid {
+        let eof = UnitStateEof {
+            total: 0,
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_("Permission denied (UID {uid}): only root or UID {sys_uid} may inspect unit state."),
+                &[("uid", &client_uid.to_string()), ("sys_uid", &sys_uid.to_string())],
+            ),
+        };
+        let eof_env =
+            make_envelope(next_request_id(), "system-a", "", "admin.unitstate.eof", eof)?;
+        send_envelope(&mut framed, &eof_env).await?;
+        return Ok(());
+    }
+
+    let _req = UnitStateListRequest::decode(env.payload.as_slice())?;
+
+    let names = crate::unitstate::unit_names(&*allocator.read());
+    let mut total = 0u32;
+    for name in names {
+        // Collect the JSON synchronously (short read-lock) and send async.
+        let json = crate::unitstate::entry_json(&*allocator.read(), &name)
+            .and_then(|doc| serde_json::to_vec(&doc).ok());
+        let Some(json) = json else {
+            continue;
+        };
+        let entry = UnitStateEntry { name, json };
+        let entry_env =
+            make_envelope(next_request_id(), "system-a", "", "admin.unitstate.entry", entry)?;
+        send_envelope(&mut framed, &entry_env).await?;
+        total += 1;
+    }
+
+    let eof = UnitStateEof {
+        total,
+        message: String::new(),
+    };
+    let eof_env = make_envelope(next_request_id(), "system-a", "", "admin.unitstate.eof", eof)?;
+    send_envelope(&mut framed, &eof_env).await?;
     Ok(())
 }
 

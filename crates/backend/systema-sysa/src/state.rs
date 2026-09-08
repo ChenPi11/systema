@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use systema_sysf::ir::UnitIR;
 
-use crate::unit::types::{SliceSection, UnitFile, UnitKind};
+use crate::unit::types::{SliceSection, SuccessAction, UnitFile, UnitKind};
 
 /// systemd's root slice unit name (`-.slice`).
 ///
@@ -817,6 +817,7 @@ fn apply_ir_patch(ir: &UnitIR, uf: &mut UnitFile) {
         uf.unit
             .propagates_reload_to
             .clone_from(&deps.propagates_reload_to);
+        uf.unit.success_action = SuccessAction::from(deps.success_action.as_str());
         uf.unit.default_dependencies = deps.default_dependencies;
     }
 
@@ -904,6 +905,7 @@ fn unit_kind_from_type(ty: &systema_sysf::ir::UnitType) -> UnitKind {
         UnitType::Swap => UnitKind::Swap,
         UnitType::Path => UnitKind::Path,
         UnitType::Device => UnitKind::Device,
+        UnitType::Power => UnitKind::Power,
         UnitType::Other(s) => UnitKind::Unknown(s.clone()),
     }
 }

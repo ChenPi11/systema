@@ -1,0 +1,16 @@
+[package]
+name = "systema-sysp-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+sysa = { path = "../../../libsysa" }
+systema-sysf = { path = "../../systema-sysf" }
+
+tokio.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+prost.workspace = true
+serde_json.workspace = true

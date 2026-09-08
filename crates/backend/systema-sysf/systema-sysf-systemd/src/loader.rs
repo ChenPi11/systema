@@ -20,6 +20,7 @@ pub fn is_known_extension(name: &str) -> bool {
             | "swap"
             | "path"
             | "device"
+            | "power"
     )
 }
 
@@ -364,6 +365,31 @@ mod tests {
         // A plain (non-instance) name must never fall back to anything.
         let dirs = vec![dir.to_string_lossy().into_owned()];
         assert!(discover_one_in(&dirs, "sshd.service").unwrap().is_none());
+    }
+
+    #[test]
+    fn power_units_are_discovered() {
+        let dir = temp_dir("power");
+        fs::write(
+            dir.join("poweroff.power"),
+            "[Unit]\nDescription=Power off\n",
+        )
+        .unwrap();
+
+        // `discover_all` scans whole directories, so `.power` must pass the
+        // known-extension filter (the actual regression `list-units` hit).
+        assert!(is_known_extension("poweroff.power"));
+        let mut units = Vec::new();
+        let mut implicit = HashMap::new();
+        load_units_from_dir_recursive(&dir, &mut units, &mut implicit, None).unwrap();
+        assert!(units.iter().any(|u| u.name == "poweroff.power"));
+
+        // A single-unit lookup works too.
+        let dirs = vec![dir.to_string_lossy().into_owned()];
+        let unit = discover_one_in(&dirs, "poweroff.power").unwrap().unwrap();
+        assert_eq!(unit.name, "poweroff.power");
+        assert_eq!(unit.unit.description, "Power off");
+        assert_eq!(crate::types::UnitKind::from_extension(&unit.name), crate::types::UnitKind::Power);
     }
 
     #[test]
