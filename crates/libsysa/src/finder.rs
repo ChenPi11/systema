@@ -17,6 +17,14 @@ impl UnitFinder {
         }
     }
 
+    /// Build a finder client speaking to System A's IPC socket at an
+    /// explicit path (the tests use this to point at an in-process stub).
+    pub fn with_socket(socket_path: impl Into<String>) -> Self {
+        UnitFinder {
+            socket_path: socket_path.into(),
+        }
+    }
+
     pub async fn register_units(
         &self,
         name: &str,

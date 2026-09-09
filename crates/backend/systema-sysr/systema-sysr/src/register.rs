@@ -14,13 +14,32 @@
 //! are safe to repeat on every (re)connect and session transition.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use sysa::finder::UnitFinder;
 use systema_sysf::ir::{DependencySet, UnitIR, UnitType};
+use tokio::sync::Mutex;
 
 /// Staging area under which System R registers its dynamic slice units.
 const STAGING_NAME: &str = "systema-sysr/slices";
+
+/// Serialize the register → commit cycle on the shared slice staging area.
+///
+/// Every `commit_slice` cycle stages a unit into the single fixed-name
+/// staging area (`STAGING_NAME`) and commits it.  System A *consumes* the
+/// area on a successful commit, so two cycles driven concurrently — the
+/// (re)connect registration task and the per-session `user.sessions` tasks
+/// both call [`commit_slice`] — must not interleave: if a sibling commit
+/// lands between this cycle's `register_units` and `commit_units`, the
+/// staging area is already gone and System A refuses the commit with
+/// `no staging area for UID ... with name '...'`.  Holding the lock across
+/// the whole cycle makes each commit atomic.
+static STAGING_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn staging_lock() -> &'static Mutex<()> {
+    STAGING_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Description of the static user container (systemd: "User and Session
 /// Slice").
@@ -61,10 +80,19 @@ pub fn user_slice_ir(unit_name: &str, description: &str) -> UnitIR {
 /// definition.  Fails only on transport errors or an explicit refusal from
 /// System A.
 pub async fn commit_slice(unit_name: &str, description: &str) -> Result<()> {
+    let client = UnitFinder::new();
+    commit_slice_with(&client, unit_name, description).await
+}
+
+/// Serialized register → commit cycle of one slice unit against `client`.
+///
+/// The caller-visible [`commit_slice`] wrapper falls through to here; the
+/// staging lock is held across the whole cycle (see [`STAGING_LOCK`]).
+async fn commit_slice_with(client: &UnitFinder, unit_name: &str, description: &str) -> Result<()> {
+    let _serial = staging_lock().lock().await;
     let units = HashMap::from([(unit_name.to_string(), user_slice_ir(unit_name, description))]);
     let json = serde_json::to_vec(&units).context("Cannot serialise slice units")?;
 
-    let client = UnitFinder::new();
     let reg = client
         .register_units(STAGING_NAME, json)
         .await
@@ -174,6 +202,13 @@ fn slice_ir_for(unit_name: &str, parent: &str) -> UnitIR {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    use prost::Message as ProstMessage;
+    use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
+    use sysa::proto::{CommitUnits, RegisterUnits, UnitRegistrationAck};
+    use tokio::net::{UnixListener, UnixStream};
 
     #[test]
     fn slice_ir_shape() {
@@ -242,5 +277,128 @@ mod tests {
         let chain = synthesize_slice_chain("user-abc.slice").expect("arbitrary slice synthesizes");
         assert_eq!(chain[0].description, None);
         assert_eq!(chain[0].slice.as_deref(), Some("user.slice"));
+    }
+
+    /// A minimal in-process stub of System A's finder RPC, mirroring its
+    /// staging-area semantics: `register_units` merges into a fixed-name
+    /// area (git-index style), `commit_units` publishes the area's units and
+    /// *consumes* it, and a commit of an already-consumed area is refused
+    /// with `no staging area ...`.  System R's reconnect task and its
+    /// per-session tasks drive concurrent register→commit cycles over the
+    /// same name (`systema-sysr/slices`); the staging lock in
+    /// [`commit_slice_with`] is what keeps those cycles from interleaving
+    /// and tripping the refusal.
+    async fn serve_finder_connection(
+        stream: UnixStream,
+        areas: Arc<Mutex<HashMap<(u32, String), HashMap<String, UnitIR>>>>,
+        committed: Arc<Mutex<HashSet<String>>>,
+    ) -> Result<()> {
+        let mut framed = frame_stream(stream);
+        let Some(env) = recv_envelope(&mut framed).await? else {
+            return Ok(());
+        };
+        let ack = match env.method.as_str() {
+            "finder.register_units" => {
+                let msg = RegisterUnits::decode(env.payload.as_slice())?;
+                let units: HashMap<String, UnitIR> =
+                    serde_json::from_slice(&msg.units_json).context("bad units_json")?;
+                let mut areas = areas.lock().unwrap();
+                let area = areas.entry((0, msg.name.clone())).or_default();
+                area.extend(units);
+                UnitRegistrationAck {
+                    success: true,
+                    message: "staged".to_string(),
+                    unit_count: area.len() as u32,
+                }
+            }
+            "finder.commit_units" => {
+                let msg = CommitUnits::decode(env.payload.as_slice())?;
+                let area = areas.lock().unwrap().remove(&(msg.uid, msg.name.clone()));
+                match area {
+                    Some(units) => {
+                        committed.lock().unwrap().extend(units.keys().cloned());
+                        UnitRegistrationAck {
+                            success: true,
+                            message: "committed".to_string(),
+                            unit_count: units.len() as u32,
+                        }
+                    }
+                    None => UnitRegistrationAck {
+                        success: false,
+                        message: format!("no staging area for UID {} with name '{}'", msg.uid, msg.name),
+                        unit_count: 0,
+                    },
+                }
+            }
+            other => anyhow::bail!("unexpected finder method {other}"),
+        };
+        let ack_env = make_envelope(env.request_id, "system-a", "system-f", "finder.ack", ack)?;
+        send_envelope(&mut framed, &ack_env).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_commit_slice_cycles_do_not_race() {
+        let dir = std::env::temp_dir().join(format!("sysr-finder-mock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("systema.sock");
+        let _ = std::fs::remove_file(&sock);
+
+        let listener = UnixListener::bind(&sock).unwrap();
+        let areas: Arc<Mutex<HashMap<(u32, String), HashMap<String, UnitIR>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let committed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let server_areas = areas.clone();
+        let server_committed = committed.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let areas = server_areas.clone();
+                let committed = server_committed.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_finder_connection(stream, areas, committed).await {
+                        eprintln!("mock finder error: {e}");
+                    }
+                });
+            }
+        });
+
+        // Drive many registers+commits concurrently — the exact shape of
+        // System R's reconnect task racing its per-session tasks.
+        let client = Arc::new(UnitFinder::with_socket(sock.to_string_lossy().to_string()));
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move {
+                commit_slice_with(
+                    &client,
+                    &format!("user-{i}.slice"),
+                    &format!("User Slice of UID {i}"),
+                )
+                .await
+            }));
+        }
+        let mut refused = 0usize;
+        for task in tasks {
+            if let Err(e) = task.await.unwrap() {
+                if e.to_string().contains("refused the commit") {
+                    refused += 1;
+                }
+            }
+        }
+
+        server.abort();
+
+        assert_eq!(refused, 0, "a concurrent commit was refused (staging race)");
+        for i in 0..8 {
+            assert!(
+                committed.lock().unwrap().contains(&format!("user-{i}.slice")),
+                "user-{i}.slice was never committed"
+            );
+        }
+        let _ = std::fs::remove_file(&sock);
     }
 }

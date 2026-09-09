@@ -294,7 +294,16 @@ impl ReverseIndex {
                 .filter(|s| !s.is_empty())
                 .or_else(|| Some(dep.replace(".socket", ".service")));
             if let Some(svc) = svc {
-                out.insert(svc);
+                // Never order a unit after its own socket's service when that
+                // resolves back to the unit itself ("foo.socket" ->
+                // "foo.service" for a service that owns the socket).  A unit
+                // cannot appear in its own `after_deps`; a self-edge turns
+                // every mattering Stop job on the unit into an unbreakable
+                // ordering cycle (e.g. poweroff.target pulling in
+                // dbus.service/systemd-networkd.service via inverse-Conflicts).
+                if svc != u {
+                    out.insert(svc);
+                }
             }
         }
         let mut v: Vec<String> = out.into_iter().collect();
@@ -1876,66 +1885,104 @@ mod tests {
     }
 
     #[test]
-    fn temp_socket_selfloop_repro() {
-        // Mirror of systemd-udevd.service: Sockets=udevd-control.socket,
-        // and the socket resolves back to udevd.service by convention.
+    fn socket_resolution_does_not_self_order_service() {
+        // A service that is ordered after its own socket (or requires it)
+        // must not appear in its own `after_deps`.  Real systemd examples that
+        // trip this: `systemd-networkd.service` declares `After=
+        // systemd-networkd.socket` and `dbus.service` has `Requires=dbus.socket`
+        // — the `.socket -> .service` convention resolution inserts the unit
+        // into its own `after_deps`, which turns every mattering Stop job on
+        // the unit into an unbreakable ordering cycle during poweroff.
         let units = map(vec![
-            with_sockets(
+            // "foo.socket" --[convention]--> foo.service
+            with_conflicts(
+                with_before(make_unit("foo.socket"), &["shutdown.target"]),
+                &["shutdown.target"],
+            ),
+            // foo.service ordered after its own socket + inverse-Conflicts
+            with_after(
                 with_conflicts(
-                    with_before(make_unit("udevd.service"), &["shutdown.target"]),
+                    with_before(make_unit("foo.service"), &["shutdown.target"]),
                     &["shutdown.target"],
                 ),
-                &["udevd-control.socket"],
+                &["foo.socket"],
+            ),
+            make_unit("shutdown.target"),
+        ]);
+        let rev = ReverseIndex::build(&units);
+        let after = rev.after_deps(&units, "foo.service");
+        assert!(
+            !after.iter().any(|d| d == "foo.service"),
+            "foo.service must not appear in its own after_deps: {after:?}"
+        );
+        // Same guarantee when the socket is pulled in via Requires=.
+        let units = map(vec![
+            with_conflicts(
+                with_before(make_unit("bar.socket"), &["shutdown.target"]),
+                &["shutdown.target"],
+            ),
+            with_requires(
+                with_conflicts(
+                    with_before(make_unit("bar.service"), &["shutdown.target"]),
+                    &["shutdown.target"],
+                ),
+                &["bar.socket"],
+            ),
+            make_unit("shutdown.target"),
+        ]);
+        let rev = ReverseIndex::build(&units);
+        let after = rev.after_deps(&units, "bar.service");
+        assert!(
+            !after.iter().any(|d| d == "bar.service"),
+            "bar.service must not appear in its own after_deps: {after:?}"
+        );
+    }
+
+    #[test]
+    fn poweroff_target_builds_with_socket_owning_service() {
+        // Mirror the real-host failure (dbus.service / systemd-networkd.service
+        // ordering after their own sockets): with the inverse-Conflicts fix,
+        // starting shutdown.target stops the services that conflict with it.
+        // Before the self-order guard these services produced an unbreakable
+        // ordering cycle; now the poweroff transaction must build and order
+        // the stops before the shutdown.target start.
+        let units = map(vec![
+            with_after(
+                with_conflicts(
+                    with_before(make_unit("dbus.service"), &["shutdown.target"]),
+                    &["shutdown.target"],
+                ),
+                &["dbus.socket"],
             ),
             with_conflicts(
-                with_before(make_unit("udevd-control.socket"), &["shutdown.target"]),
+                with_before(make_unit("dbus.socket"), &["shutdown.target"]),
                 &["shutdown.target"],
             ),
             make_unit("shutdown.target"),
         ]);
         let states = {
             let mut m = HashMap::new();
-            m.insert("udevd.service".to_string(), Active);
-            m.insert("udevd-control.socket".to_string(), Active);
+            m.insert("dbus.service".to_string(), Active);
+            m.insert("dbus.socket".to_string(), Active);
             m
         };
-        match build_plan(
+        let s = steps(
             &units,
             &states,
             &HashMap::new(),
             "shutdown.target",
             Start,
-            Replace,
-        ) {
-            Ok(p) => {
-                eprintln!("PLAN OK: {:?}", names(&p.steps));
-                for s in &p.steps {
-                    eprintln!(
-                        "  {} {:?} matters={}",
-                        s.unit, s.job_type, s.matters_to_anchor
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("PLAN ERR: {e:?}");
-            }
-        }
-        let rev = ReverseIndex::build(&units);
-        eprintln!(
-            "after_deps(udevd.service): {:?}",
-            rev.after_deps(&units, "udevd.service")
+            ReplaceIrreversibly,
         );
-        eprintln!(
-            "before_deps(udevd.service): {:?}",
-            rev.before_deps(&units, "udevd.service")
-        );
-        eprintln!(
-            "after_deps(udevd-control.socket): {:?}",
-            rev.after_deps(&units, "udevd-control.socket")
-        );
-        eprintln!(
-            "conflicted_by(shutdown.target): {:?}",
-            rev.conflicted_by("shutdown.target")
+        let svc = s.iter().find(|x| x.unit == "dbus.service").unwrap();
+        assert_eq!(svc.job_type, Stop);
+        assert!(svc.matters_to_anchor);
+        let shutdown_pos = s.iter().position(|x| x.unit == "shutdown.target").unwrap();
+        let svc_pos = s.iter().position(|x| x.unit == "dbus.service").unwrap();
+        assert!(
+            svc_pos < shutdown_pos,
+            "service stop must run before shutdown.target start (plan: {:?})",
+            names(&s)
         );
     }
 

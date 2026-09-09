@@ -487,7 +487,18 @@ impl AllocatorState {
     /// The staging area is removed only after a fully successful merge.
     pub fn commit_staging(&mut self, uid: u32, name: &str) -> Result<u32, String> {
         let Some(area) = self.staging_areas.get(&(uid, name.to_string())) else {
-            return Err(format!("no staging area for UID {uid} with name '{name}'"));
+            // Idempotent by design: a successful commit consumes the staging
+            // area, and finders drive register → commit cycles under a fixed
+            // per-finder staging name (System R additionally runs them from
+            // concurrent tasks).  When two cycles overlap, the first commit
+            // publishes — and removes — the shared area, so a sibling commit
+            // legitimately finds it already consumed.  Treat that as a repeat
+            // of an already-satisfied commit, not an error.
+            info!(
+                "commit_staging(UID={uid}, name={name}): staging area already consumed \
+                 (idempotent commit)"
+            );
+            return Ok(0);
         };
 
         let unit_count = area.units.len() as u32;
@@ -1583,10 +1594,10 @@ mod tests {
             2
         );
 
-        let err = state
-            .commit_staging(7, "systema-sysm/discovery")
-            .unwrap_err();
-        assert!(err.contains("no staging area"), "unexpected error: {err}");
+        // Committing a staging area that was never created is an idempotent
+        // no-op (a consumed area must not be reported as a refused commit
+        // when concurrent finder cycles share a fixed staging name).
+        assert_eq!(state.commit_staging(7, "systema-sysm/discovery").unwrap(), 0);
         assert_eq!(
             state.commit_staging(7, "systema-sysd/discovery").unwrap(),
             0
@@ -1594,6 +1605,46 @@ mod tests {
         assert!(state
             .get_staging_area(8, "systema-sysd/discovery")
             .is_some());
+    }
+
+    #[test]
+    fn concurrent_cycles_shared_area_commit_is_idempotent() {
+        let mut state = AllocatorState::new();
+        // Reproduces the systema-sysr race: its reconnect registration task
+        // and its per-session `user.sessions` tasks drive register → commit
+        // cycles over the same fixed staging name ("systema-sysr/slices").
+        // B registers before A's commit lands, so A's commit publishes the
+        // whole shared area (both units) and consumes it.
+        state
+            .init_staging_area(
+                0,
+                "systema-sysr/slices",
+                HashMap::from([("user.slice".to_string(), mount_ir("user.slice", "/tmp"))]),
+            )
+            .unwrap();
+        state
+            .init_staging_area(
+                0,
+                "systema-sysr/slices",
+                HashMap::from([(
+                    "user-1000.slice".to_string(),
+                    mount_ir("user-1000.slice", "/tmp2"),
+                )]),
+            )
+            .unwrap();
+
+        // A's commit publishes the whole area and removes it.
+        assert_eq!(state.commit_staging(0, "systema-sysr/slices").unwrap(), 2);
+        assert!(state.units.contains_key("user.slice"));
+        assert!(state.units.contains_key("user-1000.slice"));
+        assert!(state.get_staging_area(0, "systema-sysr/slices").is_none());
+
+        // B's commit finds the area already consumed: an idempotent no-op,
+        // not a refused commit (the "no staging area" regression).
+        assert_eq!(state.commit_staging(0, "systema-sysr/slices").unwrap(), 0);
+        assert!(state.units.contains_key("user.slice"));
+        assert!(state.units.contains_key("user-1000.slice"));
+        assert!(state.get_staging_area(0, "systema-sysr/slices").is_none());
     }
 
     #[test]

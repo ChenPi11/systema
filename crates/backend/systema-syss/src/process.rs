@@ -240,19 +240,35 @@ pub async fn start_service(
         inst.invocation_id = invocation_id.clone();
     }
 
-    // Build the Command.
-    let mut cmd = if parsed.flags.via_shell {
+    // Build the Command plus the exact argv that will be handed to exec (the
+    // final command array with every transformation applied: env expansion,
+    // via_shell join), so the executed command can be verified against the
+    // unit file's ExecStart.
+    let (mut cmd, argv) = if parsed.flags.via_shell {
         // | prefix: route through sh -c
         let joined = build_shell_command_line(&parsed.program, &final_args);
         let mut c = Command::new(sysa::paths::instance().systema_shell_path);
         c.arg("-c");
         c.arg(&joined);
-        c
+        (
+            c,
+            vec![
+                sysa::paths::instance().systema_shell_path.to_string(),
+                "-c".to_string(),
+                joined,
+            ],
+        )
     } else {
         let mut c = Command::new(&parsed.program);
         c.args(&final_args);
-        c
+        (
+            c,
+            std::iter::once(parsed.program.clone())
+                .chain(final_args.iter().cloned())
+                .collect(),
+        )
     };
+    debug!("ExecStart {} argv={argv:?}", unit_name);
 
     if !svc.working_directory.is_empty() {
         cmd.current_dir(&svc.working_directory);

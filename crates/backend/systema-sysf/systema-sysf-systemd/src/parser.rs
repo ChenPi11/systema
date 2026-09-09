@@ -118,9 +118,21 @@ fn apply_dropin_dir(dir: &Path, unit: &mut UnitFile) -> Result<()> {
 /// Drop-in files follow the same INI format as base unit files. They can
 /// override scalar values and append to list values.  An empty value for
 /// a list key (e.g. `ExecStart=`) clears the accumulated list.
+/// Build an INI parser configured for systemd unit-file semantics.  The
+/// configparser default treats `;` and `#` as inline comment markers that
+/// truncate a value anywhere in the line; systemd only recognises them at
+/// the start of a line, so inline comments must be disabled or a value like
+/// `ExecStart=-/bin/sh -c 'if [ -f /x ]; then …; fi'` is silently cut at the
+/// first `;` (single-quoted shell syntax is not an INI comment).
+fn unit_ini() -> Ini {
+    let mut config = Ini::new();
+    config.set_inline_comment_symbols(Some(&[]));
+    config
+}
+
 fn apply_dropin_content(unit: &mut UnitFile, content: &str) -> Result<()> {
     let processed = merge_append_keys(&preprocess_content(content));
-    let mut config = Ini::new();
+    let mut config = unit_ini();
     config.read(processed.clone()).map_err(|e| {
         anyhow::anyhow!(sysa::l10n::fmt(
             sysa::l10n::t_("INI parse error in drop-in: {e}."),
@@ -385,7 +397,7 @@ fn is_append_key(section: &str, key: &str) -> bool {
 
 fn parse_unit_content(name: &str, content: &str) -> Result<UnitFile> {
     let processed = merge_append_keys(&preprocess_content(content));
-    let mut config = Ini::new(); // case-insensitive (normalizes to lowercase)
+    let mut config = unit_ini(); // case-insensitive (normalizes to lowercase)
     config.read(processed).map_err(|e| {
         anyhow::anyhow!(sysa::l10n::fmt(
             sysa::l10n::t_("INI parse error in {name}: {e}."),
@@ -1562,6 +1574,39 @@ BusName=org.example.Foo
         let svc = unit.service.unwrap();
         assert!(svc.exec_start[0].privileged);
         assert_eq!(svc.exec_start[0].program, "/usr/sbin/privileged-cmd");
+    }
+
+    #[test]
+    fn test_exec_start_shell_script_with_semicolons_is_not_truncated() {
+        // Inline `;` inside single quotes is shell syntax, NOT an INI
+        // comment. configparser's default inline-comment handling once cut
+        // this value at the first `;`, producing a syntactically invalid
+        // `/bin/sh -c 'if [ -f /run/network/restart-hotplug ]'` (networking
+        // syntax error, exit code 2).
+        let content = r#"[Service]
+Type=oneshot
+ExecStart=-/bin/sh -c 'if [ -f /run/network/restart-hotplug ]; then /usr/sbin/ifup -a --read-environment --allow=hotplug; fi'
+"#;
+        let unit = parse_unit("networking.service", content).unwrap();
+        let svc = unit.service.unwrap();
+        let cmd = &svc.exec_start[0];
+        assert!(cmd.ignore_failure);
+        assert_eq!(cmd.program, "/bin/sh");
+        assert_eq!(cmd.args.len(), 2);
+        assert_eq!(cmd.args[0], "-c");
+        assert_eq!(
+            cmd.args[1],
+            "if [ -f /run/network/restart-hotplug ]; then /usr/sbin/ifup -a --read-environment --allow=hotplug; fi"
+        );
+        assert!(cmd.raw.contains("; then"));
+    }
+
+    #[test]
+    fn test_whole_line_comments_are_still_ignored() {
+        let content = "[Service]\n# comment\n; also a comment\nExecStart=/bin/true\n";
+        let unit = parse_unit("foo.service", content).unwrap();
+        let svc = unit.service.unwrap();
+        assert_eq!(svc.exec_start[0].program, "/bin/true");
     }
 
     #[test]
