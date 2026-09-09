@@ -133,7 +133,7 @@
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| Unix 域套接字服务器监听 `/run/system-alphabet/allocator.sock` | ✅ 完全实现 | |
+| Unix 域套接字服务器监听 `/run/systema/allocator.sock` | ✅ 完全实现 | |
 | 长度前缀帧编解码（LengthDelimitedCodec） | ✅ 完全实现 | |
 | `Envelope` protobuf 封装 | ✅ 完全实现 | |
 | Worker 注册握手（`worker.register` → `worker.ack`） | ✅ 完全实现 | |

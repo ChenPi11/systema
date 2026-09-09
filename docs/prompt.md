@@ -52,7 +52,7 @@ System Workers 不再是固定写死的 `System S`（Service）、`System M`（M
 - **模式**：  
   - **RPC**：System A 向 System W 派发 Task，执行器回报 TaskResult。  
   - **Pub/Sub 事件流**：执行器(W)发布事件（如 `process.exit`），System A 订阅并响应。  
-- **连接模型**：System A 作为服务器监听知名地址（如 `/run/system-alphabet/allocator.sock`），各 System W 启动后主动连接 SysA，注册自己的能力。（也就是”我处理哪一类unit“，例如 `"type": "service"/"target"/"mount"`），然后持续**拉取 (Pull)** 属于自己的 Task。连接是长连接、全双工。
+- **连接模型**：System A 作为服务器监听知名地址（如 `/run/systema/allocator.sock`），各 System W 启动后主动连接 SysA，注册自己的能力。（也就是”我处理哪一类unit“，例如 `"type": "service"/"target"/"mount"`），然后持续**拉取 (Pull)** 属于自己的 Task。连接是长连接、全双工。
 
 协议框架定义：
 

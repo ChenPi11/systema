@@ -21,12 +21,12 @@ set -u
 export LOCAL_PREFIX="${PREFIX}/local"
 
 # ---------------------------------------------------------------------------
-# system-alphabet directories
+# systema directories
 # ---------------------------------------------------------------------------
-export SYSTEMA_ETC_DIR="${LOCAL_PREFIX}/etc/system-alphabet"
-export SYSTEMA_RUN_DIR="${PREFIX}/var/run/system-alphabet"
-export SYSTEMA_LOCAL_LIB_DIR="${LOCAL_PREFIX}/lib/system-alphabet"
-export SYSTEMA_LIB_DIR="${LOCAL_PREFIX}/lib/system-alphabet"
+export SYSTEMA_ETC_DIR="${LOCAL_PREFIX}/etc/systema"
+export SYSTEMA_RUN_DIR="${PREFIX}/var/run/systema"
+export SYSTEMA_LOCAL_LIB_DIR="${LOCAL_PREFIX}/lib/systema"
+export SYSTEMA_LIB_DIR="${LOCAL_PREFIX}/lib/systema"
 
 # ---------------------------------------------------------------------------
 # systemd directories (used to read real systemd unit files when present)
@@ -54,7 +54,7 @@ export SYSTEMD_MACHINE_ID_FILE="${LOCAL_PREFIX}/etc/machine-id"
 # ---------------------------------------------------------------------------
 # IPC socket
 # ---------------------------------------------------------------------------
-export SYSTEMA_IPC_SOCKET="${PREFIX}/var/run/system-alphabet/allocator.sock"
+export SYSTEMA_IPC_SOCKET="${PREFIX}/var/run/systema/allocator.sock"
 
 # ---------------------------------------------------------------------------
 # Summary

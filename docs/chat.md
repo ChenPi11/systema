@@ -72,7 +72,7 @@ The user wants me to read `docs/prompt.md` and execute the tasks described in it
 38: - **模式**：  
 39:   - **RPC**：System A 向 System W 派发 Task，执行器回报 TaskResult。  
 40:   - **Pub/Sub 事件流**：执行器(W)发布事件（如 `process.exit`），System A 订阅并响应。  
-41: - **连接模型**：System A 作为服务器监听知名地址（如 `/run/system-alphabet/allocator.sock`），各 System W 启动后主动连接 SysA，注册自己的能力。（也就是”我处理哪一类unit“，例如 `"type": "service"/"target"/"mount"`），然后持续**拉取 (Pull)** 属于自己的 Task。连接是长连接、全双工。
+41: - **连接模型**：System A 作为服务器监听知名地址（如 `/run/systema/allocator.sock`），各 System W 启动后主动连接 SysA，注册自己的能力。（也就是”我处理哪一类unit“，例如 `"type": "service"/"target"/"mount"`），然后持续**拉取 (Pull)** 属于自己的 Task。连接是长连接、全双工。
 42: 
 43: 协议框架定义：
 44: 
@@ -268,7 +268,7 @@ common/src/
 **Paths** (generated at build time, configurable via env vars):
 - `SYSTEMA_ETC_DIR`, `SYSTEMA_RUN_DIR`, `SYSTEMA_LOCAL_LIB_DIR`, `SYSTEMA_LIB_DIR`
 - `SYSTEMD_ETC_UNIT_DIR`, `SYSTEMD_LIB_UNIT_DIR`, `SYSTEMD_ALT_UNIT_DIR`
-- `IPC_SOCKET_PATH` (default: `/run/system-alphabet/allocator.sock`)
+- `IPC_SOCKET_PATH` (default: `/run/systema/allocator.sock`)
 - `UNIT_SEARCH_PATHS`, `GENERATOR_SEARCH_PATHS`
 
 ---
@@ -407,7 +407,7 @@ The IPC protocol is defined in **`/home/chenpi11/Projects/systema/systema/proto/
 
 ### Transport
 
-- **Socket:** Unix domain socket at `/run/system-alphabet/allocator.sock` (configurable via `SYSTEMA_IPC_SOCKET` env var)
+- **Socket:** Unix domain socket at `/run/systema/allocator.sock` (configurable via `SYSTEMA_IPC_SOCKET` env var)
 - **Framing:** 4-byte big-endian length prefix + protobuf-encoded `Envelope` bytes, using `tokio_util::codec::LengthDelimitedCodec` with 16 MiB max frame
 - **Connection model:** System A listens as server. Workers connect, register, then full-duplex communication via `tokio::io::split` (separate `FramedRead`/`FramedWrite`)
 - **Methods used:** `worker.register` / `worker.ack`, `task.dispatch` (A→W), `task.result` (W→A), `event.publish` (W→A)
@@ -4535,7 +4535,7 @@ Now I have a comprehensive understanding. Let me also check the remaining parts 
 132: 
 133: | 功能 | 状态 | 说明 |
 134: |------|------|------|
-135: | Unix 域套接字服务器监听 `/run/system-alphabet/allocator.sock` | ✅ 完全实现 | |
+135: | Unix 域套接字服务器监听 `/run/systema/allocator.sock` | ✅ 完全实现 | |
 136: | 长度前缀帧编解码（LengthDelimitedCodec） | ✅ 完全实现 | |
 137: | `Envelope` protobuf 封装 | ✅ 完全实现 | |
 138: | Worker 注册握手（`worker.register` → `worker.ack`） | ✅ 完全实现 | |
@@ -4765,7 +4765,7 @@ Let me create a detailed, actionable plan.
 
 1. **状态持久化存储**
    - 在 `crates/common/src/` 新增 `persist.rs` 
-   - `DesiredStateFile` — 以 JSON 格式序列化到 `/run/system-alphabet/state.json`
+   - `DesiredStateFile` — 以 JSON 格式序列化到 `/run/systema/state.json`
    - 每次 `desired` 状态变更时写盘（异步、防频繁写：去抖 500ms）
    - 持久化内容：`desired: HashMap<String, DesiredState>` + `last_state_version`
    - 设计考量：状态文件应在 crash 后仍然可读；使用原子写（写临时文件 → rename）

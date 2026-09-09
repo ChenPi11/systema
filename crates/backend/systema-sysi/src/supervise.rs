@@ -35,8 +35,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::workers::{ProcessKind, ResolvedProcess};
 
-/// Default notify directory (overridable with `SYSTEMA_NOTIFY_DIR`).
-pub const DEFAULT_NOTIFY_DIR: &str = "/run/system-alphabet/notify";
+/// Default notify directory: `<runstatedir>/systema/notify` (`/run` by
+/// default), overridable with `SYSTEMA_NOTIFY_DIR`.  Derived from the
+/// runtime state dir rather than hardcoded.
+pub fn default_notify_dir() -> String {
+    sysa::paths::instance().notify_dir.clone()
+}
 
 /// One request-reply exchange over a fresh allocator connection.
 ///
@@ -486,8 +490,7 @@ pub async fn run(
     }
 
     // --- Bind the notify listener BEFORE spawning anything. ---
-    let notify_dir =
-        std::env::var("SYSTEMA_NOTIFY_DIR").unwrap_or_else(|_| DEFAULT_NOTIFY_DIR.to_string());
+    let notify_dir = default_notify_dir();
     let sock_path = PathBuf::from(&notify_dir).join("init.sock");
     if let Err(e) = std::fs::create_dir_all(&notify_dir) {
         error!("Cannot create notify directory {}: {e}", notify_dir);

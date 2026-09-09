@@ -20,12 +20,12 @@ set -u
 : "${PREFIX:=/data/data/com.termux/files/usr}"
 
 # ---------------------------------------------------------------------------
-# system-alphabet directories
+# systema directories
 # ---------------------------------------------------------------------------
-export SYSTEMA_ETC_DIR="${PREFIX}/etc/system-alphabet"
-export SYSTEMA_RUN_DIR="${PREFIX}/var/run/system-alphabet"
-export SYSTEMA_LOCAL_LIB_DIR="${PREFIX}/local/lib/system-alphabet"
-export SYSTEMA_LIB_DIR="${PREFIX}/lib/system-alphabet"
+export SYSTEMA_ETC_DIR="${PREFIX}/etc/systema"
+export SYSTEMA_RUN_DIR="${PREFIX}/var/run/systema"
+export SYSTEMA_LOCAL_LIB_DIR="${PREFIX}/local/lib/systema"
+export SYSTEMA_LIB_DIR="${PREFIX}/lib/systema"
 
 # ---------------------------------------------------------------------------
 # systemd directories (used to read real systemd unit files when present)
@@ -53,7 +53,7 @@ export SYSTEMD_MACHINE_ID_FILE="${PREFIX}/etc/machine-id"
 # ---------------------------------------------------------------------------
 # IPC socket
 # ---------------------------------------------------------------------------
-export SYSTEMA_IPC_SOCKET="${PREFIX}/var/run/system-alphabet/allocator.sock"
+export SYSTEMA_IPC_SOCKET="${PREFIX}/var/run/systema/allocator.sock"
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -21,7 +21,7 @@
 │  Desired State only — never holds actual runtime state  │
 └──────────────────────┬─────────────────────────────────┘
                        │ IPC (Unix Socket + Protobuf)
-                       │ /run/system-alphabet/allocator.sock
+                       │ /run/systema/allocator.sock
            ┌───────────┼───────────┐
            │           │           │
 ┌──────────▼──┐ ┌──────▼──┐ ┌─────▼──────┐
@@ -80,8 +80,8 @@ stub binary instead of Linux-only code.
 ## Running
 
 ```bash
-# Terminal 1: start System A (requires /run/system-alphabet/ directory)
-sudo mkdir -p /run/system-alphabet
+# Terminal 1: start System A (requires /run/systema/ directory)
+sudo mkdir -p /run/systema
 sudo target/debug/system-a
 
 # Terminal 2: start System S
@@ -107,16 +107,16 @@ message Envelope {
 }
 ```
 
-Frames are length-delimited (4-byte big-endian length prefix) over a Unix socket at `/run/system-alphabet/allocator.sock`.
+Frames are length-delimited (4-byte big-endian length prefix) over a Unix socket at `/run/systema/allocator.sock`.
 
 ## Unit File Search Paths
 
 System Alphabet reads unit files from (in order):
 
-1. `/etc/system-alphabet/`
-2. `/run/system-alphabet/`
-3. `/usr/local/lib/system-alphabet/`
-4. `/usr/lib/system-alphabet/`
+1. `/etc/systema/`
+2. `/run/systema/`
+3. `/usr/local/lib/systema/`
+4. `/usr/lib/systema/`
 5. `/etc/systemd/system/` (compatibility)
 6. `/usr/lib/systemd/system/` (compatibility)
 7. `/lib/systemd/system/` (compatibility)
