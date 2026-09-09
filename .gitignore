@@ -26,3 +26,5 @@ target
 
 # Freebuff
 .freebuff/
+
+.cargo/config.toml
