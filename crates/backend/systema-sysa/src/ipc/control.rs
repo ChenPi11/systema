@@ -1,14 +1,18 @@
 //! Control-port bus — the System Wrapper plane of System A.
 //!
 //! Served on `control.socket` (one-to-many), this is where System Wrapper
-//! bridge flavors (`systema-sysw.systemd`) and control-plane tooling talk to
-//! System A.  The workload plane (worker/finder/staging) stays on
-//! `allocator.sock`; nothing here is exposed to workers.
+//! bridge flavors (`systema-sysw.systemd`), control-plane tooling, and
+//! one-shot admin sessions (`stagingctl`, `unitstatectl`) talk to System A.
+//! The workload plane (worker/finder/staging) stays on `allocator.sock`;
+//! nothing here is exposed to workers.
 //!
-//! Protocol: the first envelope of a session must be `manager.hello`.
-//! Afterwards the client exchanges `manager.*` request/reply envelopes and
-//! receives server-pushed event envelopes (`unit.new`, `unit.removed`,
-//! `unit.changed`, `unit.metrics`, `job.new`, `job.completed`).
+//! Protocol: the first envelope of a session is either `manager.hello` (a
+//! full bridge session with event subscription) or an `admin.*` one-shot
+//! request (`admin.staging`, `admin.unitstate`) served directly without a
+//! hello handshake, then the session closes.  Bridge sessions then exchange
+//! `manager.*` request/reply envelopes and receive server-pushed event
+//! envelopes (`unit.new`, `unit.removed`, `unit.changed`, `unit.metrics`,
+//! `job.new`, `job.completed`).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,12 +29,14 @@ use sysa::event_bus::{Event, EventSubscriber, EventTopic};
 use sysa::ipc::make_envelope;
 use sysa::proto::manager_value::Value;
 use sysa::proto::{
-    AbandonScopeRequest, DaemonReloadResult, Envelope, EnqueueJobRequest, EnqueueJobResult,
-    GetUnitByInvocationRequest, GetUnitByPidRequest, GetUnitByPidResult, ListUnitsRequest,
-    ListUnitsResult, LoadUnitRequest, LoadUnitResult, ManagerHelloRequest, ManagerHelloResult,
-    ManagerValue, RefUnitRequest, RefUnitResult, ResetFailedUnitRequest, SetUnitPropertiesRequest,
-    SimpleManagerResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest, StopUnitsResult,
-    TransientProperty, TransientUnitRequest, UnitInfo, UnitSnapshotRequest, UnitStartResult,
+    AbandonScopeRequest, AdminStagingOp, AdminStagingResult, DaemonReloadResult, Envelope,
+    EnqueueJobRequest, EnqueueJobResult, GetUnitByInvocationRequest, GetUnitByPidRequest,
+    GetUnitByPidResult, ListUnitsRequest, ListUnitsResult, LoadUnitRequest, LoadUnitResult,
+    ManagerHelloRequest, ManagerHelloResult, ManagerValue, RefUnitRequest, RefUnitResult,
+    ResetFailedUnitRequest, SetUnitPropertiesRequest, SimpleManagerResult, StartUnitsRequest,
+    StartUnitsResult, StopUnitsRequest, StopUnitsResult, TransientProperty, TransientUnitRequest,
+    UnitInfo, UnitSnapshotRequest, UnitStartResult, UnitStateEntry, UnitStateEof,
+    UnitStateListRequest,
 };
 
 use crate::scheduler::job_type::JobType;
@@ -127,22 +133,41 @@ async fn handle_control_session(stream: UnixStream, allocator: AllocatorHandle) 
     let mut reader = FramedRead::new(read_half, codec.clone());
     let mut writer = FramedWrite::new(write_half, codec);
 
-    // First envelope must be manager.hello.
-    let hello_env = match reader.next().await {
+    // First envelope is either the `manager.hello` handshake or a one-shot
+    // `admin.*` request from control tooling (stagingctl, unitstatectl).
+    // Admin sessions are served synchronously on the writer — no handshake,
+    // no event subscription — mirroring the historical admin protocol that
+    // used to live on the allocator IPC socket.
+    let first_env = match reader.next().await {
         None => {
-            info!("Control client (PID {client_pid}) disconnected before hello");
+            info!(
+                "Control client (PID {client_pid}) disconnected before the first envelope"
+            );
             return Ok(());
         }
         Some(Err(e)) => anyhow::bail!("control frame error: {e}"),
-        Some(Ok(bytes)) => Envelope::decode(bytes.as_ref()).context("bad hello envelope")?,
+        Some(Ok(bytes)) => Envelope::decode(bytes.as_ref()).context("bad first envelope")?,
     };
-    if hello_env.method != "manager.hello" {
+    let first_method = first_env.method.clone();
+    if matches!(first_method.as_str(), "admin.staging" | "admin.unitstate") {
+        let replies = admin_replies(&allocator, &first_env, client_uid)?;
+        let mut writer = writer;
+        for reply in replies {
+            if writer.send(encode_envelope(&reply)).await.is_err() {
+                break;
+            }
+        }
+        info!(
+            "Admin control session from PID {client_pid} (UID {client_uid}): '{first_method}'"
+        );
+        return Ok(());
+    }
+    if first_env.method != "manager.hello" {
         anyhow::bail!(
-            "expected 'manager.hello' as first envelope, got '{}'",
-            hello_env.method
+            "expected 'manager.hello' or 'admin.*' as first envelope, got '{first_method}'"
         );
     }
-    let hello = ManagerHelloRequest::decode(hello_env.payload.as_slice())
+    let hello = ManagerHelloRequest::decode(first_env.payload.as_slice())
         .context("bad manager.hello payload")?;
     info!(
         "Control session from PID {client_pid} (UID {client_uid}): bridge '{}' version '{}'",
@@ -165,7 +190,7 @@ async fn handle_control_session(stream: UnixStream, allocator: AllocatorHandle) 
             message: format!("welcome, bridge '{}'", hello.flavor),
         },
     )?;
-    reply.request_id = hello_env.request_id;
+    reply.request_id = first_env.request_id;
     let buf = encode_envelope(&reply);
     writer.send(buf).await.ok();
 
@@ -255,6 +280,109 @@ async fn handle_control_session(stream: UnixStream, allocator: AllocatorHandle) 
     writer_task.abort();
     info!("Control session from PID {client_pid} closed");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// One-shot admin sessions (stagingctl, unitstatectl)
+// ---------------------------------------------------------------------------
+
+/// Build the reply envelopes for a one-shot `admin.*` request.
+///
+/// The admin API was moved from the allocator IPC socket to the control
+/// port.  `admin.staging` answers with a single `admin.staging.result`
+/// envelope; `admin.unitstate` streams one `admin.unitstate.entry` envelope
+/// per loaded unit followed by the `admin.unitstate.eof` sentinel.  Both
+/// require the caller to be root or the UID running System A.
+fn admin_replies(
+    allocator: &AllocatorHandle,
+    env: &Envelope,
+    client_uid: u32,
+) -> Result<Vec<Envelope>> {
+    let sys_uid = super::server::system_uid();
+    let authorized = client_uid == 0 || client_uid == sys_uid;
+    match env.method.as_str() {
+        "admin.staging" => {
+            let result = if !authorized {
+                AdminStagingResult {
+                    success: false,
+                    message: sysa::l10n::fmt(
+                        sysa::l10n::t_(
+                            "Permission denied (UID {uid}): only root or UID {sys_uid} may query staging areas.",
+                        ),
+                        &[
+                            ("uid", &client_uid.to_string()),
+                            ("sys_uid", &sys_uid.to_string()),
+                        ],
+                    ),
+                    entries: vec![],
+                }
+            } else {
+                let op = AdminStagingOp::decode(env.payload.as_slice())?;
+                super::server::build_admin_result(&op, allocator)
+            };
+            Ok(vec![make_envelope(
+                next_request_id(),
+                "system-a",
+                "",
+                "admin.staging.result",
+                result,
+            )?])
+        }
+        "admin.unitstate" => {
+            let mut replies = Vec::new();
+            if !authorized {
+                replies.push(make_envelope(
+                    next_request_id(),
+                    "system-a",
+                    "",
+                    "admin.unitstate.eof",
+                    UnitStateEof {
+                        total: 0,
+                        message: sysa::l10n::fmt(
+                            sysa::l10n::t_(
+                                "Permission denied (UID {uid}): only root or UID {sys_uid} may inspect unit state.",
+                            ),
+                            &[
+                                ("uid", &client_uid.to_string()),
+                                ("sys_uid", &sys_uid.to_string()),
+                            ],
+                        ),
+                    },
+                )?);
+                return Ok(replies);
+            }
+            let _req = UnitStateListRequest::decode(env.payload.as_slice())?;
+            let names = crate::unitstate::unit_names(&allocator.read());
+            let mut total = 0u32;
+            for name in names {
+                let json = crate::unitstate::entry_json(&allocator.read(), &name)
+                    .and_then(|doc| serde_json::to_vec(&doc).ok());
+                let Some(json) = json else {
+                    continue;
+                };
+                replies.push(make_envelope(
+                    next_request_id(),
+                    "system-a",
+                    "",
+                    "admin.unitstate.entry",
+                    UnitStateEntry { name, json },
+                )?);
+                total += 1;
+            }
+            replies.push(make_envelope(
+                next_request_id(),
+                "system-a",
+                "",
+                "admin.unitstate.eof",
+                UnitStateEof {
+                    total,
+                    message: String::new(),
+                },
+            )?);
+            Ok(replies)
+        }
+        other => anyhow::bail!("unknown admin method '{other}'"),
+    }
 }
 
 /// Route one control request to its handler and build the reply envelope.
@@ -1308,7 +1436,7 @@ mod tests {
         make_envelope(7, "system-sysi", "system-a", method, payload).unwrap()
     }
 
-    async fn call(method: &str, env: Envelope, allocator: AllocatorHandle) -> Envelope {
+    async fn call(_method: &str, env: Envelope, allocator: AllocatorHandle) -> Envelope {
         dispatch(&allocator, env).await.unwrap().unwrap()
     }
 
@@ -1373,7 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_to_many_broadcast_delivers_event_to_all_sessions() {
-        use sysa::event_bus::{Event, EventBus, EventTopic};
+        use sysa::event_bus::{Event, EventTopic};
 
         let alloc = test_allocator();
         let mut client_a = spawn_session_pair(alloc.clone()).await;
@@ -1529,5 +1657,151 @@ mod tests {
         let result = StopUnitsResult::decode(reply.payload.as_slice()).unwrap();
         assert!(!result.success);
         assert!(!result.message.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin one-shot sessions (moved from the allocator IPC socket)
+    // -----------------------------------------------------------------------
+
+    /// Drive `admin_replies` against a fake allocator, returning the envelope
+    /// sequence.  The helper avoids the uid check by accepting `client_uid`
+    /// directly so tests run deterministically as any UID.
+    fn run_admin_replies(
+        allocator: AllocatorHandle,
+        method: &str,
+        payload: impl prost::Message,
+        client_uid: u32,
+    ) -> Vec<Envelope> {
+        let env = make_envelope(42, "tool", "system-a", method, payload).unwrap();
+        admin_replies(&allocator, &env, client_uid).unwrap()
+    }
+
+    #[test]
+    fn admin_staging_list_returns_empty() {
+        let alloc = test_allocator();
+        let replies = run_admin_replies(alloc, "admin.staging", AdminStagingOp {
+            op: "list".to_string(),
+            uid: 0,
+            name: String::new(),
+        }, 0);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].method, "admin.staging.result");
+        let result = AdminStagingResult::decode(replies[0].payload.as_slice()).unwrap();
+        assert!(result.success, "empty staging 'list' must succeed");
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn admin_staging_rejects_unprivileged_uid() {
+        let alloc = test_allocator();
+        let replies = run_admin_replies(alloc, "admin.staging", AdminStagingOp {
+            op: "list".to_string(),
+            uid: 0,
+            name: String::new(),
+        }, 0xdead00d);
+        assert_eq!(replies.len(), 1);
+        let result = AdminStagingResult::decode(replies[0].payload.as_slice()).unwrap();
+        assert!(!result.success);
+        assert!(!result.message.is_empty());
+    }
+
+    #[test]
+    fn admin_unitstate_streams_every_unit_sorted() {
+        let alloc = test_allocator();
+        let replies = run_admin_replies(alloc, "admin.unitstate", UnitStateListRequest {}, 0);
+        // Should be N entries + 1 EOF.
+        let (entries, eof) = split_unitstate_replies(&replies);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["-.slice", "default.target", "foo.service"]);
+        for entry in &entries {
+            let doc: serde_json::Value = serde_json::from_slice(&entry.json).unwrap();
+            assert!(doc["kind"].is_string());
+            assert!(
+                doc["unit"]["description"].is_string() || doc["unit"]["after"].is_array()
+            );
+        }
+        assert_eq!(eof.total, 3);
+        assert!(eof.message.is_empty());
+    }
+
+    #[test]
+    fn admin_unitstate_rejects_unprivileged_uid() {
+        let alloc = test_allocator();
+        let replies = run_admin_replies(alloc, "admin.unitstate", UnitStateListRequest {}, 0xdead00d);
+        let (entries, eof) = split_unitstate_replies(&replies);
+        assert!(entries.is_empty());
+        assert_eq!(eof.total, 0);
+        assert!(!eof.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_staging_via_control_session_roundtrip() {
+        let alloc = test_allocator();
+        let mut client = spawn_session_pair(alloc.clone()).await;
+        // Send admin.staging as the first envelope — no manager.hello.
+        let op = AdminStagingOp {
+            op: "list".to_string(),
+            uid: 0,
+            name: String::new(),
+        };
+        sysa::ipc::send_envelope(&mut client, &req_env("admin.staging", op))
+            .await
+            .unwrap();
+        let reply = sysa::ipc::recv_envelope(&mut client)
+            .await
+            .unwrap()
+            .expect("expected admin.staging result envelope");
+        assert_eq!(reply.method, "admin.staging.result");
+        // Connection must be closed after the one-shot reply.
+        let eof = sysa::ipc::recv_envelope(&mut client).await.unwrap();
+        assert!(eof.is_none(), "session must close after admin reply");
+    }
+
+    #[tokio::test]
+    async fn admin_unitstate_via_control_session_roundtrip() {
+        let alloc = test_allocator();
+        let mut client = spawn_session_pair(alloc.clone()).await;
+        sysa::ipc::send_envelope(&mut client, &req_env("admin.unitstate", UnitStateListRequest {}))
+            .await
+            .unwrap();
+        // Read entries until EOF; the entry count tracks the EOF tally.
+        // (When the test runs as a non-root UID the server returns a
+        // permission-denied EOF with zero entries — the framing is identical.)
+        let mut total = 0u32;
+        loop {
+            let env = sysa::ipc::recv_envelope(&mut client)
+                .await
+                .unwrap()
+                .expect("expected admin.unitstate entry or EOF");
+            if env.method == "admin.unitstate.eof" {
+                let eof = UnitStateEof::decode(env.payload.as_slice()).unwrap();
+                assert_eq!(eof.total, total, "EOF total must match streamed entries");
+                break;
+            }
+            assert_eq!(env.method, "admin.unitstate.entry");
+            total += 1;
+        }
+        // Connection must be closed after EOF.
+        let eof = sysa::ipc::recv_envelope(&mut client).await.unwrap();
+        assert!(eof.is_none(), "session must close after unitstate EOF");
+    }
+
+    // -- helpers for the unitstate tests ---------------------------------
+
+    fn split_unitstate_replies(replies: &[Envelope]) -> (Vec<UnitStateEntry>, UnitStateEof) {
+        let mut entries = Vec::new();
+        let mut eof = None;
+        for env in replies {
+            match env.method.as_str() {
+                "admin.unitstate.entry" => {
+                    entries.push(UnitStateEntry::decode(env.payload.as_slice()).unwrap());
+                }
+                "admin.unitstate.eof" => {
+                    eof = Some(UnitStateEof::decode(env.payload.as_slice()).unwrap());
+                }
+                _ => panic!("unexpected admin reply method '{}'", env.method),
+            }
+        }
+        (entries, eof.expect("EOF sentinel"))
     }
 }

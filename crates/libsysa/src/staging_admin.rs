@@ -16,7 +16,7 @@ pub struct StagingAdmin {
 impl StagingAdmin {
     pub fn new() -> Self {
         StagingAdmin {
-            socket_path: crate::paths::instance().ipc_socket_path.to_string(),
+            socket_path: crate::paths::instance().control_socket_path.to_string(),
         }
     }
 

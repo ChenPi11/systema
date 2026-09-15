@@ -22,8 +22,7 @@ use sysa::proto::{
     AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope, EventSubscribe,
     EventUnsubscribe, MethodResult, PathFired, RegisterAck, RegisterUnits, StagingAreaEntry,
     StagingQuery, StagingQueryResult, TimerFired, UnitDefineResult, UnitRegistrationAck,
-    UnitStateEntry, UnitStateEof, UnitStateListRequest, UnitStateUpdate, UnitStateUpdateAck,
-    UnitSyncReport, WorkerRegistration,
+    UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
 };
 
 use crate::events::load_unit_sync;
@@ -253,7 +252,7 @@ pub(crate) fn peer_cred(stream: &UnixStream) -> Result<(u32, u32)> {
 }
 
 /// The system UID (the UID running the allocator).
-fn system_uid() -> u32 {
+pub(crate) fn system_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
@@ -274,11 +273,9 @@ async fn handle_worker(
         "finder.register_units" => handle_finder_register(framed, env, allocator, client_uid).await,
         "finder.commit_units" => handle_finder_commit(framed, env, allocator, client_uid).await,
         "staging.query" => handle_finder_query(framed, env, allocator, client_uid).await,
-        "admin.staging" => handle_admin_staging(framed, env, allocator, client_uid).await,
-        "admin.unitstate" => handle_admin_unitstate(framed, env, allocator, client_uid).await,
         other => {
             anyhow::bail!(sysa::l10n::fmt(
-                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', or 'admin.unitstate', got '{method}'"),
+                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', or 'staging.query', got '{method}'"),
                 &[("method", other)],
             ))
         }
@@ -1296,126 +1293,12 @@ async fn try_finder_query(
     }
 }
 
-async fn handle_admin_staging(
-    mut framed: sysa::ipc::EnvelopeFramed,
-    env: Envelope,
-    allocator: AllocatorHandle,
-    client_uid: u32,
-) -> Result<()> {
-    let sys_uid = system_uid();
-    if client_uid != 0 && client_uid != sys_uid {
-        let result = AdminStagingResult {
-            success: false,
-            message: sysa::l10n::fmt(
-                sysa::l10n::t_("Permission denied (UID {uid}): only root or UID {sys_uid} may query staging areas."),
-                &[("uid", &client_uid.to_string()), ("sys_uid", &sys_uid.to_string())],
-            ),
-            entries: vec![],
-        };
-        let ack_env = make_envelope(
-            next_request_id(),
-            "system-a",
-            "",
-            "admin.staging.result",
-            result,
-        )?;
-        send_envelope(&mut framed, &ack_env).await?;
-        return Ok(());
-    }
-
-    let op = AdminStagingOp::decode(env.payload.as_slice())?;
-
-    // Collect result data synchronously, drop the lock, then send async.
-    let result = build_admin_result(&op, &allocator);
-    let ack_env = make_envelope(
-        next_request_id(),
-        "system-a",
-        "",
-        "admin.staging.result",
-        result,
-    )?;
-    send_envelope(&mut framed, &ack_env).await?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Unit-state administration (root / systema-uid only)
-// ---------------------------------------------------------------------------
-
-/// `admin.unitstate` — stream the System Allocator's cached unit state.
+/// Build the `admin.staging` reply over the allocator's staging-area state.
 ///
-/// Only reads the allocator's in-memory caches; no worker is contacted.
-/// The snapshot is streamed as one `admin.unitstate.entry` envelope per
-/// unit followed by a single `admin.unitstate.eof` sentinel.  Access is
-/// restricted to root or the UID running System A.
-async fn handle_admin_unitstate(
-    mut framed: sysa::ipc::EnvelopeFramed,
-    env: Envelope,
-    allocator: AllocatorHandle,
-    client_uid: u32,
-) -> Result<()> {
-    let sys_uid = system_uid();
-    if client_uid != 0 && client_uid != sys_uid {
-        let eof = UnitStateEof {
-            total: 0,
-            message: sysa::l10n::fmt(
-                sysa::l10n::t_("Permission denied (UID {uid}): only root or UID {sys_uid} may inspect unit state."),
-                &[("uid", &client_uid.to_string()), ("sys_uid", &sys_uid.to_string())],
-            ),
-        };
-        let eof_env = make_envelope(
-            next_request_id(),
-            "system-a",
-            "",
-            "admin.unitstate.eof",
-            eof,
-        )?;
-        send_envelope(&mut framed, &eof_env).await?;
-        return Ok(());
-    }
-
-    let _req = UnitStateListRequest::decode(env.payload.as_slice())?;
-
-    let names = crate::unitstate::unit_names(&allocator.read());
-    let mut total = 0u32;
-    for name in names {
-        // Collect the JSON synchronously (short read-lock) and send async.
-        let json = crate::unitstate::entry_json(&allocator.read(), &name)
-            .and_then(|doc| serde_json::to_vec(&doc).ok());
-        let Some(json) = json else {
-            continue;
-        };
-        let entry = UnitStateEntry { name, json };
-        let entry_env = make_envelope(
-            next_request_id(),
-            "system-a",
-            "",
-            "admin.unitstate.entry",
-            entry,
-        )?;
-        send_envelope(&mut framed, &entry_env).await?;
-        total += 1;
-    }
-
-    let eof = UnitStateEof {
-        total,
-        message: String::new(),
-    };
-    let eof_env = make_envelope(
-        next_request_id(),
-        "system-a",
-        "",
-        "admin.unitstate.eof",
-        eof,
-    )?;
-    send_envelope(&mut framed, &eof_env).await?;
-    Ok(())
-}
-
-/// `manager.daemon_reload` etc. now live in [`crate::ipc::control`] on the
-/// control socket; the allocator socket serves only workload traffic.
-
-fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> AdminStagingResult {
+/// The `admin.*` API was moved to the control port ([`crate::ipc::control`]);
+/// only this pure builder remains in the allocator module, shared with the
+/// control session handler.
+pub(crate) fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> AdminStagingResult {
     let state = allocator.read();
     match op.op.as_str() {
         "list" => {
@@ -1898,31 +1781,9 @@ async fn send_user_session_update(allocator: AllocatorHandle, uid: u32, count: u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UnixStream;
-
-    use futures::StreamExt;
 
     use crate::state::AllocatorState;
-    use crate::unit::types::{UnitFile, UnitSection};
-
-    fn test_allocator() -> AllocatorHandle {
-        let state = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
-        {
-            let mut state = state.write();
-            let mut foo = UnitFile::new("foo.service");
-            foo.unit = UnitSection::default();
-            state.units.insert("foo.service".to_string(), foo);
-            state.units.insert(
-                "default.target".to_string(),
-                UnitFile::new("default.target"),
-            );
-        }
-        state
-    }
-
-    fn req_env(method: &str, payload: impl ProstMessage) -> Envelope {
-        make_envelope(7, "system-sysi", "system-a", method, payload).unwrap()
-    }
+    use crate::unit::types::UnitFile;
 
     #[test]
     fn resolve_socket_service_prefers_directive() {
@@ -2048,66 +1909,5 @@ mod tests {
             },
         );
         assert!(!unit_has_failed_start_job(&state, "other.service"));
-    }
-
-    /// Stream a single `name` → YAML-able unit-state document from a fake
-    /// `admin.unitstate` request driven over a socketpair.
-    async fn stream_unitstate(
-        allocator: AllocatorHandle,
-        client_uid: u32,
-    ) -> (Vec<(String, Vec<u8>)>, UnitStateEof) {
-        let (client, server) = UnixStream::pair().unwrap();
-        let server = frame_stream(server);
-        let mut client = frame_stream(client);
-        let req = req_env("admin.unitstate", UnitStateListRequest {});
-        send_envelope(&mut client, &req).await.unwrap();
-
-        let handler_fut = Box::pin(handle_admin_unitstate(server, req, allocator, client_uid));
-        tokio::select! {
-            r = handler_fut => r.unwrap(),
-            e = client.next() => panic!("handler closed without EOF: {e:?}"),
-        };
-
-        let mut entries = Vec::new();
-        let mut eof = None;
-        while let Some(env) = recv_envelope(&mut client).await.unwrap() {
-            match env.method.as_str() {
-                "admin.unitstate.entry" => {
-                    let entry = UnitStateEntry::decode(env.payload.as_slice()).unwrap();
-                    entries.push((entry.name, entry.json));
-                }
-                "admin.unitstate.eof" => {
-                    eof = Some(UnitStateEof::decode(env.payload.as_slice()).unwrap());
-                    break;
-                }
-                other => panic!("unexpected method {other}"),
-            }
-        }
-        (entries, eof.expect("EOF sentinel"))
-    }
-
-    #[tokio::test]
-    async fn admin_unitstate_streams_every_unit_sorted() {
-        let allocator = test_allocator();
-        let (entries, eof) = stream_unitstate(allocator, 0).await;
-        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
-        assert_eq!(names, vec!["-.slice", "default.target", "foo.service"]);
-        for (_, json) in &entries {
-            let doc: serde_json::Value = serde_json::from_slice(json).unwrap();
-            assert!(doc["kind"].is_string());
-            assert!(doc["unit"]["description"].is_string() || doc["unit"]["after"].is_array());
-        }
-        assert_eq!(eof.total, 3);
-        assert!(eof.message.is_empty());
-    }
-
-    #[tokio::test]
-    async fn admin_unitstate_rejects_unprivileged_uid() {
-        let allocator = test_allocator();
-        // 0xdead is neither root nor system_uid().
-        let (entries, eof) = stream_unitstate(allocator.clone(), 0xdead00d).await;
-        assert!(entries.is_empty());
-        assert_eq!(eof.total, 0);
-        assert!(!eof.message.is_empty());
     }
 }

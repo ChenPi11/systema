@@ -16,9 +16,10 @@ pub struct UnitStateResult {
 /// Client for `admin.unitstate`: streams a JSON snapshot of every unit's
 /// cached state straight from the System Allocator (no worker is involved).
 ///
-/// Requires the caller to be UID 0 (root) or the UID under which System
-/// Allocator is running; otherwise the server responds with a
-/// permission-denied EOF.
+/// The admin methods are served on the control port (`control.socket`), not
+/// the allocator IPC socket.  Requires the caller to be UID 0 (root) or the
+/// UID under which System Allocator is running; otherwise the server responds
+/// with a permission-denied EOF.
 pub struct UnitStateAdmin {
     socket_path: String,
 }
@@ -26,7 +27,7 @@ pub struct UnitStateAdmin {
 impl UnitStateAdmin {
     pub fn new() -> Self {
         UnitStateAdmin {
-            socket_path: crate::paths::instance().ipc_socket_path.to_string(),
+            socket_path: crate::paths::instance().control_socket_path.to_string(),
         }
     }
 

@@ -5,11 +5,14 @@ mod builtin {
 use std::sync::OnceLock;
 
 pub struct Paths {
+    /// Allocator workload-plane socket: workers register here and the
+    /// System Finder (sysd/sysm/sysr/sysf) registers/commits staging sets.
     pub ipc_socket_path: &'static str,
     pub systema_fdpass_sock: &'static str,
     /// Control-port bus socket (one-to-many).  System Wrapper bridge flavors
     /// and control-plane tooling connect here; System A serves `manager.*`
-    /// RPCs and pushes unit/job events on this socket.
+    /// RPCs, pushes unit/job events on this socket, and answers one-shot
+    /// `admin.*` requests (`admin.staging`, `admin.unitstate`).
     pub control_socket_path: &'static str,
     pub systema_shell_path: &'static str,
     pub systema_socket_handler_path: &'static str,
