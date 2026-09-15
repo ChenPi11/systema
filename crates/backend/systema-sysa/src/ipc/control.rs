@@ -318,7 +318,11 @@ fn admin_replies(
                 }
             } else {
                 let op = AdminStagingOp::decode(env.payload.as_slice())?;
-                super::server::build_admin_result(&op, allocator)
+                if op.op == "commit" {
+                    admin_staging_commit(&op, allocator)
+                } else {
+                    super::server::build_admin_result(&op, allocator)
+                }
             };
             Ok(vec![make_envelope(
                 next_request_id(),
@@ -382,6 +386,84 @@ fn admin_replies(
             Ok(replies)
         }
         other => anyhow::bail!("unknown admin method '{other}'"),
+    }
+}
+
+/// Merge staging areas into the active unit set (`admin.staging` op=`commit`).
+///
+/// Mirrors `finder.commit_units`: the merge is idempotent, consumes the
+/// staging area(s), and triggers a `ReloadRequest::FromCommit` pass so any
+/// newly created units gain their default dependencies (e.g. sysinit.target
+/// ordering).  With an empty `name`, every area owned by `op.uid` is
+/// committed.
+fn admin_staging_commit(op: &AdminStagingOp, allocator: &AllocatorHandle) -> AdminStagingResult {
+    if op.name.is_empty() {
+        let mut state = allocator.write();
+        let areas: Vec<(u32, String)> = state
+            .get_staging_areas_by_uid(op.uid)
+            .into_iter()
+            .map(|a| (a.uid, a.name.clone()))
+            .collect();
+        if areas.is_empty() {
+            return AdminStagingResult {
+                success: false,
+                message: format!("no staging area for UID {}", op.uid),
+                entries: vec![],
+            };
+        }
+        let mut committed = 0u32;
+        for (uid, name) in &areas {
+            match state.commit_staging(*uid, name) {
+                Ok(count) => committed += count,
+                Err(msg) => {
+                    drop(state);
+                    return AdminStagingResult {
+                        success: false,
+                        message: format!("commit of '{name}' failed: {msg}"),
+                        entries: vec![],
+                    };
+                }
+            }
+        }
+        drop(state);
+        notify_commit(allocator);
+        AdminStagingResult {
+            success: true,
+            message: format!("committed {committed} unit(s) for UID {}", op.uid),
+            entries: vec![],
+        }
+    } else {
+        let count = {
+            let mut state = allocator.write();
+            match state.commit_staging(op.uid, &op.name) {
+                Ok(count) => count,
+                Err(msg) => {
+                    drop(state);
+                    return AdminStagingResult {
+                        success: false,
+                        message: format!("commit of '{}' failed: {msg}", op.name),
+                        entries: vec![],
+                    };
+                }
+            }
+        };
+        notify_commit(allocator);
+        AdminStagingResult {
+            success: true,
+            message: format!(
+                "committed {count} unit(s) from staging area '{}' (UID {})",
+                op.name, op.uid
+            ),
+            entries: vec![],
+        }
+    }
+}
+
+/// Enqueue a `FromCommit` reload pass after an admin staging commit, the
+/// same default-dependency fix-up the finder commit path applies.
+fn notify_commit(allocator: &AllocatorHandle) {
+    if let Some(tx) = allocator.read().reload_tx.as_ref() {
+        let _ = tx.try_send(crate::reload_task::ReloadRequest::FromCommit);
     }
 }
 
@@ -1392,15 +1474,16 @@ fn prop_u32s(props: &[TransientProperty], key: &str) -> Option<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
     use sysa::proto::{
         ListUnitsRequest, ListUnitsResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest,
         StopUnitsResult,
     };
 
-    use crate::state::WorkerEntry;
+    use crate::state::{StagingArea, WorkerEntry};
     use crate::unit::types::{UnitSection};
+    use systema_sysf::ir::{UnitIR, UnitType};
 
     fn test_allocator() -> AllocatorHandle {
         let state = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
@@ -1786,6 +1869,105 @@ mod tests {
         assert!(eof.is_none(), "session must close after unitstate EOF");
     }
 
+    #[test]
+    fn admin_staging_commit_merges_and_consumes_area() {
+        let alloc = test_allocator();
+        {
+            let mut state = alloc.write();
+            state.staging_areas.insert(
+                (0, "system-f1".to_string()),
+                StagingArea {
+                    name: "system-f1".to_string(),
+                    uid: 0,
+                    units: HashMap::from([(
+                        "graphical.target".to_string(),
+                        staging_target_ir("graphical.target"),
+                    )]),
+                },
+            );
+        }
+        let replies = run_admin_replies(
+            alloc.clone(),
+            "admin.staging",
+            AdminStagingOp {
+                op: "commit".to_string(),
+                uid: 0,
+                name: String::new(),
+            },
+            0,
+        );
+        assert_eq!(replies.len(), 1);
+        let result = AdminStagingResult::decode(replies[0].payload.as_slice()).unwrap();
+        assert!(result.success, "commit must succeed: {}", result.message);
+        let state = alloc.read();
+        assert!(
+            !state.staging_areas.contains_key(&(0, "system-f1".to_string())),
+            "staging area must be consumed after commit"
+        );
+    }
+
+    #[test]
+    fn admin_staging_commit_by_name_and_missing_area() {
+        let alloc = test_allocator();
+        {
+            let mut state = alloc.write();
+            state.staging_areas.insert(
+                (1000, "sysv-nginx".to_string()),
+                StagingArea {
+                    name: "sysv-nginx".to_string(),
+                    uid: 1000,
+                    units: HashMap::from([(
+                        "nginx.service".to_string(),
+                        staging_target_ir("nginx.service"),
+                    )]),
+                },
+            );
+        }
+        // Committing a named area succeeds and consumes it.
+        let replies = run_admin_replies(
+            alloc.clone(),
+            "admin.staging",
+            AdminStagingOp {
+                op: "commit".to_string(),
+                uid: 1000,
+                name: "sysv-nginx".to_string(),
+            },
+            0,
+        );
+        let result = AdminStagingResult::decode(replies[0].payload.as_slice()).unwrap();
+        assert!(result.success, "named commit must succeed: {}", result.message);
+        // A second commit of the same (already consumed) area is idempotent.
+        let replies = run_admin_replies(
+            alloc.clone(),
+            "admin.staging",
+            AdminStagingOp {
+                op: "commit".to_string(),
+                uid: 1000,
+                name: "sysv-nginx".to_string(),
+            },
+            0,
+        );
+        let result = AdminStagingResult::decode(replies[0].payload.as_slice()).unwrap();
+        assert!(
+            result.success,
+            "idempotent re-commit must succeed: {}",
+            result.message
+        );
+        // Committing for a UID with no areas reports failure.
+        let replies = run_admin_replies(
+            alloc.clone(),
+            "admin.staging",
+            AdminStagingOp {
+                op: "commit".to_string(),
+                uid: 4242,
+                name: String::new(),
+            },
+            0,
+        );
+        let result = AdminStagingResult::decode(replies[0].payload.as_slice()).unwrap();
+        assert!(!result.success);
+    }
+
     // -- helpers for the unitstate tests ---------------------------------
 
     fn split_unitstate_replies(replies: &[Envelope]) -> (Vec<UnitStateEntry>, UnitStateEof) {
@@ -1803,5 +1985,29 @@ mod tests {
             }
         }
         (entries, eof.expect("EOF sentinel"))
+    }
+
+    /// Minimal `UnitIR` for a target unit, as a systemd finder would emit it.
+    fn staging_target_ir(id: &str) -> UnitIR {
+        UnitIR {
+            id: id.to_string(),
+            unit_type: Some(UnitType::Target),
+            description: None,
+            source_format: Some("systemd".to_string()),
+            source_path: None,
+            aliases: vec![],
+            slice: None,
+            dependencies: None,
+            service: None,
+            mount: None,
+            automount: None,
+            timer: None,
+            socket: None,
+            resource_control: None,
+            conditions: None,
+            asserts: None,
+            wanted_by: None,
+            required_by: None,
+        }
     }
 }

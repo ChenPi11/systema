@@ -53,6 +53,14 @@ impl StagingAdmin {
         self.send_op("all", 0, "").await
     }
 
+    /// Commit a staging area into the active unit set.
+    ///
+    /// With a non-empty `name` only the `(uid, name)` area is merged and
+    /// consumed; with an empty `name` every area owned by `uid` is committed.
+    pub async fn commit(&self, uid: u32, name: &str) -> Result<AdminStagingResult> {
+        self.send_op("commit", uid, name).await
+    }
+
     async fn send_op(&self, op: &str, uid: u32, name: &str) -> Result<AdminStagingResult> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await

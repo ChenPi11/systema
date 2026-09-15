@@ -230,10 +230,13 @@ message AdminStagingOp {
     // "by_name"      → return full data for every area with the given name
     // "by_id"        → return full data for the (uid, name) area
     // "all"          → return full data for every area
+    // "commit"       → merge the (uid, name) area into the active set and
+    //                  consume it; with an empty name, commit every area
+    //                  owned by the given uid
     string op = 1;
-    // UID filter for "by_uid" / "by_id" operations.
+    // UID filter for "by_uid" / "by_id" / "commit" operations.
     uint32 uid = 2;
-    // Name filter for "by_name" / "by_id" operations.
+    // Name filter for "by_name" / "by_id" / "commit" operations.
     string name = 3;
 }
 

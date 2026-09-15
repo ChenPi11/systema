@@ -64,6 +64,17 @@ enum Commands {
         #[arg(help = "Regex pattern(s) to match staging area name")]
         regex: Vec<String>,
     },
+
+    #[command(about = "Commit staging areas into the active unit set")]
+    Commit {
+        #[arg(
+            short,
+            long,
+            default_value_t = 0,
+            help = "Commit every staging area owned by this UID (default: 0)"
+        )]
+        uid: u32,
+    },
 }
 
 fn init_tracing(level: &str) {
@@ -247,6 +258,31 @@ async fn run_list(json: bool, uids: Vec<u32>, regex_strs: Vec<String>) -> Result
     Ok(())
 }
 
+async fn run_commit(uid: u32) -> Result<()> {
+    let admin = StagingAdmin::new();
+    let result = admin.commit(uid, "").await?;
+    if result.success {
+        pager_println!(
+            "{}",
+            l10n::fmt(
+                l10n::t_("Staging areas for UID {uid}: {message}"),
+                &[("uid", &uid.to_string()), ("message", &result.message)]
+            )
+            .green()
+        );
+    } else {
+        pager_eprintln!(
+            "{}",
+            l10n::fmt(
+                l10n::t_("Commit failed: {message}"),
+                &[("message", &result.message)]
+            )
+            .red()
+        );
+    }
+    Ok(())
+}
+
 fn build_localized_cli() -> clap::Command {
     
     Args::command()
@@ -269,6 +305,14 @@ fn build_localized_cli() -> clap::Command {
                 })
                 .mut_arg("regex", |a| {
                     a.help(l10n::t_("Regex pattern(s) to match staging area name."))
+                })
+        })
+        .mut_subcommand("commit", |cmd| {
+            cmd.about(l10n::t_("Commit staging areas into the active unit set."))
+                .mut_arg("uid", |a| {
+                    a.help(l10n::t_(
+                        "Commit every staging area owned by this UID (default: 0).",
+                    ))
                 })
         })
 }
@@ -321,6 +365,10 @@ async fn main() -> Result<()> {
                 .cloned()
                 .collect();
             run_list(json, uids, regex_strs).await
+        }
+        Some(("commit", sub_m)) => {
+            let uid = sub_m.get_one::<u32>("uid").copied().unwrap_or(0);
+            run_commit(uid).await
         }
         None => run_list(json, vec![], vec![]).await,
         _ => {
