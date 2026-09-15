@@ -1796,6 +1796,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "regex",
  "serde_json",
  "sysa",
  "sysa-pager",
