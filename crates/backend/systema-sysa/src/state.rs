@@ -29,7 +29,7 @@ pub const ROOT_SLICE_NAME: &str = "-.slice";
 
 /// Snapshot of a unit's runtime state, kept up-to-date via `method.result`
 /// responses and `unit.state_update` push events.  Read synchronously by
-/// D-Bus property getters.
+/// control-port snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct CachedUnitState {
     pub active_state: String,
@@ -136,7 +136,7 @@ pub enum JobMode {
 
 impl JobMode {
     /// Parse a `--job-mode=` value. Unknown strings return `None` so the
-    /// D-Bus layer can reject them with `InvalidArgs`, like systemd's
+    /// control-port layer can reject them with `InvalidArgs`, like systemd's
     /// `job_mode_from_string()`.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -176,7 +176,7 @@ pub struct Job {
     pub timeout_abort: Option<AbortHandle>,
 }
 
-/// Notification sent over an internal channel so the D-Bus layer can emit
+/// Notification sent over an internal channel so the control port can emit
 /// the `JobRemoved` signal when a job finishes.
 #[derive(Debug)]
 pub struct JobCompletion {
@@ -185,7 +185,7 @@ pub struct JobCompletion {
     pub result: JobResultKind,
 }
 
-/// Notification sent when a new job is created, so the D-Bus layer can emit
+/// Notification sent when a new job is created, so the control port can emit
 /// the `JobNew` signal.
 #[derive(Debug, Clone)]
 pub struct JobNewInfo {
@@ -310,18 +310,14 @@ pub struct AllocatorState {
     /// Maps task_id (IPC level) → JobKind so we can correctly update state
     /// when a method.result arrives.
     pub task_kinds: HashMap<u64, JobKind>,
-    /// Channel to notify the D-Bus layer when a job completes so it can emit
-    /// the `JobRemoved` signal.  Set by the D-Bus server at startup.
+    /// Channel to push job-completion events to the in-process event bus so
+    /// control-port sessions relay `JobRemoved` signals to System Wrapper.
     pub job_completion_tx: Option<tokio::sync::mpsc::UnboundedSender<JobCompletion>>,
-    /// Channel to notify the D-Bus layer when a new unit is loaded so it can
-    /// register a per-unit D-Bus object.  Set by the D-Bus server at startup.
+    /// Channel to push unit-loaded events to the in-process event bus so
+    /// control-port sessions relay `unit.new` snapshots to System Wrapper.
     pub unit_loaded_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Channel to notify the D-Bus layer when a unit is removed from memory
-    /// so it can emit the `UnitRemoved` signal.  Set by the D-Bus server at
-    /// startup; no producer exists yet (units are never unloaded today).
-    pub unit_removed_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Channel to notify the D-Bus layer when a new job is created so it can
-    /// emit the `JobNew` signal.
+    /// Channel to push job-creation events to the in-process event bus so
+    /// control-port sessions relay `JobNew` signals to System Wrapper.
     pub job_new_tx: Option<tokio::sync::mpsc::UnboundedSender<JobNewInfo>>,
     /// Completion senders for serial task execution — keyed by task_id.
     /// When a task completes, `handle_task_result` sends `()` through the
@@ -355,7 +351,7 @@ pub struct AllocatorState {
     /// A unit with zero references is a candidate for unloading.
     pub ref_counts: HashMap<String, HashSet<String>>,
 
-    /// External D-Bus client reference counts (RefUnit/UnrefUnit).
+    /// External control-port client reference counts (RefUnit/UnrefUnit).
     /// Maps unit_name → ref_count. Prevents unit from being unloaded while >0.
     pub n_refs: HashMap<String, u64>,
 
@@ -366,7 +362,7 @@ pub struct AllocatorState {
 
     /// Runtime state cache populated from `method.result` IPC responses
     /// and `unit.state_update` push events.
-    /// D-Bus property getters read from this cache synchronously.
+    /// Control-port snapshots read from this cache synchronously.
     pub unit_states: HashMap<String, CachedUnitState>,
 
     /// Unit ownership table: unit_name → worker_id.
@@ -381,8 +377,9 @@ pub struct AllocatorState {
 
     /// Cgroup runtime metrics cache, populated from `cgroup.metrics` pushes
     /// from System R.  Values are opaque name-keyed numbers; System A never
-    /// interprets them, it only relays them to the systemd-compatible D-Bus
-    /// properties.  Not subject to the unit ownership table (informational).
+    /// interprets them, it only relays them to the systemd-compatible
+    /// control-port properties.  Not subject to the unit ownership table
+    /// (informational).
     pub cgroup_metrics: HashMap<String, sysa::proto::UnitCgroupMetrics>,
 
     /// Active login sessions per UID, keyed by the session scope's unit
@@ -410,7 +407,6 @@ impl AllocatorState {
             task_kinds: HashMap::new(),
             job_completion_tx: None,
             unit_loaded_tx: None,
-            unit_removed_tx: None,
             job_new_tx: None,
             serial_completion_txs: HashMap::new(),
             unit_define_txs: HashMap::new(),
@@ -435,10 +431,10 @@ impl AllocatorState {
     /// systemd keeps `-.slice` as a perpetual special unit that is always
     /// loaded and always `active` (`unit_load`/`unit_start` never touch it).
     /// The allocator mirrors that by creating it up front and marking it
-    /// active so that D-Bus lookups (`GetUnit("-.slice")`), per-unit D-Bus
-    /// objects, and the System R active-unit replay all see it — without it,
-    /// `systemctl status` fails on the missing `_2d_2eslice` object and the
-    /// overview's cgroup tree is empty.
+    /// active so that control-port lookups, per-unit objects, and the
+    /// System R active-unit replay all see it — without it, `systemctl
+    /// status` fails on the missing `_2d_2eslice` object and the overview's
+    /// cgroup tree is empty.
     fn ensure_root_slice(&mut self) {
         if self.units.contains_key(ROOT_SLICE_NAME) {
             return;
@@ -563,9 +559,9 @@ impl AllocatorState {
         for (unit_name, unit) in new_units {
             self.units.insert(unit_name.clone(), unit);
             created += 1;
-            // Notify the D-Bus layer so it can register a per-unit object
-            // (same channel the on-disk load paths use); the merge funnel
-            // covers finder commits (System F/D/R) and unit.define.
+            // Notify the event bus so a unit.new is pushed to control-plane
+            // consumers (bridge flavors); the merge funnel covers finder
+            // commits (System F/D/R) and unit.define.
             if let Some(ref tx) = self.unit_loaded_tx {
                 let _ = tx.send(unit_name);
             }
@@ -1200,7 +1196,7 @@ pub fn next_request_id() -> u64 {
 
 /// Generate a new unique invocation ID — a UUID v4 rendered as 32 lowercase
 /// hex digits, matching the `INVOCATION_ID` format systemd exposes (both in
-/// the environment of spawned processes and on D-Bus).
+/// the environment of spawned processes and in the control-port protocol).
 pub fn generate_invocation_id() -> String {
     Uuid::new_v4().simple().to_string()
 }
@@ -1213,7 +1209,7 @@ pub fn generate_invocation_id() -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use systema_sysf::ir::{MountConfig, UnitType};
+    use systema_sysf::ir::{DependencySet, MountConfig, UnitType};
 
     fn mount_ir(id: &str, where_: &str) -> UnitIR {
         UnitIR {
@@ -1272,11 +1268,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_committed_units_notify_the_dbus_layer() {
+    fn merge_committed_units_notify_the_unit_loaded_channel() {
         // Every unit that enters the allocator through the merge funnel
-        // (finder commits and unit.define) must reach the D-Bus layer so a
-        // per-unit object can be registered; a unit that only gets updated
-        // is already registered.
+        // (finder commits and unit.define) must reach the unit-loaded
+        // channel so control-plane consumers (bridge flavors) get a
+        // `unit.new`; a unit that only gets updated does not re-notify.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut state = AllocatorState::new();
         state.unit_loaded_tx = Some(tx);
@@ -1463,6 +1459,104 @@ mod tests {
             "display-manager.service"
         );
         assert!(state.units.contains_key("display-manager.service"));
+    }
+
+    /// Build a `UnitIR` for a target unit with the given wants set, exactly
+    /// as the systemd finder emits it (e.g. `graphical.target` with
+    /// `wants=["display-manager.service"]`).
+    fn target_ir(id: &str, wants: &[&str]) -> UnitIR {
+        let mut deps = DependencySet::default();
+        deps.wants = wants.iter().map(|s| s.to_string()).collect();
+        UnitIR {
+            id: id.to_string(),
+            unit_type: Some(UnitType::Target),
+            description: None,
+            source_format: Some("systemd".to_string()),
+            source_path: None,
+            slice: None,
+            dependencies: Some(deps),
+            service: None,
+            mount: None,
+            automount: None,
+            timer: None,
+            socket: None,
+            conditions: None,
+            asserts: None,
+            wanted_by: None,
+            required_by: None,
+            aliases: Vec::new(),
+            resource_control: None,
+        }
+    }
+
+    #[test]
+    fn finder_ir_target_wants_alias_rewritten_on_commit() {
+        // Reproduces the VM rootfs layout through the full finder→commit
+        // seam: `graphical.target` wants `display-manager.service`; the
+        // finder folds the `display-manager.service -> lightdm.service`
+        // symlink into an alias on `lightdm.service` instead of emitting a
+        // phantom unit.  After `merge_units`, `rebuild_alias_map` must
+        // rewrite the target's wants to the canonical `lightdm.service` so
+        // the scheduler pulls it in.  This is the invariant whose breach
+        // would make lightdm never start in the VM.
+        let mut state = AllocatorState::new();
+
+        let mut lightdm = UnitIR {
+            id: "lightdm.service".to_string(),
+            unit_type: Some(UnitType::Service),
+            description: None,
+            source_format: Some("systemd".to_string()),
+            source_path: None,
+            slice: None,
+            dependencies: None,
+            service: Some(Default::default()),
+            mount: None,
+            automount: None,
+            timer: None,
+            socket: None,
+            conditions: None,
+            asserts: None,
+            wanted_by: None,
+            required_by: None,
+            aliases: vec!["display-manager.service".to_string()],
+            resource_control: None,
+        };
+        // `[Install] Alias=display-manager.service` in lightdm.service plus
+        // the `/etc/systemd/system/display-manager.service` symlink both feed
+        // the same alias; the finder dedupes.
+        assert_eq!(lightdm.aliases, vec!["display-manager.service"]);
+
+        let units: HashMap<String, UnitIR> = vec![
+            target_ir("graphical.target", &["display-manager.service"]),
+            target_ir("multi-user.target", &["systemd-logind.service"]),
+            target_ir("default.target", &[]),
+            lightdm.clone(),
+            target_ir("systemd-logind.service", &[]),
+        ]
+        .into_iter()
+        .map(|ir| (ir.id.clone(), ir))
+        .collect();
+
+        state.merge_units(&units).unwrap();
+
+        // The alias is registered, and the target's wants are canonical.
+        assert_eq!(
+            state.resolve_unit_name("display-manager.service"),
+            "lightdm.service"
+        );
+        let wants = &state.units.get("graphical.target").unwrap().unit.wants;
+        assert_eq!(*wants, HashSet::from(["lightdm.service".to_string()]));
+        assert!(!wants.contains("display-manager.service"));
+
+        // The reverse: `default.target` resolves to itself.
+        assert_eq!(state.resolve_unit_name("default.target"), "default.target");
+
+        // lightdm unit records the alias from the symlink + [Install].
+        let lightdm_unit = state.units.get("lightdm.service").unwrap();
+        assert!(lightdm_unit
+            .install
+            .alias
+            .contains(&"display-manager.service".to_string()));
     }
 
     #[test]

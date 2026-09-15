@@ -1,5 +1,7 @@
 mod yaml;
 
+use std::io::IsTerminal;
+
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
 use colored::*;
@@ -42,9 +44,12 @@ struct Cli {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ColorChoice {
-    Always,
+    /// Use colors when output is (or is piped to) a terminal.
     Auto,
+    /// Never use colors.
     Never,
+    /// Always use colors.
+    Always,
 }
 
 fn init_tracing(level: &str) {
@@ -52,20 +57,22 @@ fn init_tracing(level: &str) {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-fn render_unit(name: &str, json: &[u8]) -> Result<()> {
+fn render_unit(name: &str, json: &[u8], color: bool) -> Result<()> {
     let doc: Value =
         serde_json::from_slice(json).context(l10n::t_("Failed to parse unit state JSON."))?;
     let mut buf = String::new();
     let render_error = l10n::t_("Failed to render unit as YAML.");
-    yaml::render_doc(&mut buf, name, &doc)
+    yaml::render_doc(&mut buf, name, &doc, color)
         .map_err(|e| anyhow::anyhow!("{}: {e}", render_error))?;
     pager_println!("{buf}");
     Ok(())
 }
 
-async fn run() -> Result<()> {
+async fn run(color: bool) -> Result<()> {
     let admin = UnitStateAdmin::new();
-    let result = admin.list(render_unit).await?;
+    let result = admin
+        .list(|name, json| render_unit(name, json, color))
+        .await?;
 
     if !result.message.is_empty() {
         pager_eprintln!(
@@ -128,17 +135,19 @@ async fn main() -> Result<()> {
         disable: !use_pager,
     })?;
 
-    match color {
-        ColorChoice::Always => colored::control::set_override(true),
-        ColorChoice::Never => colored::control::set_override(false),
-        ColorChoice::Auto => {
-            if use_pager {
-                colored::control::set_override(true);
-            }
-        }
-    }
+    // Resolve `--color` to a concrete toggle.
+    let color_enabled = match color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        // auto: color when stdout is a terminal, or when paging (the pager
+        // renders the ANSI escape sequences for the terminal it writes to).
+        ColorChoice::Auto => use_pager || std::io::stdout().is_terminal(),
+    };
+    // The `--color` decision also drives the process-wide `colored` override,
+    // so the pager footer messages match the YAML body.
+    colored::control::set_override(color_enabled);
 
-    let result = run().await;
+    let result = run(color_enabled).await;
 
     match result {
         Err(e) => match e.downcast_ref::<std::io::Error>() {

@@ -5,14 +5,17 @@
 //! - Build and maintain the unit dependency graph.
 //! - Generate and dispatch Tasks to System Workers via Unix-socket IPC.
 //! - Maintain *desired state* for each unit (never actual state).
-//! - Expose a systemd1-compatible D-Bus interface for external tooling.
+//! - Expose the allocator control plane on the control socket.  The
+//!   well-known `systemd1` D-Bus surface is served by the System Wrapper
+//!   bridge flavors (systema-sysw.systemd) instead.
 
-mod dbus;
 mod event;
+mod events;
 mod graph;
 mod ipc;
 mod reload_task;
 mod scheduler;
+mod snapshot;
 mod state;
 mod unit;
 mod unitstate;
@@ -68,10 +71,11 @@ async fn main() -> Result<()> {
         tracing::warn!("Failed to create {systemd_system_dir}: {e}");
     }
 
-    // Shared allocator state accessible from both the IPC server and D-Bus server.
+    // Shared allocator state accessible from the IPC server and the
+    // control-plane event dispatch.
     let allocator = state::Allocator::handle();
 
-    // Spawn the ReloadTask: serialises all finder-commit and D-Bus Reload
+    // Spawn the ReloadTask: serialises all finder-commit and reload
     // operations through a single consumer.  System A never scans unit
     // files directly.
     let (reload_tx, _reload_handle) = reload_task::ReloadTask::spawn(allocator.clone());
@@ -94,10 +98,10 @@ async fn main() -> Result<()> {
     // the entire unit set.  There is no "first load" special case.
     let ipc_handle = tokio::spawn(ipc::server::run(allocator.clone()));
 
-    // Start the D-Bus server with automatic reconnection.
-    // If the system D-Bus bus is not yet available (early boot, containers,
-    // or after a transient outage), it retries with exponential backoff.
-    tokio::spawn(dbus::run(allocator.clone()));
+    // Start the in-process lifecycle-event dispatch (consumed by control-port
+    // sessions and forwarded to the System Wrapper bridge flavors).  Runs for
+    // the process lifetime.
+    tokio::spawn(events::run(allocator.clone()));
 
     // Wait for the IPC server (runs until killed).
     ipc_handle.await??;

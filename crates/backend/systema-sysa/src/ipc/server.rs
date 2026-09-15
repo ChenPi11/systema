@@ -19,16 +19,14 @@ use sysa::controller::UnitStatus;
 use sysa::event_bus::Event;
 use sysa::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use sysa::proto::{
-    AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, DaemonReloadRequest,
-    DaemonReloadResult, Envelope, EventSubscribe, EventUnsubscribe, ListUnitsRequest,
-    ListUnitsResult, MethodResult, PathFired, RegisterAck, RegisterUnits, StagingAreaEntry,
-    StagingQuery, StagingQueryResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest,
-    StopUnitsResult, TimerFired, UnitDefineResult, UnitInfo, UnitRegistrationAck, UnitStartResult,
+    AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope, EventSubscribe,
+    EventUnsubscribe, MethodResult, PathFired, RegisterAck, RegisterUnits, StagingAreaEntry,
+    StagingQuery, StagingQueryResult, TimerFired, UnitDefineResult, UnitRegistrationAck,
     UnitStateEntry, UnitStateEof, UnitStateListRequest, UnitStateUpdate, UnitStateUpdateAck,
     UnitSyncReport, WorkerRegistration,
 };
 
-use crate::dbus::manager::load_unit_sync;
+use crate::events::load_unit_sync;
 use crate::event::{replay_active_units, WorkerEventForwarder};
 use crate::state::{next_request_id, AllocatorHandle, CachedUnitState, WorkerEntry};
 
@@ -87,6 +85,16 @@ pub async fn run(allocator: AllocatorHandle) -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = run_fdpass_acceptor(fdpass_listener, fpm, pf).await {
             error!("FD-Pass acceptor error: {}", e);
+        }
+    });
+
+    // Control-port bus (one-to-many): System Wrapper bridge flavors and
+    // control-plane tooling connect here.  Independent of the workload
+    // plane on `allocator.sock`.
+    let control_alloc = allocator.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::ipc::control::run_control_listener(control_alloc).await {
+            error!("Control-port bus error: {e}");
         }
     });
 
@@ -199,7 +207,7 @@ async fn run_fdpass_acceptor(
 /// Linux exposes the full `SO_PEERCRED` struct (PID + UID).  The BSDs share
 /// `getpeereid`, which only reports the effective UID/GID — the PID is lost,
 /// so it is reported as 0.
-fn peer_cred(stream: &UnixStream) -> Result<(u32, u32)> {
+pub(crate) fn peer_cred(stream: &UnixStream) -> Result<(u32, u32)> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
 
@@ -268,17 +276,9 @@ async fn handle_worker(
         "staging.query" => handle_finder_query(framed, env, allocator, client_uid).await,
         "admin.staging" => handle_admin_staging(framed, env, allocator, client_uid).await,
         "admin.unitstate" => handle_admin_unitstate(framed, env, allocator, client_uid).await,
-        "manager.list_units" => handle_manager_list_units(framed, env, allocator, client_uid).await,
-        "manager.start_units" => {
-            handle_manager_start_units(framed, env, allocator, client_uid).await
-        }
-        "manager.stop_units" => handle_manager_stop_units(framed, env, allocator, client_uid).await,
-        "manager.daemon_reload" => {
-            handle_manager_daemon_reload(framed, env, allocator, client_uid).await
-        }
         other => {
             anyhow::bail!(sysa::l10n::fmt(
-                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', 'admin.unitstate', 'manager.list_units', 'manager.start_units', 'manager.stop_units', or 'manager.daemon_reload', got '{method}'"),
+                sysa::l10n::t_("Expected 'worker.register', 'finder.register_units', 'finder.commit_units', 'staging.query', 'admin.staging', or 'admin.unitstate', got '{method}'"),
                 &[("method", other)],
             ))
         }
@@ -822,12 +822,29 @@ async fn handle_worker_session(
                         };
                         // Fire-and-forget: System R is the only authority on
                         // cgroup metrics, so the snapshot is accepted without
-                        // ownership checks and cached opaquely for the D-Bus
-                        // layer to serve.
+                        // ownership checks and cached opaquely for the control
+                        // plane to serve.
                         if !update.units.is_empty() {
-                            let mut state = alloc_for_recv.write();
-                            for unit in update.units {
-                                state.cgroup_metrics.insert(unit.unit_name.clone(), unit);
+                            let mut event_metas: Vec<Event> = Vec::new();
+                            {
+                                let mut state = alloc_for_recv.write();
+                                for unit in update.units {
+                                    let name = unit.unit_name.clone();
+                                    let mut buf = bytes::BytesMut::new();
+                                    let _ = unit.encode(&mut buf);
+                                    event_metas.push(Event {
+                                        topic: sysa::event_bus::EventTopic::UnitMetrics,
+                                        unit_name: name.clone(),
+                                        worker_id: worker_id_recv.clone(),
+                                        timestamp: tokio::time::Instant::now(),
+                                        data: buf.freeze(),
+                                    });
+                                    state.cgroup_metrics.insert(name, unit);
+                                }
+                            }
+                            let bus = alloc_for_recv.read().event_bus.clone();
+                            for ev in event_metas {
+                                bus.read().await.dispatch(&ev).await;
                             }
                         }
                         continue;
@@ -1162,15 +1179,6 @@ async fn try_finder_commit(
     }
     info!("Finder (UID={client_uid}) committing staging area (uid={target_uid}, name='{name}')");
 
-    // Collect unit names before commit_staging removes the staging area.
-    let unit_names: Vec<String> = {
-        let state = allocator.read();
-        state
-            .get_staging_area(target_uid, name)
-            .map(|area| area.units.keys().cloned().collect())
-            .unwrap_or_default()
-    };
-
     let count = {
         let mut state = allocator.write();
         match state.commit_staging(target_uid, name) {
@@ -1195,14 +1203,6 @@ async fn try_finder_commit(
     // is idempotent (set inserts).
     if let Some(tx) = allocator.read().reload_tx.as_ref() {
         let _ = tx.try_send(crate::reload_task::ReloadRequest::FromCommit);
-    }
-
-    // Register D-Bus objects synchronously so the commit does not return
-    // until System A is fully ready to serve the registered units.
-    if let Some(conn) = crate::dbus::dbus_connection() {
-        for name in &unit_names {
-            crate::dbus::register_unit_object(conn, allocator.clone(), name).await;
-        }
     }
 
     Ok(UnitRegistrationAck {
@@ -1412,289 +1412,8 @@ async fn handle_admin_unitstate(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Control plane (SysAInit → System A)
-// ---------------------------------------------------------------------------
-
-/// `manager.list_units` — list the units System A has loaded, optionally
-/// filtered to enabled ones.
-async fn handle_manager_list_units(
-    mut framed: sysa::ipc::EnvelopeFramed,
-    env: Envelope,
-    allocator: AllocatorHandle,
-    client_uid: u32,
-) -> Result<()> {
-    let req = ListUnitsRequest::decode(env.payload.as_slice())?;
-    info!(
-        "Control request from UID={client_uid}: manager.list_units (enabled_only={})",
-        req.enabled_only
-    );
-
-    let enabled =
-        crate::unit::enable::scan_enabled_units(&sysa::paths::instance().unit_search_paths);
-    let result = {
-        let state = allocator.read();
-        build_list_result(&state, &enabled, req.enabled_only)
-    };
-    info!(
-        "manager.list_units returning {} unit(s) (enabled_only={})",
-        result.units.len(),
-        req.enabled_only
-    );
-
-    let reply = make_envelope(
-        next_request_id(),
-        "system-a",
-        "",
-        "manager.list_units.result",
-        result,
-    )?;
-    send_envelope(&mut framed, &reply).await?;
-    Ok(())
-}
-
-/// Build the `manager.list_units` reply (pure, testable without the global
-/// path config).
-///
-/// `enabled_only` asks for the *boot set*: every enabled unit on disk,
-/// whether or not it is loaded yet (a unit that is not loaded has its type
-/// derived from the file extension).  Otherwise every loaded unit is
-/// returned with its enablement flag.
-fn build_list_result(
-    state: &crate::state::AllocatorState,
-    enabled: &HashSet<String>,
-    enabled_only: bool,
-) -> ListUnitsResult {
-    let mut units: Vec<UnitInfo> = if enabled_only {
-        enabled
-            .iter()
-            .map(|name| {
-                let unit_type = state
-                    .units
-                    .get(name)
-                    .map(|u| u.kind.worker_type().to_string())
-                    .unwrap_or_else(|| {
-                        crate::unit::types::UnitKind::from_extension(name)
-                            .worker_type()
-                            .to_string()
-                    });
-                UnitInfo {
-                    name: name.clone(),
-                    unit_type,
-                    enabled: true,
-                }
-            })
-            .collect()
-    } else {
-        state
-            .units
-            .iter()
-            .map(|(name, unit)| UnitInfo {
-                name: name.clone(),
-                unit_type: unit.kind.worker_type().to_string(),
-                enabled: enabled.contains(name),
-            })
-            .collect()
-    };
-    units.sort_by(|a, b| a.name.cmp(&b.name));
-    ListUnitsResult {
-        success: true,
-        message: String::new(),
-        units,
-    }
-}
-
-/// `manager.start_units` — enqueue a start job for every listed unit.
-///
-/// Each name goes through the normal transaction machinery (dependency
-/// expansion, topological ordering, job merging), mirroring `systemctl
-/// start a b c`.  Unknown or unusable names are reported per-name without
-/// blocking the rest.
-async fn handle_manager_start_units(
-    mut framed: sysa::ipc::EnvelopeFramed,
-    env: Envelope,
-    allocator: AllocatorHandle,
-    client_uid: u32,
-) -> Result<()> {
-    let req = StartUnitsRequest::decode(env.payload.as_slice())?;
-    info!(
-        "Control request from UID={client_uid}: manager.start_units ({} unit(s))",
-        req.names.len()
-    );
-
-    let mut results = Vec::with_capacity(req.names.len());
-    for name in &req.names {
-        info!("manager.start_units: processing '{name}'");
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            crate::scheduler::enqueue_start_with_mode(
-                allocator.clone(),
-                name,
-                crate::state::JobMode::Replace,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(job_id)) => {
-                info!("manager.start_units: enqueued job {job_id} for '{name}'");
-                results.push(UnitStartResult {
-                    name: name.clone(),
-                    success: true,
-                    message: format!("job {job_id}"),
-                });
-            }
-            Ok(Err(e)) => {
-                warn!("manager.start_units: cannot start '{}': {}", name, e);
-                results.push(UnitStartResult {
-                    name: name.clone(),
-                    success: false,
-                    message: e.to_string(),
-                });
-            }
-            Err(_) => {
-                warn!("manager.start_units: timed out starting '{}'", name);
-                results.push(UnitStartResult {
-                    name: name.clone(),
-                    success: false,
-                    message: "start timed out".to_string(),
-                });
-            }
-        }
-    }
-
-    let success = !results.is_empty() && results.iter().all(|r| r.success);
-    let reply = make_envelope(
-        next_request_id(),
-        "system-a",
-        "",
-        "manager.start_units.result",
-        StartUnitsResult { success, results },
-    )?;
-    send_envelope(&mut framed, &reply).await?;
-    Ok(())
-}
-
-/// `manager.stop_units` — enqueue a stop job for one unit.
-async fn handle_manager_stop_units(
-    mut framed: sysa::ipc::EnvelopeFramed,
-    env: Envelope,
-    allocator: AllocatorHandle,
-    client_uid: u32,
-) -> Result<()> {
-    let req = StopUnitsRequest::decode(env.payload.as_slice())?;
-    info!(
-        "Control request from UID={client_uid}: manager.stop_units ('{}')",
-        req.name
-    );
-
-    let result = match crate::scheduler::enqueue_job(
-        allocator.clone(),
-        &req.name,
-        crate::state::JobKind::Stop,
-        crate::state::JobMode::Replace,
-    )
-    .await
-    {
-        Ok(job_id) => {
-            info!(
-                "manager.stop_units: enqueued job {job_id} for '{}'",
-                req.name
-            );
-            StopUnitsResult {
-                success: true,
-                message: format!("job {job_id}"),
-            }
-        }
-        Err(e) => {
-            warn!("manager.stop_units: cannot stop '{}': {}", req.name, e);
-            StopUnitsResult {
-                success: false,
-                message: e.to_string(),
-            }
-        }
-    };
-
-    let reply = make_envelope(
-        next_request_id(),
-        "system-a",
-        "",
-        "manager.stop_units.result",
-        result,
-    )?;
-    send_envelope(&mut framed, &reply).await?;
-    Ok(())
-}
-
-/// `manager.daemon_reload` — trigger a full unit-file rescan via System F.
-///
-/// This is the IPC equivalent of `systemctl daemon-reload`.  SysAInit
-/// calls this once after all workers are registered to perform the
-/// initial unit discovery (replacing the old one-shot Finder chain).
-async fn handle_manager_daemon_reload(
-    mut framed: sysa::ipc::EnvelopeFramed,
-    env: Envelope,
-    allocator: AllocatorHandle,
-    client_uid: u32,
-) -> Result<()> {
-    let _req = DaemonReloadRequest::decode(env.payload.as_slice())?;
-    info!("Control request from UID={client_uid}: manager.daemon_reload");
-
-    let tx = {
-        let state = allocator.read();
-        state.reload_tx.clone()
-    };
-    let Some(tx) = tx else {
-        warn!("manager.daemon_reload: ReloadTask not yet running");
-        let reply = make_envelope(
-            next_request_id(),
-            "system-a",
-            "",
-            "manager.daemon_reload.result",
-            DaemonReloadResult {
-                success: false,
-                message: "ReloadTask not running".into(),
-            },
-        )?;
-        send_envelope(&mut framed, &reply).await?;
-        return Ok(());
-    };
-
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if tx
-        .send(crate::reload_task::ReloadRequest::ByTrigger(reply_tx))
-        .await
-        .is_err()
-    {
-        warn!("manager.daemon_reload: ReloadTask channel closed");
-        let reply = make_envelope(
-            next_request_id(),
-            "system-a",
-            "",
-            "manager.daemon_reload.result",
-            DaemonReloadResult {
-                success: false,
-                message: "ReloadTask channel closed".into(),
-            },
-        )?;
-        send_envelope(&mut framed, &reply).await?;
-        return Ok(());
-    }
-    let _ = reply_rx.await;
-
-    let reply = make_envelope(
-        next_request_id(),
-        "system-a",
-        "",
-        "manager.daemon_reload.result",
-        DaemonReloadResult {
-            success: true,
-            message: String::new(),
-        },
-    )?;
-    send_envelope(&mut framed, &reply).await?;
-    info!("manager.daemon_reload: complete");
-    Ok(())
-}
+/// `manager.daemon_reload` etc. now live in [`crate::ipc::control`] on the
+/// control socket; the allocator socket serves only workload traffic.
 
 fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandle) -> AdminStagingResult {
     let state = allocator.read();
@@ -2060,6 +1779,24 @@ async fn handle_state_update(
                 timestamp: tokio::time::Instant::now(),
                 data: bytes::Bytes::from(status_buf),
             });
+
+            // Control-plane lifecycle: a unit's state changed → push its
+            // full snapshot to control-port subscribers (the System Wrapper
+            // bridge updates its mirror's Unit interface).
+            let snap_buf = {
+                let state = allocator.read();
+                let mut buf = bytes::BytesMut::new();
+                let _ = crate::snapshot::unit_snapshot(&state, &status.unit_name)
+                    .encode(&mut buf);
+                buf
+            };
+            dispatched.push(Event {
+                topic: EventTopic::UnitChanged,
+                unit_name: status.unit_name.clone(),
+                worker_id: sender.to_string(),
+                timestamp: tokio::time::Instant::now(),
+                data: bytes::Bytes::from(snap_buf),
+            });
         }
     }
 
@@ -2161,18 +1898,11 @@ async fn send_user_session_update(allocator: AllocatorHandle, uid: u32, count: u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-    use std::pin::Pin;
     use tokio::net::UnixStream;
 
     use futures::StreamExt;
 
-    use sysa::proto::{
-        ListUnitsRequest, ListUnitsResult, StartUnitsRequest, StartUnitsResult, StopUnitsRequest,
-        StopUnitsResult,
-    };
-
-    use crate::state::{AllocatorState, WorkerEntry};
+    use crate::state::AllocatorState;
     use crate::unit::types::{UnitFile, UnitSection};
 
     fn test_allocator() -> AllocatorHandle {
@@ -2190,178 +1920,8 @@ mod tests {
         state
     }
 
-    fn register_service_worker(state: &AllocatorHandle) {
-        let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let mut state = state.write();
-        state.workers.insert(
-            "system-s-1".to_string(),
-            WorkerEntry {
-                worker_id: "system-s-1".to_string(),
-                unit_types: vec!["service".to_string()],
-                supports_unit_define: false,
-                ready: false,
-                envelope_tx: tx,
-            },
-        );
-    }
-
-    /// Drive a handler over a socketpair: send `req_env` in, get the reply
-    /// envelope out.
-    async fn call_handler(allocator: AllocatorHandle, method: &str, req_env: Envelope) -> Envelope {
-        let (client, server) = UnixStream::pair().unwrap();
-        let server = frame_stream(server);
-        let mut client = frame_stream(client);
-        send_envelope(&mut client, &req_env).await.unwrap();
-
-        let handler_fut: Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
-            match method {
-                "manager.list_units" => {
-                    Box::pin(handle_manager_list_units(server, req_env, allocator, 0))
-                }
-                "manager.start_units" => {
-                    Box::pin(handle_manager_start_units(server, req_env, allocator, 0))
-                }
-                "manager.stop_units" => {
-                    Box::pin(handle_manager_stop_units(server, req_env, allocator, 0))
-                }
-                _ => panic!("unknown method {method}"),
-            };
-        tokio::select! {
-            r = handler_fut => r.unwrap(),
-            e = client.next() => panic!("handler closed without reply: {e:?}"),
-        };
-        recv_envelope(&mut client).await.unwrap().unwrap()
-    }
-
     fn req_env(method: &str, payload: impl ProstMessage) -> Envelope {
         make_envelope(7, "system-sysi", "system-a", method, payload).unwrap()
-    }
-
-    #[test]
-    fn build_list_result_filters_enabled() {
-        let state = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
-        {
-            let mut state_guard = state.write();
-            state_guard
-                .units
-                .insert("foo.service".to_string(), UnitFile::new("foo.service"));
-            state_guard
-                .units
-                .insert("bar.timer".to_string(), UnitFile::new("bar.timer"));
-        }
-
-        let enabled: HashSet<String> = ["foo.service".to_string()].into_iter().collect();
-        let all = build_list_result(&state.read(), &enabled, false);
-        // "-.slice" (root slice, auto-created) + foo.service + bar.timer.
-        assert_eq!(all.units.len(), 3);
-
-        let only = build_list_result(&state.read(), &enabled, true);
-        assert_eq!(only.units.len(), 1);
-        let unit = &only.units[0];
-        assert_eq!(unit.name, "foo.service");
-        assert!(unit.enabled);
-        assert_eq!(unit.unit_type, "service");
-    }
-
-    #[tokio::test]
-    async fn list_units_returns_sorted_snapshot() {
-        let allocator = test_allocator();
-        let reply = call_handler(
-            allocator,
-            "manager.list_units",
-            req_env(
-                "manager.list_units",
-                ListUnitsRequest {
-                    enabled_only: false,
-                },
-            ),
-        )
-        .await;
-        assert_eq!(reply.method, "manager.list_units.result");
-        let result = ListUnitsResult::decode(reply.payload.as_slice()).unwrap();
-        assert!(result.success);
-        let names: Vec<&str> = result.units.iter().map(|u| u.name.as_str()).collect();
-        // "-.slice" (root slice, auto-created), default.target, foo.service — sorted.
-        assert_eq!(names, vec!["-.slice", "default.target", "foo.service"]);
-    }
-
-    #[tokio::test]
-    async fn start_units_enqueues_known_and_rejects_unknown() {
-        let allocator = test_allocator();
-        register_service_worker(&allocator);
-
-        let reply = call_handler(
-            allocator.clone(),
-            "manager.start_units",
-            req_env(
-                "manager.start_units",
-                StartUnitsRequest {
-                    names: vec!["foo.service".to_string(), "nope.service".to_string()],
-                },
-            ),
-        )
-        .await;
-        assert_eq!(reply.method, "manager.start_units.result");
-        let result = StartUnitsResult::decode(reply.payload.as_slice()).unwrap();
-        assert_eq!(result.results.len(), 2);
-
-        let foo = result
-            .results
-            .iter()
-            .find(|r| r.name == "foo.service")
-            .unwrap();
-        assert!(foo.success, "foo.service should enqueue: {}", foo.message);
-        assert!(foo.message.starts_with("job "));
-
-        let nope = result
-            .results
-            .iter()
-            .find(|r| r.name == "nope.service")
-            .unwrap();
-        assert!(!nope.success);
-        assert!(!nope.message.is_empty());
-    }
-
-    #[tokio::test]
-    async fn start_units_creates_jobs() {
-        let allocator = test_allocator();
-        register_service_worker(&allocator);
-
-        let _ = call_handler(
-            allocator.clone(),
-            "manager.start_units",
-            req_env(
-                "manager.start_units",
-                StartUnitsRequest {
-                    names: vec!["foo.service".to_string()],
-                },
-            ),
-        )
-        .await;
-
-        let state = allocator.read();
-        let has_job = state.jobs.values().any(|j| j.unit_name == "foo.service");
-        assert!(has_job, "a job for foo.service must exist in state");
-    }
-
-    #[tokio::test]
-    async fn stop_units_unknown_rejected() {
-        let allocator = test_allocator();
-        let reply = call_handler(
-            allocator,
-            "manager.stop_units",
-            req_env(
-                "manager.stop_units",
-                StopUnitsRequest {
-                    name: "nope.service".to_string(),
-                },
-            ),
-        )
-        .await;
-        assert_eq!(reply.method, "manager.stop_units.result");
-        let result = StopUnitsResult::decode(reply.payload.as_slice()).unwrap();
-        assert!(!result.success);
-        assert!(!result.message.is_empty());
     }
 
     #[test]

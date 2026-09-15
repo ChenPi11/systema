@@ -1,0 +1,55 @@
+//! systema-sysw.systemd — System Wrapper systemd D-Bus bridge
+//!
+//! Serves the org.freedesktop.systemd1 D-Bus surface on the system bus,
+//! backed by System A over the control socket.  Properties, job lists and
+//! unit listings are read from a local mirror that is refreshed by
+//! control-port lifecycle events; mutations are forwarded to System A as
+//! `manager.*` RPCs.
+
+mod bridge;
+mod dbus;
+mod mirror;
+mod watcher;
+
+use anyhow::Result;
+use clap::Parser;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "systema-sysw.systemd", about = "System Wrapper — systemd D-Bus bridge")]
+struct Args {
+    #[arg(long, short = 'D', help = "Enable debug-level logging")]
+    debug: bool,
+
+    #[arg(
+        long,
+        default_value = "info",
+        help = "Log level (trace, debug, info, warn, error)"
+    )]
+    log_level: String,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    sysa::paths::init();
+    sysa::l10n::init();
+
+    let args = Args::parse();
+    let log_level = if args.debug { "debug" } else { &args.log_level };
+    tracing_subscriber::fmt()
+        .with_env_filter(log_level.parse::<EnvFilter>()?)
+        .init();
+
+    // Reconnect loop: keep serving D-Bus across control-session restarts.
+    loop {
+        match bridge::run().await {
+            Ok(()) => {
+                tracing::info!("Bridge exited cleanly; reconnecting");
+            }
+            Err(e) => {
+                tracing::warn!("Bridge session ended: {e:#}; reconnecting");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}

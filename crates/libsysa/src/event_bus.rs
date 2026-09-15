@@ -6,10 +6,26 @@ use std::sync::Arc;
 /// Workers no longer emit free-form event strings; all runtime state
 /// changes flow through the unified `unit.state_update` protocol, which
 /// SysA re-dispatches as [`EventTopic::UnitStateChange`].
+///
+/// Control-bus subscribers (System Wrapper bridge flavors) additionally
+/// receive the richer life-cycle topics below; their `data` payloads are
+/// protobuf-encoded control-plane messages.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum EventTopic {
     /// A unit's runtime state changed (unified `unit.state_update`).
     UnitStateChange,
+    /// A unit's full snapshot changed (data = encoded `UnitSnapshot`).
+    UnitChanged,
+    /// A unit was loaded into memory (data = encoded `UnitSnapshot`).
+    UnitNew,
+    /// A unit was unloaded from memory (data = encoded `UnitRemovedEvent`).
+    UnitRemoved,
+    /// New cgroup metrics arrived (data = encoded `UnitCgroupMetrics`).
+    UnitMetrics,
+    /// A job was created (data = encoded `JobEvent`, result empty).
+    JobNew,
+    /// A job finished (data = encoded `JobEvent`, result filled).
+    JobCompleted,
     /// Events for a single, named unit.  Used by subscribers that want to
     /// watch a specific unit instead of every unit.
     Unit(String),

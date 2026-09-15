@@ -7,6 +7,10 @@ use std::sync::OnceLock;
 pub struct Paths {
     pub ipc_socket_path: &'static str,
     pub systema_fdpass_sock: &'static str,
+    /// Control-port bus socket (one-to-many).  System Wrapper bridge flavors
+    /// and control-plane tooling connect here; System A serves `manager.*`
+    /// RPCs and pushes unit/job events on this socket.
+    pub control_socket_path: &'static str,
     pub systema_shell_path: &'static str,
     pub systema_socket_handler_path: &'static str,
     pub systemd_machine_id_file: &'static str,
@@ -54,6 +58,7 @@ fn compute_paths() -> Paths {
     Paths {
         ipc_socket_path: resolve("SYSTEMA_IPC_SOCKET", builtin::IPC_SOCKET_PATH),
         systema_fdpass_sock: resolve("SYSTEMA_FDPASS_SOCK", builtin::SYSTEMA_FDPASS_SOCK),
+        control_socket_path: resolve("SYSTEMA_CONTROL_SOCKET", builtin::CONTROL_SOCKET_PATH),
         systema_shell_path: resolve("SYSTEMA_SHELL_PATH", builtin::SYSTEMA_SHELL_PATH),
         systema_socket_handler_path: resolve(
             "SYSTEMA_SOCKET_HANDLER_PATH",

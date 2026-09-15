@@ -1,17 +1,13 @@
-//! Per-unit Socket interface objects.
-//!
-//! Exposes a minimal `org.freedesktop.systemd1.Socket` interface so tools like
-//! `systemctl status` can query socket units without receiving interface errors.
+//! Per-unit `Socket` interface (bridge).
+
+use std::sync::Arc;
 
 use zbus::interface;
 
-use crate::state::AllocatorHandle;
+use super::BridgeContext;
 
-/// Socket-specific D-Bus object bound to a unit path.
 pub struct SocketObject {
-    #[allow(dead_code)]
-    pub allocator: AllocatorHandle,
-    #[allow(dead_code)]
+    pub ctx: Arc<BridgeContext>,
     pub unit_name: String,
 }
 
@@ -19,7 +15,10 @@ pub struct SocketObject {
 impl SocketObject {
     #[zbus(property)]
     fn result(&self) -> String {
-        "success".to_string()
+        match self.snapshot().extensions.get("last_exit_code") {
+            Some(code) if code != "0" => "exit-code".to_string(),
+            _ => "success".to_string(),
+        }
     }
 
     #[zbus(property)]
@@ -34,7 +33,7 @@ impl SocketObject {
 
     #[zbus(property)]
     fn control_pid(&self) -> u32 {
-        0
+        self.snapshot().main_pid
     }
 
     #[zbus(property)]
@@ -60,5 +59,16 @@ impl SocketObject {
     #[zbus(property)]
     fn o_o_m_rules(&self) -> Vec<String> {
         Vec::new()
+    }
+}
+
+impl SocketObject {
+    fn snapshot(&self) -> sysa::proto::UnitSnapshot {
+        self.ctx
+            .mirror
+            .read()
+            .get(&self.unit_name)
+            .cloned()
+            .unwrap_or_default()
     }
 }

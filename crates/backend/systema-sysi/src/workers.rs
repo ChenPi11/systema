@@ -146,6 +146,13 @@ fn default_workers() -> Vec<WorkerSpec> {
             true,
         ),
         WorkerSpec::new(
+            "sysw",
+            "systema-sysw.systemd",
+            Some("system-w-1"),
+            ProcessKind::LongRunning,
+            true,
+        ),
+        WorkerSpec::new(
             "sysp",
             "systema-sysp.shim",
             Some("system-p-1"),
@@ -313,17 +320,18 @@ mod tests {
         let linux = build_worker_set_for(Platform::Linux, &[]).unwrap();
         assert_eq!(
             names(&linux),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm", "sysp"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm", "sysw", "sysp"]
         );
-        assert_eq!(linux.len(), 11);
+        assert_eq!(linux.len(), 12);
         assert!(
             linux.iter().all(|s| s.kind == ProcessKind::LongRunning)
         );
         fn binary_of<'a>(set: &'a [WorkerSpec], name: &'a str) -> &'a str {
             set.iter().find(|s| s.name == name).unwrap().binary
         }
-        // System M exists only on Linux; System P has a per-platform binary.
+        // System M / System W exist only on Linux; System P has a per-platform binary.
         assert_eq!(binary_of(&linux, "sysm"), "systema-sysm.linux");
+        assert_eq!(binary_of(&linux, "sysw"), "systema-sysw.systemd");
         assert_eq!(binary_of(&linux, "sysp"), "systema-sysp.linux");
 
         let other = build_worker_set_for(Platform::Other, &[]).unwrap();
@@ -339,7 +347,7 @@ mod tests {
         let set = build_worker_set_for(Platform::Linux, &skip(&["sysd", "sysc", "sysp"])).unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysk", "sysn", "sysr", "sysm"]
+            vec!["sysa", "syss", "syse", "syst", "sysk", "sysn", "sysr", "sysm", "sysw"]
         );
     }
 
@@ -352,7 +360,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             names(&set),
-            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysr"]
+            vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysr", "sysw"]
         );
     }
 
@@ -444,8 +452,9 @@ mod tests {
         let (resolved, missing) = resolve_set(&set, Some(&dir));
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].spec.name, "sysa");
-        assert_eq!(missing.len(), 10);
+        assert_eq!(missing.len(), 11);
         assert!(missing.iter().any(|m| m.name == "syss"));
+        assert!(missing.iter().any(|m| m.name == "sysw"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

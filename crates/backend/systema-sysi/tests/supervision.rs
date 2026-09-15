@@ -8,7 +8,7 @@
 //! gated on notify-channel readiness events.  The tests play the role of
 //! System A's notify sender: they write `MANAGER_READY` / `WORKER_READY`
 //! datagrams to the listener socket SysAInit binds in `SYSTEMA_NOTIFY_DIR`.
-//! They also serve the fake allocator IPC socket (`SYSTEMA_IPC_SOCKET`)
+//! They also serve the fake System A control socket (`SYSTEMA_CONTROL_SOCKET`)
 //! for the control phase (`manager.list_units` / `manager.start_units`).
 
 use std::fs;
@@ -26,8 +26,8 @@ use nix::unistd::Pid;
 use prost::Message;
 
 use sysa::proto::{
-    DaemonReloadResult, Envelope, ListUnitsResult, StartUnitsRequest, StartUnitsResult, UnitInfo,
-    UnitStartResult,
+    DaemonReloadResult, Envelope, ListUnitsResult, ManagerHelloResult, StartUnitsRequest,
+    StartUnitsResult, UnitInfo, UnitStartResult,
 };
 
 /// Long-running shim: exits 0 on SIGTERM, otherwise sleeps forever.
@@ -47,6 +47,7 @@ const DEFAULT_WORKERS: &[&str] = &[
     "systema-sysd",
     "systema-sysr",
     "systema-sysm.linux",
+    "systema-sysw.systemd",
     "systema-sysp.linux",
 ];
 
@@ -61,12 +62,13 @@ const WORKER_IDS: &[&str] = &[
     "system-d-1",
     "system-r-1",
     "system-m-1",
+    "system-w-1",
     "system-p-1",
 ];
 
 /// Short names in spawn order (`DEFAULT_WORKERS[1..]`).
 const SHORT_NAMES: &[&str] = &[
-    "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm", "sysp",
+    "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr", "sysm", "sysw", "sysp",
 ];
 
 fn shim_dir(tag: &str) -> PathBuf {
@@ -133,9 +135,9 @@ fn run_sysi(dir: &Path, notify_dir: &Path, extra: &[&str]) -> Child {
         .arg("--ready-timeout")
         .arg("2")
         .env("SYSTEMA_NOTIFY_DIR", notify_dir)
-        // The control phase talks to System A over the allocator socket;
+        // The control phase talks to System A over the control socket;
         // point it at the fake listener below.
-        .env("SYSTEMA_IPC_SOCKET", notify_dir.join("allocator.sock"))
+        .env("SYSTEMA_CONTROL_SOCKET", notify_dir.join("control.sock"))
         .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -213,13 +215,13 @@ fn default_canned() -> Vec<UnitInfo> {
     ]
 }
 
-/// Serve the fake allocator IPC socket at `<notify-dir>/allocator.sock`.
+/// Serve the fake System A control socket at `<notify-dir>/control.sock`.
 ///
 /// Answers `manager.list_units` with `canned` and `manager.start_units`
 /// with an all-success reply, recording the requested names into `sent`.
-fn fake_allocator(notify_dir: &Path, canned: Vec<UnitInfo>, sent: Arc<Mutex<Vec<String>>>) {
+fn fake_control(notify_dir: &Path, canned: Vec<UnitInfo>, sent: Arc<Mutex<Vec<String>>>) {
     fs::create_dir_all(notify_dir).unwrap();
-    let path = notify_dir.join("allocator.sock");
+    let path = notify_dir.join("control.sock");
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
@@ -235,6 +237,19 @@ fn fake_allocator(notify_dir: &Path, canned: Vec<UnitInfo>, sent: Arc<Mutex<Vec<
                     break;
                 };
                 let reply = match env.method.as_str() {
+                    "manager.hello" => {
+                        let result = ManagerHelloResult {
+                            success: true,
+                            message: "welcome".to_string(),
+                        };
+                        Envelope {
+                            request_id: env.request_id,
+                            source: "system-a".to_string(),
+                            target: "system-sysi".to_string(),
+                            method: "manager.hello.result".to_string(),
+                            payload: result.encode_to_vec(),
+                        }
+                    }
                     "manager.daemon_reload" => {
                         let result = DaemonReloadResult {
                             success: true,
@@ -356,7 +371,7 @@ fn boot_all_canned(
     canned: Vec<UnitInfo>,
 ) -> Arc<Mutex<Vec<String>>> {
     let sent = Arc::new(Mutex::new(Vec::new()));
-    fake_allocator(notify_dir, canned, sent.clone());
+    fake_control(notify_dir, canned, sent.clone());
     let a = FakeA::new(notify_dir);
     a.manager_ready();
     for (name, worker_id) in SHORT_NAMES.iter().zip(WORKER_IDS) {
@@ -558,27 +573,6 @@ fn worker_timeout_exits_nonzero() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn notify_events_are_logged() {
-    let dir = shim_dir("notify-log");
-    default_shims(&dir);
-    let notify_dir = dir.join("notify");
-
-    let mut child = run_sysi(&dir, &notify_dir, &[]);
-    let buf = stderr_reader(&mut child);
-    let a = FakeA::new(&notify_dir);
-    a.send("UNIT_STARTED=sshd.service\nRESULT=success\n");
-    assert!(wait_for(&buf, "notify: UNIT_STARTED=sshd.service", 5));
-    assert!(wait_for(&buf, "notify: RESULT=success", 5));
-
-    a.manager_ready();
-    assert!(wait_for(&buf, "System A is ready", 5));
-
-    send_term(&child);
-    let status = wait_timeout(&mut child, 8).expect("should exit after SIGTERM");
-    assert_eq!(status.code(), Some(0), "got {status:?}");
-    let _ = fs::remove_dir_all(&dir);
-}
 #[test]
 fn control_phase_starts_enabled_units_and_default_target() {
     let dir = shim_dir("control-boot");

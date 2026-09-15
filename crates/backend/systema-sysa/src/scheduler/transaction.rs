@@ -352,6 +352,30 @@ fn state_of(states: &HashMap<String, UnitActiveState>, u: &str) -> UnitActiveSta
     states.get(u).copied().unwrap_or(UnitActiveState::Unknown)
 }
 
+/// Whether a conflict- or propagation-derived `Stop` job for `unit` would be
+/// a no-op: the unit is not active/activating and has no running job.
+///
+/// systemd only stops units that are (or could be) running — an idle unit
+/// has nothing to stop, so the `Stop` job is never installed (it would be
+/// redundant).  `Unknown` state (no cached entry) is treated the same way
+/// here: a unit that has never reported any state and has no in-flight job
+/// cannot be running.  This deliberately relaxes `job_type_is_redundant()`'s
+/// conservative `Unknown` policy for *stop* injection: it keeps the
+/// operation only when there is a running job or an active-like state to
+/// act on, keeping later `Start`/`Stop` pairs from colliding over units
+/// that were never started (e.g. `lightdm.service` `Conflicts=`
+/// `plymouth-quit.service` during boot).
+fn stop_job_is_noop(
+    states: &HashMap<String, UnitActiveState>,
+    installed: &HashMap<String, JobType>,
+    unit: &str,
+) -> bool {
+    if installed.contains_key(unit) {
+        return false;
+    }
+    !state_of(states, unit).is_active_or_activating()
+}
+
 /// systemd `job_type_is_conflicting()`: start/verify-active/reload jobs
 /// conflict with every non-positive job.
 fn job_type_is_conflicting(a: JobType, b: JobType) -> bool {
@@ -661,6 +685,17 @@ impl Transaction {
             // poweroff/halt actually shut services down before the hardware
             // power transition.
             for u in rev.conflicted_by(unit) {
+                // A Stop for a unit that is neither running nor being
+                // started would be a no-op — and, worse, would later
+                // collide with a legitimate Start for the same unit (e.g. a
+                // display manager that `Conflicts=` the plymouth boot
+                // splash).  systemd never installs it; skip it here too.
+                if stop_job_is_noop(states, installed, &u) {
+                    debug!(
+                        "Skipping inverse-conflict stop for {u} via {unit}: not active/activating, no running job"
+                    );
+                    continue;
+                }
                 if let Err(e) = self.add_job_and_dependencies(
                     units,
                     states,
@@ -690,6 +725,15 @@ impl Transaction {
                     state_of(states, &x),
                 );
                 if nt == JobType::Nop {
+                    continue;
+                }
+                // Idle units have nothing to stop; skipping them avoids
+                // both a spurious worker round-trip and a later
+                // Start/Stop collision on the same unit.
+                if is_stop && stop_job_is_noop(states, installed, &x) {
+                    debug!(
+                        "Skipping propagate-stop for {x} via {unit}: not active/activating, no running job"
+                    );
                     continue;
                 }
                 self.add_job_and_dependencies(
@@ -1810,7 +1854,7 @@ mod tests {
 
     #[test]
     fn inverse_conflicts_stop_units_that_declare_conflicts() {
-        // Starting `a.service` must stop every unit that declares
+        // Starting `a.service` must stop every *running* unit that declares
         // `Conflicts=a.service` (systemd `UNIT_ATOM_CONFLICTED_BY`), not
         // only the target's own forward Conflicts= list.
         let units = map(vec![
@@ -1818,9 +1862,15 @@ mod tests {
             with_conflicts(make_unit("x.service"), &["a.service"]),
             with_conflicts(make_unit("y.service"), &["a.service"]),
         ]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("x.service".to_string(), Active);
+            m.insert("y.service".to_string(), Active);
+            m
+        };
         let s = steps(
             &units,
-            &HashMap::new(),
+            &states,
             &HashMap::new(),
             "a.service",
             Start,
@@ -1831,6 +1881,107 @@ mod tests {
         assert_eq!(x.job_type, Stop);
         assert_eq!(y.job_type, Stop);
         assert!(x.matters_to_anchor && y.matters_to_anchor);
+    }
+
+    #[test]
+    fn inverse_conflicts_skip_stop_for_idle_conflicting_unit() {
+        // Regression test for the lightdm boot hang: `lightdm.service`
+        // declares `Conflicts=plymouth-quit.service` ("replaces plymouth-quit
+        // since lightdm quits plymouth on its own").  Starting
+        // plymouth-quit during boot must NOT emit a Stop for lightdm when
+        // lightdm is not running — systemd only stops units that are (or
+        // could be) active.  Emitting the spurious Stop made lightdm report
+        // inactive, then the later `graphical.target` transaction collided
+        // its Start with the leftover Stop and deleted lightdm entirely.
+        let units = map(vec![
+            make_unit("plymouth-quit.service"),
+            with_conflicts(make_unit("lightdm.service"), &["plymouth-quit.service"]),
+        ]);
+        // lightdm was never started: no cached state, no running job.
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "plymouth-quit.service",
+            Start,
+            Replace,
+        );
+        assert!(
+            !s.iter().any(|x| x.unit == "lightdm.service"),
+            "idle conflicting unit must not get a Stop job (plan: {:?})",
+            names(&s)
+        );
+
+        // Contrast: once lightdm is actually running, the inverse-Conflicts
+        // Stop must still be emitted.
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("lightdm.service".to_string(), Active);
+            m
+        };
+        let s = steps(
+            &units,
+            &states,
+            &HashMap::new(),
+            "plymouth-quit.service",
+            Start,
+            Replace,
+        );
+        let lightdm = s.iter().find(|x| x.unit == "lightdm.service").unwrap();
+        assert_eq!(lightdm.job_type, Stop);
+        assert!(lightdm.matters_to_anchor);
+
+        // A running job for the idle-looking unit also keeps the Stop.
+        let installed = {
+            let mut m = HashMap::new();
+            m.insert("lightdm.service".to_string(), Start);
+            m
+        };
+        let s = steps(
+            &units,
+            &HashMap::new(),
+            &installed,
+            "plymouth-quit.service",
+            Start,
+            Replace,
+        );
+        let lightdm = s.iter().find(|x| x.unit == "lightdm.service").unwrap();
+        assert_eq!(lightdm.job_type, Stop);
+    }
+
+    #[test]
+    fn propagate_stop_skip_idle_requirers() {
+        // Stop-propagation (inverse Requires=) must only stop units that are
+        // running or have a running job, same no-op gate as inverse-Conflicts.
+        let units = map(vec![
+            make_unit("x.target"),
+            with_requires(make_unit("a.service"), &["x.target"]),
+            with_requires(make_unit("b.service"), &["x.target"]),
+        ]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("a.service".to_string(), Active);
+            m.insert("b.service".to_string(), Inactive);
+            m
+        };
+        let s = steps(
+            &units,
+            &states,
+            &HashMap::new(),
+            "x.target",
+            Stop,
+            Replace,
+        );
+        let a = s.iter().find(|x| x.unit == "a.service").unwrap();
+        assert_eq!(a.job_type, Stop, "active requirer must be stopped");
+        assert!(
+            !s.iter().any(|x| x.unit == "b.service"),
+            "idle requirer must not get a Stop job (plan: {:?})",
+            names(&s)
+        );
+        let x = s.iter().find(|x| x.unit == "x.target").unwrap();
+        assert_eq!(x.job_type, Stop);
+        assert!(x.anchor);
     }
 
     #[test]
@@ -1992,9 +2143,14 @@ mod tests {
             make_unit("a.service"),
             with_requires(make_unit("b.service"), &["a.service"]),
         ]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("b.service".to_string(), Active);
+            m
+        };
         let s = steps(
             &units,
-            &HashMap::new(),
+            &states,
             &HashMap::new(),
             "a.service",
             Stop,
@@ -2011,9 +2167,14 @@ mod tests {
             make_unit("a.service"),
             with_part_of(make_unit("b.service"), &["a.service"]),
         ]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("b.service".to_string(), Active);
+            m
+        };
         let s = steps(
             &units,
-            &HashMap::new(),
+            &states,
             &HashMap::new(),
             "a.service",
             Stop,
@@ -2029,9 +2190,14 @@ mod tests {
             make_unit("a.service"),
             with_requisite(make_unit("b.service"), &["a.service"]),
         ]);
+        let states = {
+            let mut m = HashMap::new();
+            m.insert("b.service".to_string(), Active);
+            m
+        };
         let s = steps(
             &units,
-            &HashMap::new(),
+            &states,
             &HashMap::new(),
             "a.service",
             Stop,

@@ -1432,8 +1432,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "zbus",
- "zvariant",
 ]
 
 [[package]]
@@ -1753,6 +1751,42 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "systema-sysw-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "prost",
+ "sysa",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "systema-sysw-systemd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "futures",
+ "once_cell",
+ "parking_lot",
+ "prost",
+ "sysa",
+ "systema-sysw-common",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zbus",
+ "zvariant",
 ]
 
 [[package]]

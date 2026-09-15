@@ -314,7 +314,7 @@ org.freedesktop.systemd1.Job             （路径：/org/freedesktop/systemd1/j
 | 信号名 | 状态 | 说明 |
 |--------|------|------|
 | `UnitNew(id, unit)` | ❌ 未实现 | 单元对象注册时不发出（dbus/mod.rs:359-366） |
-| `UnitRemoved(id, unit)` | ✅ 完全实现 | M2 已实现（`unit_removed_tx` 通道 + dbus/mod.rs:368-389） |
+| `UnitRemoved(id, unit)` | ❌ 未实现 | sysa 端 `unit_removed_tx` 通道已移除（死代码），sysa 不再发出 `unit.removed` 事件；桥接层 `bridge.rs` 仍保有该事件的处理分支（保留兼容） |
 | `JobNew(id, job, unit)` | ⚠️ 部分实现 | 已发出（`job_new_tx` 通道 + dbus/mod.rs:334-357）；但 `Job` 对象未注册，路径不可解析（同 `JobRemoved`） |
 | `JobRemoved(id, job, unit, result)` | ⚠️ 部分实现 | 已在作业完成时发出；但 `Job` 对象本身未注册（路径不可解析） |
 | `StartupFinished(firmware, loader, kernel, initrd, userspace, total)` | ❌ 未实现 | 系统启动完成时发出 |

@@ -1,0 +1,31 @@
+cargo-features = ["different-binary-name"]
+
+[package]
+name = "systema-sysw-systemd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "systema-sysw-systemd"
+filename = "systema-sysw.systemd"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sysa = { path = "../../../libsysa" }
+systema-sysw-common = { path = "../systema-sysw-common" }
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+prost.workspace = true
+bytes.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+zbus.workspace = true
+zvariant.workspace = true
+uuid.workspace = true
+once_cell.workspace = true

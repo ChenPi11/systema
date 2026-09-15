@@ -130,7 +130,7 @@ impl JobType {
         }
     }
 
-    /// Stable string form, used for diagnostics and D-Bus job properties.
+    /// Stable string form, used for diagnostics and control-port job properties.
     pub fn as_str(&self) -> &str {
         match self {
             JobType::Start => "start",

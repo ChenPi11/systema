@@ -27,8 +27,8 @@ use nix::sys::signal::{kill, signal, SigHandler, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use sysa::proto::{
-    DaemonReloadRequest, DaemonReloadResult, ListUnitsRequest, ListUnitsResult, StartUnitsRequest,
-    StartUnitsResult,
+    DaemonReloadRequest, DaemonReloadResult, ListUnitsRequest, ListUnitsResult, ManagerHelloRequest,
+    StartUnitsRequest, StartUnitsResult,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -42,11 +42,14 @@ pub fn default_notify_dir() -> String {
     sysa::paths::instance().notify_dir.clone()
 }
 
-/// One request-reply exchange over a fresh allocator connection.
+/// One request-reply exchange over a fresh control-port connection.
 ///
-/// The server closes the connection after answering a single envelope, so
-/// every call gets its own connection, like `systemctl`'s one-call-per-
-/// connection model.
+/// The control bus requires a `manager.hello` handshake as the first
+/// envelope of every session, so each call performs it before sending the
+/// real request.  The server also pushes event envelopes (`unit.new`,
+/// `unit.changed`, `job.*`, …) onto the same session; those are skipped
+/// until the matching `{method}.result` reply arrives, then the connection
+/// is dropped.
 async fn manager_call<Req, Res>(
     sock_path: &str,
     request_id: u64,
@@ -59,6 +62,31 @@ where
 {
     let stream = tokio::net::UnixStream::connect(sock_path).await?;
     let mut framed = sysa::ipc::frame_stream(stream);
+
+    // Handshake: the control socket closes the session if the first
+    // envelope is anything but `manager.hello`.
+    let hello_env = sysa::ipc::make_envelope(
+        0,
+        "system-sysi",
+        "system-a",
+        "manager.hello",
+        ManagerHelloRequest {
+            flavor: "sysi".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            worker_id: String::new(),
+        },
+    )?;
+    sysa::ipc::send_envelope(&mut framed, &hello_env).await?;
+    let hello_reply = sysa::ipc::recv_envelope(&mut framed)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("System A closed the connection during hello"))?;
+    if hello_reply.method != "manager.hello.result" {
+        anyhow::bail!(
+            "unexpected reply '{}' to manager.hello",
+            hello_reply.method
+        );
+    }
+
     let req = sysa::ipc::make_envelope(
         request_id,
         "system-sysi",
@@ -67,13 +95,15 @@ where
         req,
     )?;
     sysa::ipc::send_envelope(&mut framed, &req).await?;
-    let reply = sysa::ipc::recv_envelope(&mut framed)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("System A closed the connection"))?;
-    if reply.method != format!("{method}.result") {
-        anyhow::bail!("unexpected reply '{}' to {method}", reply.method);
+    loop {
+        let reply = sysa::ipc::recv_envelope(&mut framed)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("System A closed the connection"))?;
+        if reply.method == format!("{method}.result") {
+            return Ok(Res::decode(reply.payload.as_slice())?);
+        }
+        // Otherwise it is a pushed event envelope; keep waiting.
     }
-    Ok(Res::decode(reply.payload.as_slice())?)
 }
 
 struct Spawned {
@@ -365,7 +395,9 @@ async fn control_phase(
     }
 
     let deadline = tokio::time::Instant::now() + ready_timeout;
-    let sock_path = sysa::paths::instance().ipc_socket_path.to_string();
+    // Control-plane RPCs live on the control socket; the allocator socket is
+    // pure workload (worker/finder/staging traffic only).
+    let sock_path = sysa::paths::instance().control_socket_path.to_string();
     let mut exchange = Box::pin(async {
         // Trigger daemon-reload: System A spawns System F which discovers
         // and commits all unit files.  This replaces the old one-shot
@@ -383,8 +415,9 @@ async fn control_phase(
         }
         info!("Control phase: daemon-reload complete");
 
-        // One request per connection: the allocator server closes the
-        // connection after replying to a single envelope.
+        // One request per connection: each `manager_call` drops its control
+        // session after the reply, like `systemctl`'s one-call-per-connection
+        // model.
         let list = manager_call::<ListUnitsRequest, ListUnitsResult>(
             &sock_path,
             1,
