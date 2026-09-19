@@ -1,26 +1,21 @@
-//! On-demand synthesis of `.power` unit definitions (`unit.define`).
+//! On-demand synthesis of `.power` unit definitions.
 //!
-//! `.power` units have no unit file on disk: they are materialized by System
-//! P from the unit name alone (e.g. `poweroff.power` → the `poweroff`
-//! transition).  When System A references such a unit before it has ever
-//! been loaded (typically through a `SuccessAction=` — `systemd-poweroff
-//! .service` carries `SuccessAction=poweroff-force`, which the System A
-//! scheduler turns into a `start` of `poweroff.power`), it asks the worker
-//! that owns the `power` type through the `unit.define` protocol.  This
-//! module answers that protocol, exactly like System R does for slice
-//! parent chains.
+//! `.power` units have no unit file on disk: they are materialized from the
+//! unit name alone (e.g. `poweroff.power` → the `poweroff` transition).
+//! Previously System P answered System A's `unit.define` protocol for these;
+//! now that System P is a library, System A calls
+//! [`synthesize_power_definitions`] directly and embeds the definitions into
+//! its unit graph without any worker round-trip.
 
 use std::collections::HashMap;
 
-use sysa::proto::{UnitDefineRequest, UnitDefineResult};
-use sysa::worker_ipc::EventPublisher;
-use systema_sysf::ir::{UnitIR, UnitType};
-use tracing::{debug, warn};
-use prost::Message as ProstMessage;
+use tracing::debug;
 
 use crate::controller::PowerAction;
+use crate::UnitIR;
+use crate::UnitType;
 
-/// The description systemd uses for the given power action (best effort).
+/// The description used for the given power action (best effort).
 fn power_description(action: PowerAction) -> String {
     match action {
         PowerAction::Poweroff => "System Power Off".to_string(),
@@ -59,11 +54,10 @@ fn power_unit_ir(unit_name: &str) -> Option<UnitIR> {
 
 /// Synthesize the definitions of every requested `.power` unit name.
 ///
-/// Returns `None` when any of the requested names is not a legal `.power`
-/// unit ("poweroff", "reboot", "halt", "kexec", "suspend", "hibernate" plus
-/// the `.power` suffix, optionally followed by `.power` — e.g. the
-/// `SuccessAction=`-derived `poweroff.power`) — mirroring System R, which
-/// refuses non-slice names.
+/// Returns `None` when **any** requested name is not a legal `.power` unit
+/// ("poweroff", "reboot", "halt", "kexec", "suspend", "hibernate"; the
+/// `.power` suffix is optional).  This mirrors the old worker behaviour of
+/// refusing a whole `unit.define` batch when a single name is invalid.
 pub fn synthesize_power_definitions(unit_names: &[String]) -> Option<HashMap<String, UnitIR>> {
     if unit_names.is_empty() || unit_names.iter().any(|n| n.is_empty()) {
         return None;
@@ -73,79 +67,17 @@ pub fn synthesize_power_definitions(unit_names: &[String]) -> Option<HashMap<Str
         let ir = power_unit_ir(name)?;
         units.insert(ir.id.clone(), ir);
     }
-    Some(units)
-}
-
-/// Handle a `unit.define` request (echoing on the same `request_id` with a
-/// `unit.define_result`).  This is the System P half of the on-demand
-/// materialization protocol: `.power` units have no on-disk definition, so
-/// every legal `.power` name is answered from the name alone.
-pub fn handle_unit_define(env: &sysa::proto::Envelope, event_pub: &EventPublisher) {
-    let req = match UnitDefineRequest::decode(env.payload.as_slice()) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Cannot decode UnitDefineRequest: {e}");
-            return;
-        }
-    };
-
-    let units = match synthesize_power_definitions(&req.unit_names) {
-        Some(u) => u,
-        None => {
-            warn!("unit.define refused for non-power units: {:?}", req.unit_names);
-            event_pub.send_reply(
-                env.request_id,
-                "unit.define_result",
-                UnitDefineResult {
-                    success: false,
-                    error: format!(
-                        "cannot synthesize definitions for non-power units: {:?}",
-                        req.unit_names
-                    ),
-                    units_json: vec![],
-                },
-            );
-            return;
-        }
-    };
-
-    let units_json = match serde_json::to_vec(&units) {
-        Ok(json) => json,
-        Err(e) => {
-            warn!("Cannot serialise synthesized power definitions: {e}");
-            event_pub.send_reply(
-                env.request_id,
-                "unit.define_result",
-                UnitDefineResult {
-                    success: false,
-                    error: format!("cannot serialise synthesized definitions: {e}"),
-                    units_json: vec![],
-                },
-            );
-            return;
-        }
-    };
-
     debug!(
-        "unit.define answered: {} definition(s) for {:?}",
+        "synthesized {} built-in .power unit definition(s): {:?}",
         units.len(),
-        req.unit_names
+        unit_names
     );
-    event_pub.send_reply(
-        env.request_id,
-        "unit.define_result",
-        UnitDefineResult {
-            success: true,
-            error: String::new(),
-            units_json,
-        },
-    );
+    Some(units)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn synthesizes_poweroff_unit() {

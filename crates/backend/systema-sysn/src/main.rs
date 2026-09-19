@@ -60,7 +60,10 @@ async fn main() -> Result<()> {
 
     info!("System N (System Notify Worker) starting up");
 
-    ipc::run().await?;
+    tokio::select! {
+        result = ipc::run() => result?,
+        _sig = sysa::signals::shutdown_signal() => {}
+    }
 
     Ok(())
 }

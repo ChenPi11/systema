@@ -51,5 +51,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("System R (System Resource Worker) starting up");
 
-    systema_sysr::ipc::run().await
+    tokio::select! {
+        result = systema_sysr::ipc::run() => result?,
+        _sig = sysa::signals::shutdown_signal() => {}
+    }
+
+    Ok(())
 }

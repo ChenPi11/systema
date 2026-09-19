@@ -103,8 +103,16 @@ async fn main() -> Result<()> {
     // the process lifetime.
     tokio::spawn(events::run(allocator.clone()));
 
-    // Wait for the IPC server (runs until killed).
-    ipc_handle.await??;
+    // Wait for the IPC server, or a graceful-shutdown request (SIGTERM from
+    // System Init during a power transition, or an interactive SIGINT).  On a
+    // signal we unwind the runtime so sockets and sessions are dropped
+    // cleanly.
+    tokio::select! {
+        result = ipc_handle => {
+            result??;
+        }
+        _sig = sysa::signals::shutdown_signal() => {}
+    }
 
     Ok(())
 }

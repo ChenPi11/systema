@@ -41,8 +41,16 @@ async fn main() -> Result<()> {
         .init();
 
     // Reconnect loop: keep serving D-Bus across control-session restarts.
+    // A SIGTERM/SIGINT request (from System Init or a console) ends it.
     loop {
-        match bridge::run().await {
+        let result = tokio::select! {
+            biased;
+            _sig = sysa::signals::shutdown_signal() => {
+                break;
+            }
+            result = bridge::run() => result,
+        };
+        match result {
             Ok(()) => {
                 tracing::info!("Bridge exited cleanly; reconnecting");
             }
@@ -52,4 +60,6 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+
+    Ok(())
 }

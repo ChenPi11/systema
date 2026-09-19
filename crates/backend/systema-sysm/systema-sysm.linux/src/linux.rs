@@ -56,7 +56,10 @@ pub async fn run() -> Result<()> {
 
     info!("System M (System Mount Worker for Linux) starting up");
 
-    ipc::run().await?;
+    tokio::select! {
+        result = ipc::run() => result?,
+        _sig = sysa::signals::shutdown_signal() => {}
+    }
 
     Ok(())
 }

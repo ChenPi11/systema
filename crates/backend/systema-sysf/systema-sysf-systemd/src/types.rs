@@ -711,6 +711,23 @@ impl StartLimitAction {
             StartLimitAction::Exit => "exit",
         }
     }
+
+    /// Return the `.power` unit name whose start performs this transition,
+    /// or `None` for actions that map to no power unit (`None`, `Exit`).
+    ///
+    /// Like [`SuccessAction::power_unit_name`], this funnels every
+    /// start-rate-limit outage through the same `.power` dispatch path as
+    /// `SuccessAction=` and direct unit starts, so System Init (which owns
+    /// `libsystema-sysp`) is the sole executor of system transitions.
+    pub fn power_unit_name(&self) -> Option<&'static str> {
+        match self {
+            StartLimitAction::Reboot
+            | StartLimitAction::RebootForce
+            | StartLimitAction::RebootImmediate => Some("reboot.power"),
+            StartLimitAction::Poweroff => Some("poweroff.power"),
+            StartLimitAction::None | StartLimitAction::Exit => None,
+        }
+    }
 }
 
 impl From<&str> for StartLimitAction {

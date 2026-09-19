@@ -223,6 +223,104 @@ async fn shutdown(procs: &[Spawned], code: i32, grace: Duration) -> i32 {
     code
 }
 
+/// Ordered graceful shutdown driven by a `POWER=` notify datagram.
+///
+/// Consumes the datagram System A sends when a `.power` unit starts.  The
+/// sequence mirrors PID 1 semantics:
+///
+/// 1. SIGTERM every supervised worker and wait (up to `grace`) for each to
+///    be reaped, SIGKILLing stragglers.
+/// 2. SIGTERM System A last, so the allocator keeps reporting state while
+///    the system is draining, and wait for it as well.
+/// 3. Execute the transition **in-process** through
+///    `libsystema-sysp` (System P is now a library, not a worker).
+///    Terminal transitions never return from this call.
+///
+/// Returns the code `SysAInit` should exit with; `Err` means the drain or
+/// the transition failed (logged by the caller).
+async fn power_down(
+    procs: &[Spawned],
+    grace: Duration,
+    action: &str,
+    reaper_rx: &mut mpsc::UnboundedReceiver<ReaperEvent>,
+) -> Result<i32> {
+    let power_action =
+        systema_sysp::PowerAction::from_unit_name(action).ok_or_else(|| {
+            anyhow::anyhow!("System Init received an unknown power action: {action:?}")
+        })?;
+
+    // Phase 1: stop every supervised worker (everything except System A).
+    let workers: Vec<&Spawned> = procs.iter().filter(|p| p.name != "sysa").collect();
+    let mut reaped: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + grace;
+    info!(
+        "Power transition '{power_action}': stopping {} worker(s) gracefully",
+        workers.len()
+    );
+    for p in &workers {
+        let _ = kill(Pid::from_raw(p.pid), Signal::SIGTERM);
+    }
+    while reaped.len() < workers.len() && tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            Some((pid, _status)) = reaper_rx.recv() => {
+                reaped.insert(pid);
+            }
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+    for p in &workers {
+        if !reaped.contains(&p.pid) {
+            warn!(
+                "Worker {} (pid={}) did not exit in time; SIGKILL",
+                p.name, p.pid
+            );
+            let _ = kill(Pid::from_raw(p.pid), Signal::SIGKILL);
+        }
+    }
+
+    // Phase 2: stop System A last.
+    let allocator: Vec<&Spawned> = procs.iter().filter(|p| p.name == "sysa").collect();
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut allocator_reaped = 0;
+    info!("Power transition '{power_action}': stopping System A gracefully");
+    for p in &allocator {
+        let _ = kill(Pid::from_raw(p.pid), Signal::SIGTERM);
+    }
+    while allocator_reaped < allocator.len() && tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            Some((pid, _status)) = reaper_rx.recv() => {
+                if allocator.iter().any(|p| p.pid == pid) {
+                    allocator_reaped += 1;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+    for p in &allocator {
+        if !reaped.contains(&p.pid) {
+            warn!(
+                "System A (pid={}) did not exit in time; SIGKILL",
+                p.pid
+            );
+            let _ = kill(Pid::from_raw(p.pid), Signal::SIGKILL);
+        }
+    }
+
+    // Phase 3: the transition itself, in-process through libsystema-sysp.
+    info!(
+        "Power transition '{power_action}': executing in-process (libsystema-sysp)"
+    );
+    systema_sysp::execute_action(power_action)?;
+    // Terminal transitions never return.  Reaching this point means a
+    // resumable transition (suspend/hibernate) completed and the machine
+    // came back; the supervisors are already gone, so the best we can do is
+    // log prominently and exit.
+    warn!(
+        "Power transition '{power_action}' returned after the drain; supervisors have exited (reboot the machine manually)"
+    );
+    Ok(0)
+}
+
 /// Parse a notify datagram into its `key=value` lines.
 fn parse_notify(body: &str) -> HashMap<String, String> {
     let mut kv = HashMap::new();
@@ -640,6 +738,7 @@ pub async fn run(
 
     // --- Steady state. ---
     let code = loop {
+        let mut power_requested: Option<String> = None;
         tokio::select! {
             _ = ctx.terminate.recv() => {
                 info!("SIGTERM received; shutting down");
@@ -659,6 +758,21 @@ pub async fn run(
                 bootlog.push(body);
                 for (key, value) in &kv {
                     info!("notify: {key}={value}");
+                }
+                // System A dispatches `.power` unit starts as `POWER=<action>`
+                // datagrams.  The ordered shutdown (drain workers, then
+                // allocator, then the in-process libsystema-sysp transition)
+                // runs outside the select, where `ctx.reaper_rx` is free to
+                // be borrowed again.
+                power_requested = kv.get("POWER").cloned();
+            }
+        }
+        if let Some(action) = power_requested {
+            match power_down(&procs, grace, &action, &mut ctx.reaper_rx).await {
+                Ok(code) => break code,
+                Err(e) => {
+                    error!("Power transition '{action}' aborted: {e:#}");
+                    break 1;
                 }
             }
         }

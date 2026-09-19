@@ -1706,6 +1706,28 @@ SuccessAction=poweroff-force
     }
 
     #[test]
+    fn test_start_limit_action_power_unit_mapping() {
+        // StartLimitAction= transitions funnel through the same `.power`
+        // dispatch path as SuccessAction= (System Init executes them via
+        // libsystema-sysp).
+        assert_eq!(StartLimitAction::Reboot.power_unit_name(), Some("reboot.power"));
+        assert_eq!(
+            StartLimitAction::RebootForce.power_unit_name(),
+            Some("reboot.power")
+        );
+        assert_eq!(
+            StartLimitAction::RebootImmediate.power_unit_name(),
+            Some("reboot.power")
+        );
+        assert_eq!(
+            StartLimitAction::Poweroff.power_unit_name(),
+            Some("poweroff.power")
+        );
+        assert_eq!(StartLimitAction::None.power_unit_name(), None);
+        assert_eq!(StartLimitAction::Exit.power_unit_name(), None);
+    }
+
+    #[test]
     fn test_exec_start_empty_clears_list() {
         // An empty ExecStart= should have no entries (configparser drops the key).
         let content = "[Service]\nExecStart=/usr/bin/foo\nExecStart=\n";

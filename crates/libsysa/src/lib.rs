@@ -13,6 +13,7 @@ pub mod l10n;
 pub mod logging;
 pub mod notify;
 pub mod paths;
+pub mod signals;
 pub mod staging_admin;
 pub mod unit_name;
 pub mod unitstate_admin;

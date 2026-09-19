@@ -15,7 +15,7 @@ use anyhow::{bail, Result};
 use prost::Message;
 use sysa::l10n;
 use tokio::task::AbortHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::state::{
     generate_invocation_id, next_job_id, next_request_id, next_task_id, AllocatorHandle,
@@ -334,6 +334,45 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
         return Ok(());
     }
 
+    // 2a. `.power` units are materialized by System P in-process
+    // (`libsystema-sysp`, linked into System Init) — no worker owns the
+    // `power` type anymore.  Synthesize their definitions directly and
+    // commit them through the same merge as the unit.define path.
+    let (power_names, mut rest): (Vec<String>, Vec<String>) = dynamic
+        .into_iter()
+        .partition(|n| n.ends_with(".power"));
+    if !power_names.is_empty() {
+        match systema_sysp::synthesize_power_definitions(&power_names) {
+            Some(units) => {
+                let (created, updated) = {
+                    let mut state = allocator.write();
+                    state.merge_units(&units).map_err(anyhow::Error::msg)?
+                };
+                // Newly materialized units must also receive
+                // DefaultDependencies= (After=sysinit.target & co.).
+                crate::unit::loader::inject_default_dependencies(allocator.clone());
+                info!(
+                    "System P (in-process): committed {created} new, {updated} updated .power unit(s)"
+                );
+            }
+            None => {
+                // An illegal `.power` name (e.g. `evil.power`) stays missing
+                // so the plan fails with UnitNotFound below.  It is folded
+                // into the general grouping, which errors out for the now
+                // worker-less `power` type.
+                warn!(
+                    "Cannot materialize .power definitions for {:?}; leaving them missing",
+                    power_names
+                );
+                rest.extend(power_names);
+            }
+        }
+    }
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let dynamic = rest;
+
     // 2. Group the remaining (dynamic) units by the worker that owns their
     // unit type.  Only workers that declared `unit.define` support
     // (WorkerRegistration.supports_unit_define) are asked; a worker that
@@ -456,6 +495,164 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
     Ok(())
 }
 
+/// Dispatch one `power`-type unit step by forwarding it to System Init.
+///
+/// System P is a library linked into System Init and deliberately registers
+/// no `power` worker with System A.  The whole contract is one datagram on
+/// the Init notify socket: `POWER=<short-action>`.  The step job is
+/// recorded as Running, completes as Done as soon as the datagram is handed
+/// to the kernel (for terminal transitions the machine goes down before any
+/// reply could matter), and the unit state flips to `active`.  On send
+/// failure the request's jobs are cancelled and the root completes Failed.
+async fn dispatch_power_step(
+    allocator: AllocatorHandle,
+    name: &str,
+    step_kind: JobKind,
+    job_id: u64,
+    primary_job_id: u64,
+    root_name: &str,
+    created_job_ids: &[(u64, String)],
+) -> Result<()> {
+    // A `.power` unit's transition is only ever *started*.  Stopping or
+    // reloading one is a no-op: resolving the job as Done without touching
+    // the system mirrors how the synthetic unit simply disappears.
+    if !matches!(step_kind, JobKind::Start | JobKind::Restart) {
+        let mut state = allocator.write();
+        if let Some(job) = state.jobs.get_mut(&job_id) {
+            job.status = JobStatus::Done;
+        }
+        if let Some(ref tx) = state.job_completion_tx {
+            let _ = tx.send(JobCompletion {
+                job_id,
+                unit_name: name.to_string(),
+                result: JobResultKind::Done,
+            });
+        }
+        return Ok(());
+    }
+
+    let Some(action) = systema_sysp::PowerAction::from_unit_name(name) else {
+        let err = l10n::fmt(
+            l10n::t_("Unit '{name}' is not a valid .power transition; cannot execute it."),
+            &[("name", name)],
+        );
+        warn!("{}", err);
+        cancel_request_jobs(&allocator, created_job_ids, primary_job_id, root_name);
+        bail!("{}", err);
+    };
+
+    let invocation_id = match step_kind {
+        JobKind::Start | JobKind::Restart => Some(generate_invocation_id()),
+        _ => None,
+    };
+    {
+        let mut state = allocator.write();
+        if let Some(ref inv_id) = invocation_id {
+            state.invocation_ids.insert(name.to_string(), inv_id.clone());
+        }
+        state.jobs.insert(
+            job_id,
+            Job {
+                id: job_id,
+                unit_name: name.to_string(),
+                kind: step_kind,
+                status: JobStatus::Running,
+                timeout_abort: None,
+            },
+        );
+    }
+    emit_job_new_after_lock(allocator.clone(), job_id, name, step_kind);
+
+    // The notify listener System Init binds before spawning anything
+    // (<notify-dir>/init.sock); a datagram there is how workers and the
+    // allocator report readiness, and how power transitions are requested.
+    let sock_path =
+        std::path::PathBuf::from(sysa::paths::instance().notify_dir.as_str()).join("init.sock");
+    let payload = format!("POWER={action}\n");
+    let delivered = match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(sock) => match sock.send_to(payload.as_bytes(), &sock_path) {
+            Ok(_) => true,
+            Err(e) => {
+                error!(
+                    "Cannot forward power transition '{action}' to System Init ({}): {e}",
+                    sock_path.display()
+                );
+                false
+            }
+        },
+        Err(e) => {
+            error!("Cannot create notify datagram socket: {e}");
+            false
+        }
+    };
+
+    if delivered {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let mut state = allocator.write();
+        if let Some(job) = state.jobs.get_mut(&job_id) {
+            job.status = JobStatus::Done;
+        }
+        let entry = state.unit_states.entry(name.to_string()).or_default();
+        if entry.active_state != "active" {
+            let inv = invocation_id.clone().unwrap_or_default();
+            entry.active_state = "active".to_string();
+            entry.sub_state.clear();
+            entry.invocation_id = inv;
+            entry.active_enter_timestamp = now;
+        }
+        if let Some(ref tx) = state.job_completion_tx {
+            let _ = tx.send(JobCompletion {
+                job_id,
+                unit_name: name.to_string(),
+                result: JobResultKind::Done,
+            });
+        }
+        info!(
+            "Forwarded power transition '{action}' (unit {}) to System Init",
+            name
+        );
+    } else {
+        let err = l10n::fmt(
+            l10n::t_(
+                "Cannot forward power transition for '{name}' to System Init (notify socket unreachable)."
+            ),
+            &[("name", name)],
+        );
+        warn!("{}", err);
+        cancel_request_jobs(&allocator, created_job_ids, primary_job_id, root_name);
+        bail!("{}", err);
+    }
+
+    Ok(())
+}
+
+/// Cancel every job created for a request and complete the root as Failed.
+/// Mirrors the `No worker registered` error path in [`enqueue_job`].
+fn cancel_request_jobs(
+    allocator: &AllocatorHandle,
+    created_job_ids: &[(u64, String)],
+    primary_job_id: u64,
+    root_name: &str,
+) {
+    let mut state = allocator.write();
+    for (jid, _) in created_job_ids {
+        if let Some(job) = state.jobs.get_mut(jid) {
+            job.status = JobStatus::Cancelled;
+        }
+        state.serial_completion_txs.remove(jid);
+    }
+    if let Some(ref tx) = state.job_completion_tx {
+        let _ = tx.send(JobCompletion {
+            job_id: primary_job_id,
+            unit_name: root_name.to_string(),
+            result: JobResultKind::Failed,
+        });
+    }
+}
+
 /// Core job enqueueing logic.
 pub async fn enqueue_job(
     allocator: AllocatorHandle,
@@ -557,6 +754,8 @@ pub async fn enqueue_job(
                     .worker_type()
                     .to_string()
             });
+        // `power` is served by the in-process System P worker registered by
+        // `systema-sysp` at startup, so the ordinary worker lookup handles it.
         let has_worker = state
             .workers
             .values()
@@ -691,7 +890,7 @@ pub async fn enqueue_job(
                 "Start rate limit exceeded for {} (interval={}s burst={}), refusing to start",
                 unit_name, interval_sec, burst
             );
-            execute_start_limit_action(&action, unit_name);
+            execute_start_limit_action(allocator.clone(), &action, unit_name).await;
             bail!("{}", l10n::fmt(l10n::t_("Start rate limit exceeded for {unit_name} (interval={interval_sec}s burst={burst})."), &[
                 ("unit_name", unit_name),
                 ("interval_sec", &interval_sec.to_string()),
@@ -820,7 +1019,7 @@ pub async fn enqueue_job(
                         unit_name,
                         attempts + 1
                     );
-                    request_unit_definition(allocator.clone(), &[name.clone()]).await?;
+                    request_unit_definition(allocator.clone(), std::slice::from_ref(&name)).await?;
                     attempts += 1;
                 }
                 Err(e) => {
@@ -1008,6 +1207,27 @@ pub async fn enqueue_job(
                 unit_type,
             )
         };
+
+        // --- Power transitions run in System Init, not in a remote worker:
+        // System P is now a library (`libsystema-sysp`) linked into System
+        // Init, which registers no `power` worker.  Every `power`-type step
+        // is forwarded to the Init notify listener as `POWER=<action>`, and
+        // the job completes immediately (fire-and-forget: for terminal
+        // transitions the kernel takes the machine down before any reply
+        // could matter).  `task_id` above was reserved but never used.
+        if unit_type == "power" {
+            dispatch_power_step(
+                allocator.clone(),
+                name,
+                step_kind,
+                job_id,
+                primary_job_id,
+                unit_name,
+                &created_job_ids[..],
+            )
+            .await?;
+            continue;
+        }
 
         let (worker_envelope_tx, task_id) = match (worker_chan, task_id) {
             (Some(tx), tid) => (tx, tid),
@@ -2091,33 +2311,41 @@ pub fn schedule_automatic_restart(allocator: AllocatorHandle, unit_name: &str) {
 
 /// Execute the `StartLimitAction=` configured for a unit whose start rate
 /// limit was exceeded (mirrors systemd's `unit_start_limit_action()`).
-fn execute_start_limit_action(action: &StartLimitAction, unit_name: &str) {
-    match action {
-        StartLimitAction::None => {}
-        StartLimitAction::Reboot
-        | StartLimitAction::RebootForce
-        | StartLimitAction::RebootImmediate => {
+///
+/// Every transition is dispatched as a `.power` unit start — the same
+/// single path used by `SuccessAction=` and direct unit starts — so System
+/// Init (which owns `libsystema-sysp`) is the sole executor of system
+/// transitions.  Previously this shelled out to the external `shutdown(8)`.
+async fn execute_start_limit_action(
+    allocator: AllocatorHandle,
+    action: &StartLimitAction,
+    unit_name: &str,
+) {
+    match action.power_unit_name() {
+        Some(power_unit) => {
             warn!(
-                "StartLimitAction={:?} for {}: rebooting system",
+                "StartLimitAction={:?} for {}: dispatching {} transition",
+                action, unit_name, power_unit
+            );
+            // Dispatched on a detached task: this runs from inside
+            // `enqueue_job` for the rate-limited unit, and routing the
+            // transition through `enqueue_job` again must not create an
+            // async recursion cycle.
+            let alloc = allocator.clone();
+            tokio::spawn(async move {
+                if let Err(e) = enqueue_job(alloc, power_unit, JobKind::Start, JobMode::Replace)
+                    .await
+                {
+                    warn!(
+                        "Failed to dispatch StartLimitAction transition {power_unit}: {e}"
+                    );
+                }
+            });
+        }
+        None => {
+            warn!(
+                "StartLimitAction={:?} for {} (no-op, logging only)",
                 action, unit_name
-            );
-            let _ = std::process::Command::new("shutdown")
-                .args(["-r", "now", "StartLimitAction triggered by systema"])
-                .spawn();
-        }
-        StartLimitAction::Poweroff => {
-            warn!(
-                "StartLimitAction=poweroff for {}: powering off system",
-                unit_name
-            );
-            let _ = std::process::Command::new("shutdown")
-                .args(["-P", "now", "StartLimitAction triggered by systema"])
-                .spawn();
-        }
-        StartLimitAction::Exit => {
-            warn!(
-                "StartLimitAction=exit for {} (no-op, logging only)",
-                unit_name
             );
         }
     }
@@ -4119,6 +4347,42 @@ mod tests {
             "no unit.define request may be pending"
         );
         assert!(!state.units.contains_key("no-such-unit-42.service"));
+    }
+
+    #[tokio::test]
+    async fn test_request_unit_definition_materializes_power_units_in_process() {
+        // System P is now a library: `.power` units are synthesized by
+        // System A in-process (`libsystema-sysp`), with no worker owning
+        // the `power` type.  A legal transition name must land in the unit
+        // graph as a dynamic power unit.
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        request_unit_definition(alloc.clone(), &["poweroff.power".to_string()])
+            .await
+            .expect("a legal .power unit must materialize in-process");
+        let state = alloc.read();
+        let uf = state.units.get("poweroff.power").expect("unit in graph");
+        assert_eq!(uf.kind.worker_type(), "power");
+        assert_eq!(
+            uf.unit.description.as_str(),
+            "System Power Off",
+            "definition comes from the library, not a worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_unit_definition_refuses_bad_power_name() {
+        // An illegal `.power` name has no definition source: it stays
+        // missing and the request fails (no worker exists for the type).
+        let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        let err = request_unit_definition(alloc.clone(), &["evil.power".to_string()])
+            .await
+            .expect_err("an illegal .power name must fail");
+        assert!(
+            err.to_string().contains("power"),
+            "error must mention the power type: {}",
+            err
+        );
+        assert!(!alloc.read().units.contains_key("evil.power"));
     }
 
     // =========================================================================

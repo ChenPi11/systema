@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 sysa = { path = "../../libsysa" }
+systema-sysp = { path = "../systema-sysp" }
 
 tokio.workspace = true
 anyhow.workspace = true
