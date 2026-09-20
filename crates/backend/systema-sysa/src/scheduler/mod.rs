@@ -334,44 +334,13 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
         return Ok(());
     }
 
-    // 2a. `.power` units are materialized by System P in-process
-    // (`libsystema-sysp`, linked into System Init) — no worker owns the
-    // `power` type anymore.  Synthesize their definitions directly and
-    // commit them through the same merge as the unit.define path.
-    let (power_names, mut rest): (Vec<String>, Vec<String>) = dynamic
-        .into_iter()
-        .partition(|n| n.ends_with(".power"));
-    if !power_names.is_empty() {
-        match systema_sysp::synthesize_power_definitions(&power_names) {
-            Some(units) => {
-                let (created, updated) = {
-                    let mut state = allocator.write();
-                    state.merge_units(&units).map_err(anyhow::Error::msg)?
-                };
-                // Newly materialized units must also receive
-                // DefaultDependencies= (After=sysinit.target & co.).
-                crate::unit::loader::inject_default_dependencies(allocator.clone());
-                info!(
-                    "System P (in-process): committed {created} new, {updated} updated .power unit(s)"
-                );
-            }
-            None => {
-                // An illegal `.power` name (e.g. `evil.power`) stays missing
-                // so the plan fails with UnitNotFound below.  It is folded
-                // into the general grouping, which errors out for the now
-                // worker-less `power` type.
-                warn!(
-                    "Cannot materialize .power definitions for {:?}; leaving them missing",
-                    power_names
-                );
-                rest.extend(power_names);
-            }
-        }
-    }
-    if rest.is_empty() {
-        return Ok(());
-    }
-    let dynamic = rest;
+    // 2a. `.power` units need no on-demand materialization here: System Init
+    // owns the `power` unit type and registers every `.power` definition
+    // (poweroff.power, reboot.power, ...) with System A during its control
+    // phase via `manager.register_power_units`, so they are already in the
+    // graph.  A `.power` name that is *not* registered (e.g. `evil.power`)
+    // falls through to the general grouping below and fails with "No worker
+    // available for unit type 'power'".
 
     // 2. Group the remaining (dynamic) units by the worker that owns their
     // unit type.  Only workers that declared `unit.define` support
@@ -497,13 +466,16 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
 
 /// Dispatch one `power`-type unit step by forwarding it to System Init.
 ///
-/// System P is a library linked into System Init and deliberately registers
-/// no `power` worker with System A.  The whole contract is one datagram on
-/// the Init notify socket: `POWER=<short-action>`.  The step job is
-/// recorded as Running, completes as Done as soon as the datagram is handed
-/// to the kernel (for terminal transitions the machine goes down before any
-/// reply could matter), and the unit state flips to `active`.  On send
-/// failure the request's jobs are cancelled and the root completes Failed.
+/// The `power` unit type belongs to System Init, which registers every
+/// `.power` definition at boot via `manager.register_power_units`; no worker
+/// ever registers `power` with System A.  The whole execution contract is
+/// one datagram on the Init notify socket: `POWER=<short-action>`.  The step
+/// job is recorded as Running, completes as Done as soon as the datagram is
+/// handed to the kernel (for terminal transitions the machine goes down
+/// before any reply could matter), and the unit state flips to `active`.  On
+/// send failure the request's jobs are cancelled and the root completes
+/// Failed.  The short action is the unit name minus its `.power` suffix;
+/// System Init is the authority on the vocabulary.
 async fn dispatch_power_step(
     allocator: AllocatorHandle,
     name: &str,
@@ -531,7 +503,7 @@ async fn dispatch_power_step(
         return Ok(());
     }
 
-    let Some(action) = systema_sysp::PowerAction::from_unit_name(name) else {
+    let Some(action) = name.strip_suffix(".power") else {
         let err = l10n::fmt(
             l10n::t_("Unit '{name}' is not a valid .power transition; cannot execute it."),
             &[("name", name)],
@@ -754,12 +726,15 @@ pub async fn enqueue_job(
                     .worker_type()
                     .to_string()
             });
-        // `power` is served by the in-process System P worker registered by
-        // `systema-sysp` at startup, so the ordinary worker lookup handles it.
-        let has_worker = state
-            .workers
-            .values()
-            .any(|w| w.unit_types.contains(&unit_type));
+        // The `power` unit type has no worker: it is owned by System Init,
+        // which registers every `.power` definition at boot and executes the
+        // transition in-process after System A forwards it over the notify
+        // datagram (`dispatch_power_step`).  Treat it as always served.
+        let has_worker = unit_type == "power"
+            || state
+                .workers
+                .values()
+                .any(|w| w.unit_types.contains(&unit_type));
         if !has_worker {
             bail!("{}", l10n::fmt(l10n::t_("No worker available for unit type '{unit_type}' (unit: {unit_name}). Cannot execute {kind:?} operation. Is the corresponding System Worker running?"), &[
                 ("unit_type", &unit_type),
@@ -1209,8 +1184,9 @@ pub async fn enqueue_job(
         };
 
         // --- Power transitions run in System Init, not in a remote worker:
-        // System P is now a library (`libsystema-sysp`) linked into System
-        // Init, which registers no `power` worker.  Every `power`-type step
+        // System Init owns the `power` unit type (it registers every
+        // `.power` definition at boot via `manager.register_power_units`)
+        // and executes the transition in-process.  Every `power`-type step
         // is forwarded to the Init notify listener as `POWER=<action>`, and
         // the job completes immediately (fire-and-forget: for terminal
         // transitions the kernel takes the machine down before any reply
@@ -1721,7 +1697,7 @@ pub fn handle_task_result(
                 // successfully (e.g. `systemd-poweroff.service` has
                 // `SuccessAction=poweroff-force`): the configured power
                 // transition is dispatched as a `.power` unit start, which
-                // routes to System P.
+                // routes to System Init (the owner of the `power` type).
                 if let Some(power_unit) = unit.unit.success_action.power_unit_name() {
                     info!(
                         "SuccessAction={} for {}: triggering {}",
@@ -2314,8 +2290,8 @@ pub fn schedule_automatic_restart(allocator: AllocatorHandle, unit_name: &str) {
 ///
 /// Every transition is dispatched as a `.power` unit start — the same
 /// single path used by `SuccessAction=` and direct unit starts — so System
-/// Init (which owns `libsystema-sysp`) is the sole executor of system
-/// transitions.  Previously this shelled out to the external `shutdown(8)`.
+/// Init is the sole executor of system transitions (it owns the whole
+/// `power` unit type and runs `reboot(2)` in-process).
 async fn execute_start_limit_action(
     allocator: AllocatorHandle,
     action: &StartLimitAction,
@@ -4350,23 +4326,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_unit_definition_materializes_power_units_in_process() {
-        // System P is now a library: `.power` units are synthesized by
-        // System A in-process (`libsystema-sysp`), with no worker owning
-        // the `power` type.  A legal transition name must land in the unit
-        // graph as a dynamic power unit.
+    async fn test_request_unit_definition_leaves_unregistered_power_missing() {
+        // The `power` unit type is owned by System Init, which registers
+        // every `.power` definition at boot over `manager.register_power_units`.
+        // `request_unit_definition` must NOT synthesize them itself: a legal
+        // name that was never registered stays missing and the request fails
+        // (no worker owns the `power` type).
         let alloc = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
-        request_unit_definition(alloc.clone(), &["poweroff.power".to_string()])
+        let err = request_unit_definition(alloc.clone(), &["poweroff.power".to_string()])
             .await
-            .expect("a legal .power unit must materialize in-process");
-        let state = alloc.read();
-        let uf = state.units.get("poweroff.power").expect("unit in graph");
-        assert_eq!(uf.kind.worker_type(), "power");
-        assert_eq!(
-            uf.unit.description.as_str(),
-            "System Power Off",
-            "definition comes from the library, not a worker"
+            .expect_err("an unregistered .power unit must stay missing");
+        assert!(
+            err.to_string().contains("power"),
+            "error must mention the power type: {}",
+            err
         );
+        assert!(!alloc.read().units.contains_key("poweroff.power"));
     }
 
     #[tokio::test]

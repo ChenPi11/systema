@@ -12,7 +12,6 @@ path = "src/main.rs"
 sysa = { path = "../../libsysa" }
 systema-sysf = { path = "../systema-sysf" }
 systema-sysf-systemd = { path = "../systema-sysf/systema-sysf-systemd" }
-systema-sysp = { path = "../systema-sysp" }
 
 tokio.workspace = true
 tokio-util.workspace = true

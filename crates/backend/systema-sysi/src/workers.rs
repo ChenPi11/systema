@@ -62,8 +62,8 @@ impl WorkerSpec {
 /// The default set of long-running processes.
 ///
 /// System M ships a dedicated `.linux` flavor and is dropped off Linux.
-/// System P is now a library (`libsystema-sysp`) linked into System Init and
-/// is no longer supervised as a worker process.
+/// System P has been removed: System Init manages the `power` unit type
+/// directly (in-process `reboot(2)`) and no `power` worker is supervised.
 fn default_workers() -> Vec<WorkerSpec> {
     vec![
         WorkerSpec::new(

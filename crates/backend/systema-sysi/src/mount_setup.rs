@@ -20,7 +20,7 @@ use std::ffi::CString;
 use std::fs;
 
 use anyhow::{anyhow, Context};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 // The nix mount API differs between Linux (mount/umount2/MsFlags) and the
 // BSDs (FreeBSD nmount/Nmount + unmount/MntFlags).  Platform-specific
@@ -57,8 +57,8 @@ mod imp {
     }
 
     /// Best-effort unmount of `path`.
-    pub fn do_unmount(path: &str) {
-        let _ = umount2(path, MntFlags::UMOUNT_NOFOLLOW);
+    pub fn do_unmount(path: &str) -> Result<(), Errno> {
+        umount2(path, MntFlags::UMOUNT_NOFOLLOW)
     }
 
     /// True when `e` is `EBUSY` (target already occupied by another fs).
@@ -109,8 +109,8 @@ mod imp {
     }
 
     /// Best-effort unmount of `path`.
-    pub fn do_unmount(path: &str) {
-        let _ = unmount(path, MntFlags::MNT_FORCE);
+    pub fn do_unmount(path: &str) -> Result<(), Errno> {
+        unmount(path, MntFlags::MNT_FORCE)
     }
 
     /// True when `e` is `EBUSY` (target already occupied by another fs).
@@ -196,7 +196,7 @@ fn mount_table_entry(
     let c_path = CString::new(path).expect("mount point path must not contain interior NUL");
     if unsafe { nix::libc::access(c_path.as_ptr(), nix::libc::W_OK) } != 0 {
         let err = std::io::Error::last_os_error();
-        imp::do_unmount(path);
+        let _ = imp::do_unmount(path);
         let _ = fs::remove_dir(path);
         return Err(anyhow!("{fstype} mount at {path} is not writable, undoing: {err}"));
     }
@@ -238,7 +238,7 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
     let c_cgroup = CString::new(CGROUP_PATH).expect("cgroup path must not contain interior NUL");
     if unsafe { nix::libc::access(c_cgroup.as_ptr(), nix::libc::W_OK) } != 0 {
         let err = std::io::Error::last_os_error();
-        imp::do_unmount(CGROUP_PATH);
+        let _ = imp::do_unmount(CGROUP_PATH);
         let _ = fs::remove_dir(CGROUP_PATH);
         return Err(anyhow!(
             "cgroup2 mount at {CGROUP_PATH} is not writable, undoing: {err}"
@@ -265,6 +265,30 @@ pub fn mount_dev_shm() -> anyhow::Result<()> {
 /// mounted by devtmpfs.  Never fatal.
 pub fn mount_dev_pts() -> anyhow::Result<()> {
     mount_table_entry("devpts", DEV_PTS_PATH, DEV_PTS_OPTIONS, imp::dev_pts_flags())
+}
+
+/// Unmount the runstatedir if it is a mount point.
+///
+/// Best-effort: logs the outcome but never returns an error (the caller
+/// continues regardless).  Only attempted when SysAInit has mount
+/// privileges (i.e. is root).
+pub fn umount_runstatedir(path: &str) {
+    if !has_mount_privileges() {
+        debug!("Running without mount privileges; not unmounting {path}");
+        return;
+    }
+    if !is_mount_point(path) {
+        debug!("{path} is not a mount point; nothing to unmount");
+        return;
+    }
+    match imp::do_unmount(path) {
+        Ok(()) => {
+            info!("Unmounted {path}");
+        }
+        Err(e) => {
+            error!("Failed to unmount {path}: {e}");
+        }
+    }
 }
 
 #[cfg(test)]

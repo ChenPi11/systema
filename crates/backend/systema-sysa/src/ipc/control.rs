@@ -33,10 +33,10 @@ use sysa::proto::{
     EnqueueJobRequest, EnqueueJobResult, GetUnitByInvocationRequest, GetUnitByPidRequest,
     GetUnitByPidResult, ListUnitsRequest, ListUnitsResult, LoadUnitRequest, LoadUnitResult,
     ManagerHelloRequest, ManagerHelloResult, ManagerValue, RefUnitRequest, RefUnitResult,
-    ResetFailedUnitRequest, SetUnitPropertiesRequest, SimpleManagerResult, StartUnitsRequest,
-    StartUnitsResult, StopUnitsRequest, StopUnitsResult, TransientProperty, TransientUnitRequest,
-    UnitInfo, UnitSnapshotRequest, UnitStartResult, UnitStateEntry, UnitStateEof,
-    UnitStateListRequest,
+    RegisterPowerUnitsRequest, RegisterPowerUnitsResult, ResetFailedUnitRequest,
+    SetUnitPropertiesRequest, SimpleManagerResult, StartUnitsRequest, StartUnitsResult,
+    StopUnitsRequest, StopUnitsResult, TransientProperty, TransientUnitRequest, UnitInfo,
+    UnitSnapshotRequest, UnitStartResult, UnitStateEntry, UnitStateEof, UnitStateListRequest,
 };
 
 use crate::scheduler::job_type::JobType;
@@ -493,6 +493,7 @@ async fn dispatch(
         "manager.start_units" => manager_start_units(allocator, env).await?,
         "manager.stop_units" => manager_stop_units(allocator, env).await?,
         "manager.daemon_reload" => manager_daemon_reload(allocator).await?,
+        "manager.register_power_units" => manager_register_power_units(allocator, env).await?,
         other => anyhow::bail!("unknown control method '{other}'"),
     };
     Ok(Some(reply))
@@ -1143,6 +1144,52 @@ async fn manager_daemon_reload(allocator: &AllocatorHandle) -> Result<Envelope> 
     )
 }
 
+/// `manager.register_power_units` — merge the built-in `.power` unit
+/// definitions supplied by System Init into the unit graph.
+///
+/// System Init owns the `power` unit type: it synthesizes the definitions
+/// (`poweroff.power`, `reboot.power`, ...) and pushes them over the control
+/// plane at boot.  System A merges them idempotently (the same path as the
+/// finder commit path) and injects DefaultDependencies=; the units then
+/// dispatch to System Init through `POWER=<action>` datagrams, so no
+/// `power` worker is ever registered.
+async fn manager_register_power_units(
+    allocator: &AllocatorHandle,
+    env: Envelope,
+) -> Result<Envelope> {
+    let req = RegisterPowerUnitsRequest::decode(env.payload.as_slice())
+        .context("bad manager.register_power_units")?;
+    let units: std::collections::HashMap<String, systema_sysf::ir::UnitIR> =
+        serde_json::from_slice(&req.units_json).context("bad power units JSON payload")?;
+    info!(
+        "manager.register_power_units: {} unit definition(s)",
+        units.len()
+    );
+    let (created, updated) = {
+        let mut state = allocator.write();
+        state.merge_units(&units).map_err(anyhow::Error::msg)?
+    };
+    // Newly materialized units must also receive DefaultDependencies=
+    // (After=sysinit.target & co.).
+    crate::unit::loader::inject_default_dependencies(allocator.clone());
+    let message = format!(
+        "registered {created} new, {updated} updated .power unit(s)"
+    );
+    info!("{}", message);
+    make_envelope(
+        next_request_id(),
+        "system-a",
+        "",
+        "manager.register_power_units.result",
+        RegisterPowerUnitsResult {
+            success: true,
+            message,
+            created: created as u32,
+            updated: updated as u32,
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1644,6 +1691,82 @@ use std::collections::{HashMap, HashSet};
         assert_eq!(unit.name, "foo.service");
         assert!(unit.enabled);
         assert_eq!(unit.unit_type, "service");
+    }
+
+    #[tokio::test]
+    async fn register_power_units_merges_into_graph() {
+        let allocator = test_allocator();
+        let units: HashMap<String, UnitIR> = [(
+            "poweroff.power".to_string(),
+            UnitIR {
+                id: "poweroff.power".to_string(),
+                unit_type: Some(UnitType::Power),
+                description: Some("System Power Off".to_string()),
+                source_format: None,
+                source_path: None,
+                aliases: Vec::new(),
+                slice: None,
+                dependencies: None,
+                service: None,
+                mount: None,
+                automount: None,
+                timer: None,
+                socket: None,
+                resource_control: None,
+                conditions: None,
+                asserts: None,
+                wanted_by: None,
+                required_by: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let mut state = allocator.write();
+        let (created, updated) = state
+            .merge_units(&units)
+            .map_err(|e| panic!("merge_units failed: {e}"))
+            .unwrap();
+        assert_eq!(created, 1);
+        assert_eq!(updated, 0);
+        let uf = state
+            .units
+            .get("poweroff.power")
+            .expect("unit in graph");
+        assert_eq!(uf.kind.worker_type(), "power");
+    }
+
+    #[tokio::test]
+    async fn register_power_units_rejects_bad_json() {
+        let allocator = test_allocator();
+        let env = req_env(
+            "manager.register_power_units",
+            RegisterPowerUnitsRequest {
+                units_json: b"not-json".to_vec(),
+            },
+        );
+        let err = dispatch(&allocator, env).await.expect_err("bad JSON must fail");
+        assert!(
+            err.to_string().contains("JSON"),
+            "error must describe the bad payload: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_power_units_bad_json_rejected() {
+        let allocator = test_allocator();
+        let env = req_env(
+            "manager.register_power_units",
+            RegisterPowerUnitsRequest {
+                units_json: b"not json".to_vec(),
+            },
+        );
+        let err = dispatch(&allocator, env).await.expect_err("bad JSON must fail");
+        assert!(
+            err.to_string().contains("JSON"),
+            "error must describe the bad payload: {}",
+            err
+        );
     }
 
     #[tokio::test]

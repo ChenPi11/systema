@@ -329,6 +329,30 @@ message DaemonReloadResult {
     string message = 2;
 }
 
+// Request from System Init to register the built-in `.power` unit
+// definitions (poweroff.power, reboot.power, halt.power, kexec.power,
+// suspend.power, hibernate.power) in System A's unit graph.
+//
+// System Init owns the `power` unit type: it synthesizes the definitions
+// and pushes them over the control plane at boot, so System A never needs
+// a `power` worker.  System A merges them idempotently (same path as the
+// finder commit) and injects DefaultDependencies=.
+message RegisterPowerUnitsRequest {
+    // JSON-serialized map of unit_id → UnitIR for every `.power` unit.
+    bytes units_json = 1;
+}
+
+// Response to RegisterPowerUnitsRequest.
+message RegisterPowerUnitsResult {
+    bool success = 1;
+    // Human-readable message (empty on success).
+    string message = 2;
+    // Units freshly created by the registration.
+    uint32 created = 3;
+    // Existing units updated by the registration.
+    uint32 updated = 4;
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Unit-state administration (root / systema-uid only)
 // ──────────────────────────────────────────────────────────────────

@@ -571,14 +571,13 @@ msgid   "System N — System Notify Worker"
 msgstr  "System T — 系统目标工作进程"
 #
 # File: ../crates/systema-sysk/src/main.rs, line: 24
-#, fuzzy
-msgid   "System P — System Power Worker (no-op shim)"
-msgstr  "System K — 系统套接字工作进程"
-#
-# File: ../crates/systema-sysk/src/main.rs, line: 24
-#, fuzzy
-msgid   "System P — System Power Worker (Linux)"
-msgstr  "System K — 系统套接字工作进程"
+# The `systema-sysp` worker crate no longer exists (System P was merged into
+# System Init as an in-process module); these msgids are obsolete and kept
+# only for msgmerge continuity.
+#~ msgid   "System P — System Power Worker (no-op shim)"
+#~ msgstr  ""
+#~ msgid   "System P — System Power Worker (Linux)"
+#~ msgstr  ""
 #
 # File: ../crates/systema-syss/src/ipc/mod.rs, line: 395
 #, fuzzy
@@ -640,6 +639,24 @@ msgstr  ""
 msgid   "Regex pattern(s) to match staging area name."
 msgstr  ""
 #
+# File: ../crates/frontend/systema-stagingctl/src/main.rs, line: 268
+#, rust-format
+msgid   "Staging areas for UID {uid}: {message}"
+msgstr  "UID {uid} 的暂存区：{message}"
+#
+# File: ../crates/frontend/systema-stagingctl/src/main.rs, line: 277
+#, rust-format
+msgid   "Commit failed: {message}"
+msgstr  "提交失败：{message}"
+#
+# File: ../crates/frontend/systema-stagingctl/src/main.rs, line: 311
+msgid   "Commit staging areas into the active unit set."
+msgstr  "将暂存区内容提交到活动 unit 集合。"
+#
+# File: ../crates/frontend/systema-stagingctl/src/main.rs, line: 314
+msgid   "Commit every staging area owned by this UID (default: 0)."
+msgstr  "提交此 UID 拥有的所有暂存区（默认：0）。"
+#
 # File: ../crates/systema-syss/src/ipc/mod.rs, line: 395
 # File: ../crates/frontend/systema-unitstatectl/src/main.rs, line: 57
 msgid   "Failed to parse unit state JSON."
@@ -663,6 +680,26 @@ msgstr  "共 {total} 个 unit。"
 msgid   "System A — Unit State Controller"
 msgstr  "System A — Unit 状态控制器"
 #
+#
+#
+# File: ../crates/frontend/systema-unitstatectl/src/main.rs, line: 33
+msgid   "List the System Allocator's cached unit state."
+msgstr  "列出 System Allocator 缓存的 unit 状态。"
+#
+# File: ../crates/frontend/systema-unitstatectl/src/main.rs, line: 38
+#, rust-format
+msgid   "Unit name; tried as an exact match first, otherwise treated as a regular expression."
+msgstr  "Unit 名称；先尝试精确匹配，失败则视为正则表达式。"
+#
+# File: ../crates/frontend/systema-unitstatectl/src/main.rs, line: 104
+#, rust-format
+msgid   "No unit's name matches '{name}' exactly, and '{name}' is not a valid regular expression."
+msgstr  "没有 unit 的名称恰好匹配 '{name}'，且 '{name}' 不是有效的正则表达式。"
+#
+# File: ../crates/frontend/systema-unitstatectl/src/main.rs, line: 152
+#, rust-format
+msgid   "No unit matches '{name}'."
+msgstr  "没有 unit 匹配 '{name}'。"
 #
 #
 # File: ../crates/systema-sysf/src/main.rs, line: 49

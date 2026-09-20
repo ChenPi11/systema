@@ -478,7 +478,7 @@ System A 从不实际发出该信号（见 1.3 节）。
 | `systemctl set-default / get-default` | ❌ | Set/GetDefaultTarget |
 | `systemctl set-environment / show-environment` | ❌ | SetEnvironment 等 |
 | `systemctl kill / freeze / thaw / clean` | ❌ | KillUnit / FreezeUnit 等 |
-| `systemctl reboot / poweroff / halt / kexec` | ❌ | Manager 方法（`POWER=` 数据报 → System Init 调 `libsystema-sysp.so`） |
+| `systemctl reboot / poweroff / halt / kexec` | ❌ | Manager 方法（`POWER=` 数据报 → System Init 在进程内用 `libc reboot(2)` 执行） |
 | `systemctl list-timers` | ❌ | Timer 接口 |
 | `systemd-analyze` | ❌ | Dump |
 | `journalctl` | ❌ | 无 journal 后端（journald 未实现） |

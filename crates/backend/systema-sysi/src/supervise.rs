@@ -28,11 +28,13 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use sysa::proto::{
     DaemonReloadRequest, DaemonReloadResult, ListUnitsRequest, ListUnitsResult, ManagerHelloRequest,
-    StartUnitsRequest, StartUnitsResult,
+    RegisterPowerUnitsRequest, RegisterPowerUnitsResult, StartUnitsRequest, StartUnitsResult,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::mount_setup;
+use crate::power;
 use crate::workers::{ProcessKind, ResolvedProcess};
 
 /// Default notify directory: `<runstatedir>/systema/notify` (`/run` by
@@ -232,22 +234,23 @@ async fn shutdown(procs: &[Spawned], code: i32, grace: Duration) -> i32 {
 ///    be reaped, SIGKILLing stragglers.
 /// 2. SIGTERM System A last, so the allocator keeps reporting state while
 ///    the system is draining, and wait for it as well.
-/// 3. Execute the transition **in-process** through
-///    `libsystema-sysp` (System P is now a library, not a worker).
-///    Terminal transitions never return from this call.
+/// 3. Unmount the runstatedir (best-effort; failure is logged but does not
+///    abort the transition).
+/// 4. Execute the transition **in-process** (System Init manages the
+///    `power` unit type directly).  Terminal transitions never return from
+///    this call.  When `--powerctl=never`, the transition is skipped and
+///    System Init exits cleanly instead.
 ///
-/// Returns the code `SysAInit` should exit with; `Err` means the drain or
-/// the transition failed (logged by the caller).
 async fn power_down(
     procs: &[Spawned],
     grace: Duration,
     action: &str,
     reaper_rx: &mut mpsc::UnboundedReceiver<ReaperEvent>,
+    power_ctl: power::PowerCtl,
 ) -> Result<i32> {
-    let power_action =
-        systema_sysp::PowerAction::from_unit_name(action).ok_or_else(|| {
-            anyhow::anyhow!("System Init received an unknown power action: {action:?}")
-        })?;
+    let power_action = power::PowerAction::from_unit_name(action).ok_or_else(|| {
+        anyhow::anyhow!("System Init received an unknown power action: {action:?}")
+    })?;
 
     // Phase 1: stop every supervised worker (everything except System A).
     let workers: Vec<&Spawned> = procs.iter().filter(|p| p.name != "sysa").collect();
@@ -306,19 +309,31 @@ async fn power_down(
         }
     }
 
-    // Phase 3: the transition itself, in-process through libsystema-sysp.
-    info!(
-        "Power transition '{power_action}': executing in-process (libsystema-sysp)"
-    );
-    systema_sysp::execute_action(power_action)?;
-    // Terminal transitions never return.  Reaching this point means a
-    // resumable transition (suspend/hibernate) completed and the machine
-    // came back; the supervisors are already gone, so the best we can do is
-    // log prominently and exit.
-    warn!(
-        "Power transition '{power_action}' returned after the drain; supervisors have exited (reboot the machine manually)"
-    );
-    Ok(0)
+    // Phase 3: unmount the runstatedir (best-effort).
+    let runstatedir = sysa::paths::instance().runstatedir;
+    info!("Power transition '{power_action}': unmounting {runstatedir}");
+    mount_setup::umount_runstatedir(runstatedir);
+
+    // Phase 4: execute the transition or exit cleanly.
+    if power_ctl.enabled(std::process::id() == 1) {
+        info!(
+            "Power transition '{power_action}': executing in-process (System Init)"
+        );
+        power::execute_action(power_action, power_ctl)?;
+        // Terminal transitions never return.  Reaching this point means a
+        // resumable transition (suspend/hibernate) completed and the machine
+        // came back; the supervisors are already gone, so the best we can do
+        // is log prominently and exit.
+        warn!(
+            "Power transition '{power_action}' returned after the drain; supervisors have exited (reboot the machine manually)"
+        );
+        Ok(0)
+    } else {
+        info!(
+            "Power transition '{power_action}': power control disabled (--powerctl={power_ctl}); exiting cleanly"
+        );
+        Ok(0)
+    }
 }
 
 /// Parse a notify datagram into its `key=value` lines.
@@ -486,6 +501,7 @@ async fn control_phase(
     procs: &[Spawned],
     grace: Duration,
     ready_timeout: Duration,
+    power_ctl: power::PowerCtl,
 ) -> Result<Option<i32>> {
     if !procs.iter().any(|p| p.name == "sysa") {
         warn!("System A is not in the process set; skipping control phase");
@@ -513,12 +529,40 @@ async fn control_phase(
         }
         info!("Control phase: daemon-reload complete");
 
+        // Register the built-in `.power` unit definitions with System A.
+        // System Init owns the `power` unit type; System A merges the
+        // synthesized definitions idempotently and never needs a `power`
+        // worker.  Registration is unconditional — the policy only gates
+        // the actual transition in execute_action.
+        {
+            let units_json = serde_json::to_vec(&power::all_power_definitions())?;
+            let register =
+                manager_call::<RegisterPowerUnitsRequest, RegisterPowerUnitsResult>(
+                    &sock_path,
+                    1,
+                    "manager.register_power_units",
+                    RegisterPowerUnitsRequest { units_json },
+                )
+                .await?;
+            if !register.success {
+                anyhow::bail!(
+                    "manager.register_power_units failed: {}",
+                    register.message
+                );
+            }
+            info!(
+                "Control phase: registered {created} new, {updated} updated .power unit(s)",
+                created = register.created,
+                updated = register.updated
+            );
+        }
+
         // One request per connection: each `manager_call` drops its control
         // session after the reply, like `systemctl`'s one-call-per-connection
         // model.
         let list = manager_call::<ListUnitsRequest, ListUnitsResult>(
             &sock_path,
-            1,
+            2,
             "manager.list_units",
             ListUnitsRequest { enabled_only: true },
         )
@@ -539,7 +583,7 @@ async fn control_phase(
 
         let start = manager_call::<StartUnitsRequest, StartUnitsResult>(
             &sock_path,
-            2,
+            3,
             "manager.start_units",
             StartUnitsRequest { names },
         )
@@ -606,6 +650,7 @@ pub async fn run(
     ready_timeout: Duration,
     log_dir: &std::path::Path,
     extra_flags: &HashMap<&'static str, Vec<String>>,
+    power_ctl: power::PowerCtl,
 ) -> Result<i32> {
     // Partition the resolved set: the allocator (System A) and the
     // long-running workers.  The Finder (System F) is no longer run as
@@ -729,7 +774,7 @@ pub async fn run(
     }
 
     // --- Phase 3: control plane (daemon-reload + start enabled units). ---
-    if let Some(code) = control_phase(&mut ctx, &procs, grace, ready_timeout).await? {
+    if let Some(code) = control_phase(&mut ctx, &procs, grace, ready_timeout, power_ctl).await? {
         let _ = std::fs::remove_file(&sock_path);
         drop(notify_thread);
         drop(reaper);
@@ -761,14 +806,14 @@ pub async fn run(
                 }
                 // System A dispatches `.power` unit starts as `POWER=<action>`
                 // datagrams.  The ordered shutdown (drain workers, then
-                // allocator, then the in-process libsystema-sysp transition)
-                // runs outside the select, where `ctx.reaper_rx` is free to
-                // be borrowed again.
+                // allocator, then the in-process power transition) runs
+                // outside the select, where `ctx.reaper_rx` is free to be
+                // borrowed again.
                 power_requested = kv.get("POWER").cloned();
             }
         }
         if let Some(action) = power_requested {
-            match power_down(&procs, grace, &action, &mut ctx.reaper_rx).await {
+            match power_down(&procs, grace, &action, &mut ctx.reaper_rx, power_ctl).await {
                 Ok(code) => break code,
                 Err(e) => {
                     error!("Power transition '{action}' aborted: {e:#}");

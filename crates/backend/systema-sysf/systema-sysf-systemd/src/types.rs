@@ -249,8 +249,8 @@ fn shell_words(s: &str) -> Vec<String> {
 /// which is how `systemctl poweroff` actually powers the machine down).
 ///
 /// In System A the power variants map to a `.power` unit
-/// ([`Self::power_unit_name`]); starting that unit is what dispatches the
-/// transition to System P.
+/// ([`Self::power_unit_name`]); starting that unit dispatches the transition
+/// to System Init (the in-process owner of the `power` unit type).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SuccessAction {
     #[default]

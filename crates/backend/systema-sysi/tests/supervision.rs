@@ -261,6 +261,22 @@ fn fake_control(notify_dir: &Path, canned: Vec<UnitInfo>, sent: Arc<Mutex<Vec<St
                             payload: result.encode_to_vec(),
                         }
                     }
+                    "manager.register_power_units" => {
+                        // System Init must be able to register its built-in
+                        // `.power` definitions at boot; the canned fake
+                        // acknowledges it.
+                        let result = DaemonReloadResult {
+                            success: true,
+                            message: String::new(),
+                        };
+                        Envelope {
+                            request_id: env.request_id,
+                            source: "system-a".to_string(),
+                            target: "system-sysi".to_string(),
+                            method: "manager.register_power_units.result".to_string(),
+                            payload: result.encode_to_vec(),
+                        }
+                    }
                     "manager.list_units" => {
                         let mut units = canned.clone();
                         units.sort_by(|a, b| a.name.cmp(&b.name));

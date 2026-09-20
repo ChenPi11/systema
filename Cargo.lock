@@ -1426,7 +1426,6 @@ dependencies = [
  "sysa",
  "systema-sysf",
  "systema-sysf-systemd",
- "systema-sysp",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1535,10 +1534,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "nix",
  "prost",
+ "serde_json",
  "sysa",
- "systema-sysp",
+ "systema-sysf",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1632,36 +1633,6 @@ dependencies = [
  "parking_lot",
  "prost",
  "sysa",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "systema-sysp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "serde_json",
- "systema-sysf",
- "tracing",
-]
-
-[[package]]
-name = "systema-sysr"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "clap",
- "prost",
- "serde_json",
- "sysa",
- "systema-sysf",
- "systema-sysr-common",
- "systema-sysr-linux",
  "tokio",
  "tracing",
  "tracing-subscriber",

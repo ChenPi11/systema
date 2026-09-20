@@ -20,6 +20,7 @@
 //! `mount_setup()` does, and only when it has the privileges to mount.
 
 mod mount_setup;
+mod power;
 mod supervise;
 mod workers;
 
@@ -75,6 +76,13 @@ struct Args {
         help = "Time to wait for System A / a worker to report ready before aborting"
     )]
     ready_timeout: u64,
+
+    #[arg(
+        long,
+        default_value = "auto",
+        help = "Power control policy: auto (only when PID 1), always, never"
+    )]
+    powerctl: power::PowerCtl,
 
     #[arg(
         long,
@@ -265,6 +273,11 @@ async fn main() -> Result<()> {
                 ))
                 .default_value(sysa::paths::instance().log_dir)
             })
+            .mut_arg("powerctl", |a| {
+                a.help(sysa::l10n::t_(
+                    "Power control policy: auto (only when PID 1), always, never.",
+                ))
+            })
             .mut_arg("worker_flags", |a| {
                 a.help(sysa::l10n::t_(
                     "Extra flags for every worker; --<name>-flags / SYSTEMA_SYS*_FLAGS take precedence.",
@@ -308,6 +321,9 @@ async fn main() -> Result<()> {
     } else {
         info!("SysAInit running as a container child process");
     }
+
+    let power_ctl = args.powerctl;
+    info!("Power control policy: --powerctl={power_ctl} (pid {})", std::process::id());
 
     let set = workers::build_worker_set(&args.skip_workers)?;
     let summary = set.iter().map(|s| s.name).collect::<Vec<_>>().join(", ");
@@ -356,6 +372,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.ready_timeout),
         &args.log_dir,
         &extra_flags,
+        args.powerctl,
     )
     .await?;
     std::process::exit(code);
