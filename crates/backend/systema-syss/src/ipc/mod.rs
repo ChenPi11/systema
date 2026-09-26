@@ -11,8 +11,17 @@ use crate::state::{new_registry, ServiceRegistry, ServiceState};
 const WORKER_ID: &str = "system-s-1";
 const WORKER_UNIT_TYPES: &[&str] = &["service"];
 
-pub async fn run() -> Result<()> {
+/// Shared handle to the service registry, accessible from `main` after
+/// `run()` returns so that the shutdown sequence can reap child processes.
+pub(crate) type SharedRegistry = Arc<Mutex<Option<ServiceRegistry>>>;
+
+pub fn shared_registry() -> SharedRegistry {
+    Arc::new(Mutex::new(None))
+}
+
+pub async fn run(shared: &SharedRegistry) -> Result<()> {
     let registry = new_registry();
+    *shared.lock().await = Some(registry.clone());
     let fdpass: Arc<Mutex<Option<tokio::net::UnixStream>>> = Arc::new(Mutex::new(None));
 
     // Connect to the allocator's fdpass socket (SCM_RIGHTS channel used to
