@@ -335,13 +335,13 @@ mod tests {
         );
         assert!(is_zombie(b), "tracked zombie B must still be a zombie");
 
-        // Release B.
-        let guard = shared.lock().await;
-        let reg = guard.as_ref().unwrap();
-        let mut reg = reg.lock();
-        reg.get_mut("test.service").unwrap().main_pid = None;
-        drop(reg);
-        drop(guard);
+        // Release B: clear the tracking pid so the sweep may collect it.
+        // Scoped so the guards are gone before the next await.
+        {
+            let guard = shared.lock().await;
+            let mut registry = guard.as_ref().unwrap().lock();
+            registry.get_mut("test.service").unwrap().main_pid = None;
+        }
         sweep(&shared).await;
         assert!(
             kill(Pid::from_raw(b as i32), None).is_err(),

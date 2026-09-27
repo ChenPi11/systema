@@ -49,10 +49,10 @@ async fn main() -> Result<()> {
 
     info!("System M (System Mount Worker) starting up");
 
-    tokio::select! {
-        result = ipc::run() => result?,
-        _sig = sysa::signals::shutdown_signal() => {}
-    }
+    // SIGTERM/SIGINT are handled inside the IPC loop: it sends
+    // `worker.exit`, waits for System A to close the connection, and only
+    // then returns here.
+    ipc::run().await?;
 
     Ok(())
 }

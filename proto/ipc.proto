@@ -97,6 +97,16 @@ message WorkerReady {
     // Empty — the worker's identity is the envelope's source field.
 }
 
+// Sent by a System Worker as its *last* message once it receives
+// SIGTERM/SIGINT: everything already queued for System A has been flushed
+// and the worker wants to part ways politely.  Fire-and-forget — there is
+// no reply envelope: System A closing the connection *is* the
+// acknowledgement, and the worker exits once it observes that close.
+message WorkerExit {
+    // Why the worker is going away ("SIGTERM"/"SIGINT") — logging only.
+    string reason = 1;
+}
+
 // Sent by a Worker to System A to report runtime state changes for one or
 // more units.  This is the unified state-update channel.
 message UnitStateUpdate {

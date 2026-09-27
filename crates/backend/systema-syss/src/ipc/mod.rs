@@ -50,7 +50,15 @@ pub async fn run(shared: &SharedRegistry) -> Result<()> {
     let fdpass_controller = fdpass.clone();
     let notify = crate::notify::NotifyManager::setup();
     let dbus = crate::dbus::DbusWaiter::default();
+    // On SIGTERM/SIGINT the IPC loop stops our services *first* — while the
+    // connection is still open, so their final states still reach System A —
+    // and only then exchanges the `worker.exit` goodbye.
+    let shared_for_cleanup = shared.clone();
     WorkerIpc::new(WORKER_ID, WORKER_UNIT_TYPES)
+        .on_shutdown(move || {
+            let shared = shared_for_cleanup.clone();
+            async move { crate::shutdown(shared).await }
+        })
         .run(
             move |event_pub| {
                 ServiceController::new(

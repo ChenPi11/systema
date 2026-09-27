@@ -231,7 +231,10 @@ async fn shutdown(procs: &[Spawned], code: i32, grace: Duration) -> i32 {
 /// sequence mirrors PID 1 semantics:
 ///
 /// 1. SIGTERM every supervised worker and wait (up to `grace`) for each to
-///    be reaped, SIGKILLing stragglers.
+///    be reaped, SIGKILLing stragglers.  That SIGTERM is what makes each
+///    worker perform the `worker.exit` handshake — System A closes the
+///    connection, and only then does the worker exit — so once this step
+///    completes every worker is disconnected from System A.
 /// 2. SIGTERM System A last, so the allocator keeps reporting state while
 ///    the system is draining, and wait for it as well.
 /// 3. Unmount the runstatedir (best-effort; failure is logged but does not
@@ -252,7 +255,11 @@ async fn power_down(
         anyhow::anyhow!("System Init received an unknown power action: {action:?}")
     })?;
 
-    // Phase 1: stop every supervised worker (everything except System A).
+    // Phase 1: stop every supervised worker (everything except System A) and
+    // wait for them all to exit.  A worker now leaves only *after* the
+    // `worker.exit` handshake (System A has closed its connection), so
+    // "exited" implies "disconnected from System A" — the precondition for
+    // touching System A in phase 2.
     let workers: Vec<&Spawned> = procs.iter().filter(|p| p.name != "sysa").collect();
     let mut reaped: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let deadline = tokio::time::Instant::now() + grace;
@@ -261,7 +268,17 @@ async fn power_down(
         workers.len()
     );
     for p in &workers {
-        let _ = kill(Pid::from_raw(p.pid), Signal::SIGTERM);
+        // ESRCH: the worker died before we got here — its connection to
+        // System A died with it, so treat it as already disconnected instead
+        // of spending the whole grace period waiting for a reap event that
+        // will never come.
+        if let Err(nix::errno::Errno::ESRCH) = kill(Pid::from_raw(p.pid), Signal::SIGTERM) {
+            info!(
+                "Worker {} (pid={}) already exited; already disconnected",
+                p.name, p.pid
+            );
+            reaped.insert(p.pid);
+        }
     }
     while reaped.len() < workers.len() && tokio::time::Instant::now() < deadline {
         tokio::select! {
@@ -281,7 +298,9 @@ async fn power_down(
         }
     }
 
-    // Phase 2: stop System A last.
+    // Phase 2: stop System A last — only now that every worker has
+    // disconnected (phase 1 waits for each worker to exit, and a worker
+    // exits after System A closed its `worker.exit` handshake).
     let allocator: Vec<&Spawned> = procs.iter().filter(|p| p.name == "sysa").collect();
     let deadline = tokio::time::Instant::now() + grace;
     let mut allocator_reaped = 0;
@@ -299,8 +318,11 @@ async fn power_down(
             _ = tokio::time::sleep_until(deadline) => {}
         }
     }
-    for p in &allocator {
-        if !reaped.contains(&p.pid) {
+    // Only a *timed-out* System A gets the hammer — checking the phase-1
+    // `reaped` set here would always report a failure, because System A is
+    // never a member of it.
+    if allocator_reaped < allocator.len() {
+        for p in &allocator {
             warn!(
                 "System A (pid={}) did not exit in time; SIGKILL",
                 p.pid

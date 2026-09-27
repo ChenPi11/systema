@@ -51,10 +51,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("System R (System Resource Worker) starting up");
 
-    tokio::select! {
-        result = systema_sysr::ipc::run() => result?,
-        _sig = sysa::signals::shutdown_signal() => {}
-    }
+    // SIGTERM/SIGINT are handled inside the IPC loop: it sends
+    // `worker.exit`, waits for System A to close the connection, and only
+    // then returns here.
+    systema_sysr::ipc::run().await?;
 
     Ok(())
 }

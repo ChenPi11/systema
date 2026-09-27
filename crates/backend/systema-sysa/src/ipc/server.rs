@@ -22,7 +22,7 @@ use sysa::proto::{
     AdminStagingOp, AdminStagingResult, CgroupMetricsUpdate, CommitUnits, Envelope, EventSubscribe,
     EventUnsubscribe, MethodResult, PathFired, RegisterAck, RegisterUnits, StagingAreaEntry,
     StagingQuery, StagingQueryResult, TimerFired, UnitDefineResult, UnitRegistrationAck,
-    UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerRegistration,
+    UnitStateUpdate, UnitStateUpdateAck, UnitSyncReport, WorkerExit, WorkerRegistration,
 };
 
 use crate::events::load_unit_sync;
@@ -928,6 +928,25 @@ async fn handle_worker_session(
                             &format!("workers-ready={ready_count}"),
                         )]);
                         continue;
+                    }
+
+                    if env.method == "worker.exit" {
+                        // Polite goodbye: the worker flushed everything it
+                        // had queued and now waits for us to close.  Breaking
+                        // out ends both tasks and drops the socket, which is
+                        // the acknowledgement — no reply envelope exists.
+                        let reason = WorkerExit::decode(env.payload.as_slice())
+                            .map(|r| r.reason)
+                            .unwrap_or_default();
+                        let why = if reason.is_empty() {
+                            "no reason given"
+                        } else {
+                            &reason
+                        };
+                        info!(
+                            "Worker '{worker_id_recv}' is exiting ({why}) — closing its connection"
+                        );
+                        break;
                     }
 
                     warn!(
@@ -1909,5 +1928,101 @@ mod tests {
             },
         );
         assert!(!unit_has_failed_start_job(&state, "other.service"));
+    }
+
+    /// A worker's `worker.exit` goodbye is recognised (no "Unknown method"
+    /// warning), answered by closing the connection — which *is* the ack —
+    /// and followed by deregistration.
+    #[tokio::test]
+    async fn worker_exit_is_recognised_and_closes_the_connection() {
+        // Captures this thread's log records; the session is polled on this
+        // very thread (never spawned), so what it says lands in here.
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log_buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let buf_for_writer = log_buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Capture(buf_for_writer.clone()))
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let allocator: AllocatorHandle = Arc::new(parking_lot::RwLock::new(AllocatorState::new()));
+        let pending_fd = Arc::new(Mutex::new(VecDeque::new()));
+
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let reg = WorkerRegistration {
+            worker_id: "system-t-1".to_string(),
+            unit_types: vec!["timer".to_string()],
+            supports_unit_define: false,
+        };
+        let reg_env = make_envelope(7, "system-t-1", "system-a", "worker.register", reg).unwrap();
+
+        let session =
+            handle_worker_session(frame_stream(server), reg_env, allocator.clone(), pending_fd);
+        tokio::pin!(session);
+
+        let mut client = frame_stream(client);
+        let ack = tokio::select! {
+            ack = recv_envelope(&mut client) => ack,
+            res = &mut session => panic!("session ended before acknowledging: {res:?}"),
+        };
+        let ack = ack
+            .expect("registration ack must be readable")
+            .expect("System A must acknowledge the registration");
+        assert_eq!(ack.method, "worker.ack");
+        assert!(
+            allocator.read().workers.contains_key("system-t-1"),
+            "worker must be registered after the handshake"
+        );
+
+        // The goodbye, carrying the reason SysAInit's SIGTERM produced.
+        let exit = make_envelope(
+            0,
+            "system-t-1",
+            "system-a",
+            "worker.exit",
+            WorkerExit {
+                reason: "SIGTERM".to_string(),
+            },
+        )
+        .unwrap();
+        send_envelope(&mut client, &exit).await.unwrap();
+
+        // System A answers by hanging up; the session deregisters on the way
+        // out.
+        let (eof, session_res) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (eof, res) = tokio::join!(recv_envelope(&mut client), &mut session);
+            (eof, res)
+        })
+        .await
+        .expect("System A must close the connection after worker.exit");
+        let eof = eof.expect("reading the goodbye must not fail");
+        assert!(eof.is_none(), "expected EOF, got {eof:?}");
+        session_res.expect("session must end cleanly after worker.exit");
+        assert!(
+            !allocator.read().workers.contains_key("system-t-1"),
+            "worker must be deregistered after worker.exit"
+        );
+
+        let text = String::from_utf8_lossy(&log_buf.lock().unwrap()).to_string();
+        assert!(
+            text.contains("is exiting (SIGTERM)"),
+            "System A must recognise worker.exit; log was: {text}"
+        );
+        assert!(
+            !text.contains("Unknown method"),
+            "worker.exit must not look like an unknown method; log was: {text}"
+        );
     }
 }

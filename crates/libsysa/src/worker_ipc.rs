@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,6 +15,12 @@ use tracing::{debug, error, info, warn};
 use crate::controller::{UnitController, UnitStatus};
 use crate::ipc::{frame_stream, make_envelope, recv_envelope, send_envelope};
 use crate::proto::*;
+
+/// How long `WorkerIpc::run` waits, after sending `worker.exit`, for System
+/// A to close the connection before giving up and exiting anyway.  Well
+/// inside SysAInit's shutdown grace, so a stuck System A can never make a
+/// worker overrun its deadline.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
 
 /// Handle for publishing unit state updates from within a unit controller.
 ///
@@ -248,6 +256,11 @@ fn encode_envelope(env: Envelope) -> Result<bytes::Bytes> {
     Ok(buf.freeze())
 }
 
+/// Local cleanup run on a shutdown signal *before* the `worker.exit`
+/// handshake, produced by [`WorkerIpc::on_shutdown`]'s closure.  Boxed so
+/// the hook can be an `async` block without generics infecting the struct.
+type ShutdownCleanup = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// Encapsulated worker IPC loop.
 ///
 /// Handles connection, registration, method dispatch, state synchronisation,
@@ -257,6 +270,11 @@ pub struct WorkerIpc {
     worker_id: String,
     unit_types: Vec<String>,
     supports_unit_define: bool,
+    on_shutdown: Option<Arc<dyn Fn() -> ShutdownCleanup + Send + Sync>>,
+    /// Test-only override of System A's socket path, so the fake System A in
+    /// the tests need not live at the compiled-in `/run/...` location.
+    #[cfg(test)]
+    socket_path: Option<String>,
 }
 
 impl WorkerIpc {
@@ -269,7 +287,36 @@ impl WorkerIpc {
             worker_id: worker_id.to_string(),
             unit_types: unit_types.iter().map(|s| s.to_string()).collect(),
             supports_unit_define: false,
+            on_shutdown: None,
+            #[cfg(test)]
+            socket_path: None,
         }
+    }
+
+    /// Connect to `path` instead of the configured socket (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_socket_path(mut self, path: impl Into<String>) -> Self {
+        self.socket_path = Some(path.into());
+        self
+    }
+
+    /// Arrange for `cleanup` to run on SIGTERM/SIGINT, **before** the
+    /// `worker.exit` handshake and while the System A connection is still
+    /// open.
+    ///
+    /// For a worker that has to finish local work on its way out (System S
+    /// stopping its services) the ordering matters: state emitted while the
+    /// cleanup runs must still reach System A, and only once it is done does
+    /// the loop say goodbye.  The connection is polled concurrently with the
+    /// cleanup, so a System A that disconnects first neither cancels nor
+    /// stalls it.
+    pub fn on_shutdown<F, Fut>(mut self, cleanup: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_shutdown = Some(Arc::new(move || Box::pin(cleanup())));
+        self
     }
 
     /// Declare support for the `unit.define` protocol: System A may ask this
@@ -297,6 +344,17 @@ impl WorkerIpc {
     /// `controller_factory` that clones the publisher and spawns the tasks
     /// inside the closure.  The spawned tasks will stop naturally when the
     /// underlying channel is closed on the next reconnection attempt.
+    ///
+    /// # Graceful shutdown
+    ///
+    /// SIGTERM/SIGINT are handled *in here*: the loop first runs any
+    /// [`Self::on_shutdown`] cleanup on the still-open connection, then
+    /// queues a final `worker.exit` envelope, keeps the connection running so
+    /// System A receives everything queued before it, and returns only once
+    /// System A has closed the connection (or [`DISCONNECT_GRACE`] elapses).
+    /// Callers must therefore not race this function against their own
+    /// [`crate::signals::shutdown_signal()`] — that would drop the socket
+    /// before the goodbye is exchanged.
     pub async fn run<C, H>(
         &self,
         controller_factory: impl Fn(EventPublisher) -> C,
@@ -306,21 +364,140 @@ impl WorkerIpc {
         C: UnitController + Send + Sync + 'static,
         H: Fn(&Envelope, &EventPublisher) -> Result<bool>,
     {
+        self.run_until_shutdown(
+            crate::signals::shutdown_signal(),
+            controller_factory,
+            custom_handler,
+        )
+        .await
+    }
+
+    /// [`Self::run`] with the shutdown signal supplied by the caller.
+    ///
+    /// `run()` wires in the real SIGTERM/SIGINT listener; tests drive this
+    /// one instead so they never raise a real signal in-process.
+    async fn run_until_shutdown<S, C, H>(
+        &self,
+        shutdown: S,
+        controller_factory: impl Fn(EventPublisher) -> C,
+        custom_handler: H,
+    ) -> Result<()>
+    where
+        S: Future<Output = &'static str>,
+        C: UnitController + Send + Sync + 'static,
+        H: Fn(&Envelope, &EventPublisher) -> Result<bool>,
+    {
+        // One listener for the whole loop.  Rebuilding it per attempt would
+        // open a window in which a signal delivered between attempts is
+        // never observed again — tokio does not replay signals.
+        tokio::pin!(shutdown);
+
         let mut backoff = Duration::from_millis(500);
         loop {
             let (out_tx, out_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-            match self
-                .try_run_inner(&controller_factory, &custom_handler, out_tx, out_rx)
-                .await
-            {
-                Ok(()) => {
+            // Clone kept aside for the shutdown path: it queues
+            // `worker.exit` *behind* everything already queued, so System A
+            // sees it only after this connection's outstanding messages.
+            let exit_tx = out_tx.clone();
+
+            let inner = self.try_run_inner(&controller_factory, &custom_handler, out_tx, out_rx);
+            tokio::pin!(inner);
+
+            // What ended this attempt: the connection itself, or us being
+            // asked to leave (SIGTERM/SIGINT).
+            enum Stopped {
+                Finished(Result<()>),
+                Signal(&'static str),
+            }
+            let stopped = tokio::select! {
+                res = &mut inner => Stopped::Finished(res),
+                sig = &mut shutdown => Stopped::Signal(sig),
+            };
+
+            match stopped {
+                Stopped::Finished(Ok(())) => {
                     info!("Worker loop exited cleanly");
                     return Ok(());
                 }
-                Err(e) => {
+                Stopped::Finished(Err(e)) => {
                     warn!("Worker error: {}; reconnecting in {:?}", e, backoff);
-                    tokio::time::sleep(backoff).await;
+                    // A signal must not be lost while we back off: there is
+                    // no live connection, so there is nothing to disconnect.
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        sig = &mut shutdown => {
+                            info!("{sig}: no live System A connection; exiting");
+                            return Ok(());
+                        }
+                    }
                     backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+                Stopped::Signal(sig) => {
+                    info!("{sig} received; shutting down locally before saying goodbye");
+
+                    // Local cleanup runs first, *while the connection is
+                    // still up*, so whatever state it reports still reaches
+                    // System A.  `inner` is polled alongside it: a System A
+                    // that disconnects early must neither cancel nor wedge
+                    // the cleanup — we just note it and finish anyway.
+                    let mut closed_during_cleanup = false;
+                    if let Some(cleanup_fn) = &self.on_shutdown {
+                        let cleanup = cleanup_fn();
+                        tokio::pin!(cleanup);
+                        tokio::select! {
+                            _ = &mut cleanup => {}
+                            _ = &mut inner => {
+                                closed_during_cleanup = true;
+                                info!(
+                                    "System A closed the connection while shutting down locally"
+                                );
+                            }
+                        }
+                        if closed_during_cleanup {
+                            // `inner` is spent (a future may not be polled
+                            // after it completed); wait out the cleanup on
+                            // its own.
+                            cleanup.await;
+                        }
+                    }
+                    if closed_during_cleanup {
+                        // Nothing left to say goodbye on.
+                        return Ok(());
+                    }
+
+                    info!("sending worker.exit and waiting for System A to disconnect");
+                    match make_envelope(
+                        0,
+                        &self.worker_id,
+                        "system-a",
+                        "worker.exit",
+                        WorkerExit {
+                            reason: sig.to_string(),
+                        },
+                    )
+                    .and_then(encode_envelope)
+                    {
+                        Ok(bytes) => {
+                            let _ = exit_tx.send(bytes);
+                        }
+                        Err(e) => {
+                            warn!("Failed to encode worker.exit: {}", e);
+                        }
+                    }
+                    // Keep pumping the connection (writer flushes the exit
+                    // frame, reader waits for System A's close) until the
+                    // inner loop finishes on its own or we run out of
+                    // patience — either way we leave after this.
+                    match tokio::time::timeout(DISCONNECT_GRACE, &mut inner).await {
+                        Ok(Ok(())) => info!("System A closed the connection; disconnected"),
+                        Ok(Err(e)) => {
+                            warn!("Connection failed while disconnecting: {e}; exiting")
+                        }
+                        Err(_) => warn!(
+                            "System A did not close the connection within {DISCONNECT_GRACE:?}; exiting anyway"
+                        ),
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -341,17 +518,22 @@ impl WorkerIpc {
         use futures::StreamExt;
         use tokio_util::codec::LengthDelimitedCodec;
 
-        info!(
-            "Connecting to System A at {}",
-            crate::paths::instance().ipc_socket_path
-        );
+        #[cfg(test)]
+        let socket_path = self
+            .socket_path
+            .clone()
+            .unwrap_or_else(|| crate::paths::instance().ipc_socket_path.to_string());
+        #[cfg(not(test))]
+        let socket_path = crate::paths::instance().ipc_socket_path.to_string();
 
-        let stream = tokio::net::UnixStream::connect(crate::paths::instance().ipc_socket_path)
+        info!("Connecting to System A at {}", socket_path);
+
+        let stream = tokio::net::UnixStream::connect(&socket_path)
             .await
             .with_context(|| {
                 crate::l10n::fmt(
                     crate::l10n::t_("Cannot connect to {path}."),
-                    &[("path", crate::paths::instance().ipc_socket_path)],
+                    &[("path", socket_path.as_str())],
                 )
             })?;
 
@@ -666,5 +848,312 @@ async fn run_method<C: UnitController>(controller: &C, call: &MethodCall) -> Met
             error: e.to_string(),
             result: vec![],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the fake System A observed, in arrival order — shared with the
+    /// worker side so both can be interleaved in assertions.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    fn push(log: &Log, entry: impl Into<String>) {
+        log.lock().unwrap().push(entry.into());
+    }
+
+    fn snapshot(log: &Log) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    fn index_of(entries: &[String], needle: &str) -> usize {
+        entries
+            .iter()
+            .position(|e| e == needle || e.starts_with(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing from {entries:?}"))
+    }
+
+    /// Socket path for one test, in a directory tagged by test name so the
+    /// tests of this binary never collide on it.
+    fn test_socket(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("sysa-worker-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("allocator.sock").to_str().unwrap().to_string()
+    }
+
+    /// A controller with nothing to manage: these tests exercise the IPC loop,
+    /// not unit lifecycle.  `sync_state` keeps the trait's empty default.
+    struct NoopController;
+
+    #[async_trait::async_trait]
+    impl UnitController for NoopController {
+        async fn status(&self, _unit_name: &str) -> Result<UnitStatus> {
+            anyhow::bail!("no units in this test")
+        }
+
+        async fn start(
+            &self,
+            _unit_name: &str,
+            _config: &[u8],
+            _invocation_id: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self, _unit_name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn restart(
+            &self,
+            _unit_name: &str,
+            _config: &[u8],
+            _invocation_id: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reload(&self, _unit_name: &str, _config: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The final state a shutdown cleanup reports on its way out.
+    fn cleanup_status() -> UnitStatus {
+        UnitStatus {
+            unit_name: "cleanup.service".to_string(),
+            active_state: "inactive".to_string(),
+            sub_state: "dead".to_string(),
+            main_pid: 0,
+            invocation_id: String::new(),
+            extensions: HashMap::new(),
+        }
+    }
+
+    /// Minimal System A: completes the handshake, acknowledges every state
+    /// update, and closes the connection when `worker.exit` arrives — that
+    /// close *is* the acknowledgement.  With `close_after_ready` it hangs up
+    /// right after the handshake instead, modelling a System A that leaves
+    /// first.
+    async fn fake_system_a(
+        listener: tokio::net::UnixListener,
+        log: Log,
+        ready: oneshot::Sender<()>,
+        close_after_ready: Option<Duration>,
+    ) -> anyhow::Result<()> {
+        let (stream, _) = listener.accept().await?;
+        let mut framed = frame_stream(stream);
+        // Taken on the first `worker.ready` so the sender is moved only once.
+        let mut ready = Some(ready);
+
+        let reg = recv_envelope(&mut framed)
+            .await?
+            .context("worker never registered")?;
+        assert_eq!(reg.method, "worker.register");
+        let ack = RegisterAck {
+            accepted: true,
+            message: "Welcome".to_string(),
+        };
+        send_envelope(
+            &mut framed,
+            &make_envelope(1, "system-a", "system-t-1", "worker.ack", ack)?,
+        )
+        .await?;
+
+        while let Some(env) = recv_envelope(&mut framed).await? {
+            match env.method.as_str() {
+                "unit.state_update" => {
+                    let update = UnitStateUpdate::decode(env.payload.as_slice())?;
+                    let names: Vec<&str> =
+                        update.units.iter().map(|u| u.unit_name.as_str()).collect();
+                    push(&log, format!("state_update:{}", names.join(",")));
+                    let ack = UnitStateUpdateAck {
+                        accepted: true,
+                        ignored_units: Vec::new(),
+                        message: String::new(),
+                    };
+                    send_envelope(
+                        &mut framed,
+                        &make_envelope(
+                            env.request_id,
+                            "system-a",
+                            "system-t-1",
+                            "unit.state_update_ack",
+                            ack,
+                        )?,
+                    )
+                    .await?;
+                }
+                "worker.ready" => {
+                    push(&log, "ready");
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(delay) = close_after_ready {
+                        tokio::time::sleep(delay).await;
+                        return Ok(()); // drop the socket
+                    }
+                }
+                "worker.exit" => {
+                    let exit = WorkerExit::decode(env.payload.as_slice())?;
+                    push(&log, format!("worker.exit:{}", exit.reason));
+                    return Ok(());
+                }
+                other => push(&log, format!("unexpected:{other}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// The full protocol: on a shutdown signal the worker runs its local
+    /// cleanup *on the live connection* — System A sees the state it reports
+    /// and acknowledges it — and only then says `worker.exit`, waits for
+    /// System A to hang up, and returns.
+    #[tokio::test]
+    async fn shutdown_runs_cleanup_while_connected_then_says_goodbye() {
+        let sock = test_socket("exit");
+
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let (a_log, a_sock) = (log.clone(), sock.clone());
+        tokio::spawn(async move {
+            let _ = fake_system_a(listener, a_log, ready_tx, None).await;
+        });
+
+        // The connection hands its publisher to the controller factory; the
+        // shutdown cleanup reuses it to report final state.
+        let publisher: Arc<Mutex<Option<EventPublisher>>> = Arc::new(Mutex::new(None));
+        let (pub_for_factory, pub_for_cleanup) = (publisher.clone(), publisher.clone());
+        let log_for_cleanup = log.clone();
+
+        let ipc = WorkerIpc::new("system-t-1", &["timer"])
+            .with_socket_path(a_sock)
+            .on_shutdown(move || {
+                let (publisher, log) = (pub_for_cleanup.clone(), log_for_cleanup.clone());
+                async move {
+                    push(&log, "cleanup-start");
+                    let publisher = publisher.lock().unwrap().clone();
+                    let ep = publisher.expect("factory installed the publisher on connect");
+                    ep.publish_unit_state_update(vec![cleanup_status()], false);
+                    // Done once System A has received (and logged) the update:
+                    // without the connection still being open this never
+                    // happens and the cleanup would time out.
+                    for _ in 0..500 {
+                        if snapshot(&log).iter().any(|e| e.contains("cleanup.service")) {
+                            push(&log, "cleanup-done");
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    panic!("System A never saw the cleanup state update");
+                }
+            });
+
+        let signal = async move {
+            ready_rx
+                .await
+                .expect("fake System A disappeared before the handshake finished");
+            "SIGTERM"
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            ipc.run_until_shutdown(
+                signal,
+                move |event_pub| {
+                    *pub_for_factory.lock().unwrap() = Some(event_pub);
+                    NoopController
+                },
+                |_, _| Ok(false),
+            ),
+        )
+        .await
+        .expect("graceful shutdown must not hang");
+        assert!(result.is_ok(), "worker must exit cleanly: {result:?}");
+
+        let entries = snapshot(&log);
+        let ready = index_of(&entries, "ready");
+        let start = index_of(&entries, "cleanup-start");
+        let update = entries
+            .iter()
+            .position(|e| e.contains("cleanup.service"))
+            .unwrap_or_else(|| panic!("cleanup state update missing from {entries:?}"));
+        let done = index_of(&entries, "cleanup-done");
+        let exit = index_of(&entries, "worker.exit:SIGTERM");
+        assert!(
+            ready < start && start < update && update < done && done < exit,
+            "cleanup must run, and be seen by System A, before the goodbye: {entries:?}"
+        );
+    }
+
+    /// A shutdown signal with no System A behind the socket exits instead of
+    /// sitting in the reconnect backoff forever.
+    #[tokio::test]
+    async fn shutdown_signal_without_a_connection_exits_promptly() {
+        let ipc = WorkerIpc::new("system-t-1", &["timer"])
+            .with_socket_path("/nonexistent/systema/allocator.sock");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            ipc.run_until_shutdown(async { "SIGTERM" }, |_| NoopController, |_, _| Ok(false)),
+        )
+        .await
+        .expect("must not wait for a System A that will never come");
+        assert!(result.is_ok(), "worker must exit cleanly: {result:?}");
+    }
+
+    /// System A hanging up *while* the local cleanup runs must neither cancel
+    /// nor wedge it: the cleanup finishes, then the worker leaves.
+    #[tokio::test]
+    async fn cleanup_finishes_even_when_system_a_leaves_first() {
+        let sock = test_socket("early-close");
+
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let (a_log, a_sock) = (log.clone(), sock.clone());
+        tokio::spawn(async move {
+            let _ =
+                fake_system_a(listener, a_log, ready_tx, Some(Duration::from_millis(250))).await;
+        });
+
+        let log_for_cleanup = log.clone();
+        let ipc = WorkerIpc::new("system-t-1", &["timer"])
+            .with_socket_path(a_sock)
+            .on_shutdown(move || {
+                let log = log_for_cleanup.clone();
+                async move {
+                    push(&log, "cleanup-start");
+                    // Local work that outlives System A's patience.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    push(&log, "cleanup-done");
+                }
+            });
+
+        let signal = async move {
+            ready_rx
+                .await
+                .expect("fake System A disappeared before the handshake finished");
+            "SIGTERM"
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            ipc.run_until_shutdown(signal, |_| NoopController, |_, _| Ok(false)),
+        )
+        .await
+        .expect("shutdown must not wedge when System A leaves first");
+        assert!(result.is_ok(), "worker must exit cleanly: {result:?}");
+
+        let entries = snapshot(&log);
+        index_of(&entries, "cleanup-start");
+        index_of(&entries, "cleanup-done");
+        assert!(
+            !entries.iter().any(|e| e.starts_with("unexpected:")),
+            "System A must not be sent anything unexpected: {entries:?}"
+        );
     }
 }

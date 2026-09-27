@@ -86,16 +86,24 @@ async fn main() -> Result<()> {
 
     let shared = ipc::shared_registry();
     tokio::select! {
+        // SIGTERM/SIGINT are handled inside the IPC loop: it stops our
+        // services first (the `on_shutdown` hook wired up in `ipc::run`),
+        // then sends `worker.exit`, waits for System A to close the
+        // connection, and only then returns — racing a signal branch here
+        // would drop the socket before the goodbye is exchanged.
         result = ipc::run(&shared) => result?,
-        _sig = sysa::signals::shutdown_signal() => {}
         // Orphan reaper: while the worker runs, collect every child no unit
         // is waiting for (adopted orphans under subreaper mode, plus direct
-        // children nobody reaps anymore).  Dropped on shutdown so
-        // `shutdown()`'s own `reap_children()` has the field to itself.
+        // children nobody reaps anymore).  It overlaps the shutdown hook —
+        // both it and `reap_children()` merely collect zombies, and the
+        // kernel refuses a second reap of the same child — and is dropped
+        // once the goodbye completes.
         _reaped = reaper::run(&shared) => {}
     }
 
-    // Shutdown: stop every running service and reap its children.
+    // Fallback for leaving the loop *without* a signal (System A went away
+    // first): the hook never ran, so stop the services now.  When it did
+    // run, the registry is already taken and this returns immediately.
     shutdown(shared).await;
 
     Ok(())

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -159,6 +160,27 @@ pub struct MountInfoMonitor {
     event_pub: EventPublisher,
 }
 
+/// How long the blocking mountinfo poll waits for a change before re-checking
+/// the stop flag.  Bounded so that shutting the worker down can never wait on
+/// it for more than a tick.
+const POLL_TIMEOUT_MS: i32 = 500;
+
+/// Sets the stop flag when dropped.
+///
+/// Held by [`MountInfoMonitor::run`]'s task for exactly as long as that task
+/// lives: `poll(2)` cannot be interrupted from the outside, and tokio's
+/// runtime shutdown waits for already-running blocking tasks — so without
+/// this an unbounded `poll(-1)` would pin the worker at exit (System Init
+/// used to have to SIGKILL it).  The runtime drops task futures before it
+/// shuts the blocking pool down, which is what makes the ordering work.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 impl MountInfoMonitor {
     pub fn new(registry: MountRegistry, event_pub: EventPublisher) -> Self {
         MountInfoMonitor {
@@ -195,6 +217,14 @@ impl MountInfoMonitor {
 
         let notify = Arc::new(Notify::new());
         let notify_clone = notify.clone();
+
+        // The poller runs on the blocking pool, where nothing can cancel it —
+        // and tokio waits for already-running blocking tasks when the runtime
+        // shuts down.  A bare `poll(-1)` would therefore hang this worker's
+        // exit; instead the poll is bounded and watches a stop flag that
+        // `_stop` raises when this task is dropped.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop = StopOnDrop(stop.clone());
         tokio::task::spawn_blocking(move || {
             let mut pfd = libc::pollfd {
                 fd,
@@ -202,7 +232,11 @@ impl MountInfoMonitor {
                 revents: 0,
             };
             loop {
-                let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+                let rc = unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) };
+                if stop.load(Ordering::Relaxed) {
+                    debug!("mountinfo poller stopping (monitor went away)");
+                    return;
+                }
                 if rc < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::Interrupted {
@@ -211,6 +245,8 @@ impl MountInfoMonitor {
                     warn!("poll on /proc/self/mountinfo failed: {err}");
                     return;
                 }
+                // rc == 0 is the timeout tick: nothing changed, loop around.
+                //
                 // A non-zero revents (POLLPRI/POLLERR, or POLLNVAL) means the
                 // table changed; any read that follows clears the flag, so
                 // poll() resets it.  POLLNVAL is a real error.
@@ -507,5 +543,47 @@ mod tests {
         assert_eq!(tmp.fstype, "tmpfs");
         assert_eq!(tmp.options, "rw,noatime");
         assert!(!tmp.ignored);
+    }
+
+    /// System Init used to have to SIGKILL this worker ten seconds after
+    /// SIGTERM: the blocking mountinfo `poll(-1)` outlived the task that
+    /// spawned it, so runtime shutdown sat in the pool's `shutdown(None)`
+    /// forever.  The bounded poll plus the [`StopOnDrop`] guard must release
+    /// it within one poll tick of the task being dropped — which is exactly
+    /// the real shutdown order (`Runtime::drop` drops tasks first, then
+    /// drains the blocking pool).
+    #[test]
+    fn runtime_drop_releases_the_mountinfo_poller() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            rt.block_on(async {
+                let registry = crate::linux::state::new_mount_registry();
+                tokio::spawn(async move {
+                    let publisher = EventPublisher::new(tx, "system-m-1", Default::default());
+                    let mut monitor = MountInfoMonitor::new(registry, publisher);
+                    monitor.run().await;
+                });
+                // Long enough to pass the initial poll and reach the
+                // blocking poll loop.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            });
+
+            drop(rt);
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect(
+                "runtime drop is stuck waiting for the mountinfo poller — the \
+                 bounded poll/stop guard is not releasing it",
+            );
     }
 }
