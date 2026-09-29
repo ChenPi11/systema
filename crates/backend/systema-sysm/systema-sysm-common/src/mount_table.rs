@@ -3,8 +3,11 @@
 //! Each System M variant supplies the raw table (Linux: `/proc/self/
 //! mountinfo`; other Unixes: `getmntinfo(3)`, `/etc/mnttab` or `mount -p`)
 //! and converts it into [`MountTableSnapshot`].  Everything downstream —
-//! unit-name escaping, reconciliation, dynamic unit registration with
-//! System A — is shared here.
+//! the discovery gate, unit-name escaping, reconciliation, dynamic unit
+//! registration with System A — is shared here.
+//!
+//! Mount-point policy itself lives in [`sysa::mounts`]; this module only
+//! applies it while reconciling.
 
 use std::collections::HashMap;
 
@@ -123,20 +126,29 @@ pub fn build_mount_unit_ir(unit_name: &str, entry: &MountTableEntry) -> UnitIR {
 
 /// Reconcile a registry against the mount table.
 ///
-/// Every real (non-autofs, non-ignored) filesystem in the snapshot is passed
-/// to `create`, which is responsible for inserting the unit into the calling
-/// crate's own registry and returning `true` if a new unit was created.
-/// Returns the names of the created units.
+/// Passes every mount point that should become a unit to `create`, which is
+/// responsible for inserting the unit into the calling crate's own registry
+/// and returning `true` if a new unit was created.  Returns the names of the
+/// created units.
+///
+/// This is also where the discovery gate sits: autofs sentinels, mounts
+/// marked ignored, and mount points outside the unit system's jurisdiction
+/// ([`sysa::mounts::is_exempt_from_units`]) are dropped here rather than
+/// downstream, so System A never receives a unit it would have to know
+/// mount-point policy to handle.
 pub fn reconcile<F>(snapshot: &MountTableSnapshot, mut create: F) -> Vec<String>
 where
     F: FnMut(&str, &MountTableEntry) -> bool,
 {
     let mut created = Vec::new();
     for entry in &snapshot.entries {
-        // autofs entries are automount sentinels, not real filesystems; the
-        // real fs on top is a separate entry.  Ignored mounts are managed
-        // elsewhere.
-        if entry.fstype == "autofs" || entry.ignored {
+        // autofs entries are automount sentinels, not real filesystems (the
+        // real fs on top is a separate entry); ignored mounts are managed
+        // elsewhere; exempt mount points never enter the unit system.
+        if entry.fstype == "autofs"
+            || entry.ignored
+            || sysa::mounts::is_exempt_from_units(&entry.mount_point)
+        {
             continue;
         }
         let unit_name = mount_unit_name_from_path(&entry.mount_point);
@@ -221,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_skips_autofs_and_ignored() {
+    fn reconcile_skips_autofs_ignored_and_exempt() {
         let mut ignored = entry("/mnt/other", "ext4");
         ignored.ignored = true;
         let snapshot = MountTableSnapshot::new(vec![
@@ -237,12 +249,50 @@ mod tests {
             true
         });
 
-        assert_eq!(
-            created,
-            vec!["-.mount".to_string(), "tmp.mount".to_string()]
-        );
+        // `/` is the extrinsic OS root and must never become `-.mount` —
+        // otherwise it would pick up `Conflicts=umount.target`.
+        assert_eq!(created, vec!["tmp.mount".to_string()]);
+        assert!(!registry.contains_key("-.mount"));
         assert!(!registry.contains_key("mnt.mount"));
         assert!(!registry.contains_key("mnt-other.mount"));
+    }
+
+    #[test]
+    fn reconcile_skips_exempt_mount_points() {
+        let exempt = [
+            // API
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/run/host/x",
+            "/dev/shm",
+            "/sys/fs/cgroup/system.slice",
+            // extrinsic, but neither API nor systemd-ignored
+            "/",
+            "/usr",
+            "/etc",
+            "/proc/sys/fs/binfmt_misc",
+            "/sys/kernel/debug",
+            "/dev/mqueue",
+            "/run/initramfs",
+        ];
+        let mut entries: Vec<MountTableEntry> = exempt.iter().map(|p| entry(p, "ext4")).collect();
+        entries.push(entry("/home", "ext4"));
+        entries.push(entry("/tmp", "tmpfs"));
+
+        let snapshot = MountTableSnapshot::new(entries);
+        let mut registry: HashMap<String, MountTableEntry> = HashMap::new();
+        let created = reconcile(&snapshot, |unit_name, e| {
+            registry.insert(unit_name.to_string(), e.clone());
+            true
+        });
+
+        assert_eq!(
+            created,
+            vec!["home.mount".to_string(), "tmp.mount".to_string()]
+        );
+        assert_eq!(registry.len(), 2);
     }
 
     #[test]

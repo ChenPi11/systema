@@ -11,6 +11,7 @@ pub mod finder;
 pub mod ipc;
 pub mod l10n;
 pub mod logging;
+pub mod mounts;
 pub mod notify;
 pub mod paths;
 pub mod signals;

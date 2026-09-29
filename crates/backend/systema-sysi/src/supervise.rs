@@ -15,9 +15,11 @@
 //! The Finder (System F) is no longer a supervised process.  System A
 //! spawns it on-demand when a daemon-reload is requested (via IPC or D-Bus).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -42,6 +44,106 @@ use crate::workers::{ProcessKind, ResolvedProcess};
 /// runtime state dir rather than hardcoded.
 pub fn default_notify_dir() -> String {
     sysa::paths::instance().notify_dir.clone()
+}
+
+/// SysAInit's notify listener, `<notify-dir>/init.sock`.
+///
+/// Receiving runs on a dedicated thread that feeds the channel drained by
+/// [`WaitCtx`], so every early-boot wait still sees events that arrive
+/// before it starts polling.
+///
+/// The socket lives under the runstatedir, which means the runstatedir
+/// cannot be unmounted while this FD is open — unlinking `init.sock` is not
+/// enough, the descriptor itself has to go.  Every exit path therefore
+/// calls [`NotifyListener::shutdown`], and so does the power transition
+/// before it attempts the unmount.
+struct NotifyListener {
+    sock_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl NotifyListener {
+    /// How often the receive thread wakes to re-check [`Self::stop`].
+    ///
+    /// A read timeout is what lets the thread notice a shutdown request
+    /// without a wakeup datagram, so [`NotifyListener::shutdown`] cannot
+    /// block on the join forever.
+    const POLL: Duration = Duration::from_millis(100);
+
+    /// Bind `<dir>/init.sock` and start forwarding datagrams to `tx`.
+    ///
+    /// Returns `None` after logging when the socket cannot be set up, which
+    /// the caller treats as fatal — readiness waits depend on this channel.
+    fn bind(dir: &str, tx: mpsc::UnboundedSender<String>) -> Option<Self> {
+        let sock_path = PathBuf::from(dir).join("init.sock");
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            error!("Cannot create notify directory {dir}: {e}");
+        }
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = match UnixDatagram::bind(&sock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Cannot bind notify listener {}: {e}", sock_path.display());
+                return None;
+            }
+        };
+        if let Err(e) = listener.set_read_timeout(Some(Self::POLL)) {
+            error!(
+                "Cannot time out notify listener {}: {e}",
+                sock_path.display()
+            );
+            return None;
+        }
+        info!("Notify listener bound at {}", sock_path.display());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.recv(&mut buf) {
+                    Ok(n) => {
+                        // Re-check: a shutdown requested while `recv` was
+                        // blocked must not forward a late datagram.
+                        if stopped.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    }
+                    // Read timeout: nothing arrived, just re-check `stop`.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(e) => {
+                        warn!("notify listener error: {e}");
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        });
+
+        Some(Self {
+            sock_path,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Stop receiving, release the socket FD and unlink `init.sock`.
+    ///
+    /// Closing the FD — not unlinking the path — is what makes the
+    /// runstatedir unmountable.  Idempotent, so shutdown paths may not
+    /// have to track whether it already ran.
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
 }
 
 /// One request-reply exchange over a fresh control-port connection.
@@ -148,6 +250,67 @@ fn spawn_reaper(tx: mpsc::UnboundedSender<ReaperEvent>) -> thread::JoinHandle<()
     })
 }
 
+/// How long to wait for a SIGKILLed child to actually be reaped.
+///
+/// SIGKILL is immediate for a runnable process; the bound only exists so a
+/// process wedged in uninterruptible sleep cannot stall the shutdown
+/// forever.
+const KILL_CONFIRM_GRACE: Duration = Duration::from_secs(1);
+
+/// Drain `rx` until every pid in `want` has been reaped, or `deadline`.
+///
+/// Reaps for pids outside `want` are still removed from `pending`, so one
+/// phase waiting on its own group cannot swallow another group's exit
+/// event: a later phase recognises an already-reaped pid by probing it
+/// with `kill(2)` rather than by remembering it.
+async fn wait_for_reap(
+    rx: &mut mpsc::UnboundedReceiver<ReaperEvent>,
+    pending: &mut HashSet<i32>,
+    want: &HashMap<i32, String>,
+    deadline: tokio::time::Instant,
+) {
+    while tokio::time::Instant::now() < deadline && want.keys().any(|pid| pending.contains(pid)) {
+        tokio::select! {
+            Some((pid, _status)) = rx.recv() => { pending.remove(&pid); }
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+
+/// SIGKILL whatever in `want` is still running, then wait for those reaps.
+///
+/// Confirming the reaps is the point: unmounting the runstatedir straight
+/// after SIGKILL races a process that has not finished tearing down, and
+/// its open files would keep the mount busy.
+async fn kill_stragglers(
+    rx: &mut mpsc::UnboundedReceiver<ReaperEvent>,
+    pending: &mut HashSet<i32>,
+    want: &HashMap<i32, String>,
+) {
+    let stragglers: Vec<i32> = want
+        .keys()
+        .filter(|pid| pending.contains(pid))
+        .copied()
+        .collect();
+    if stragglers.is_empty() {
+        return;
+    }
+    for pid in &stragglers {
+        warn!("{} did not exit in time; SIGKILL", want[pid]);
+        let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+    }
+    let deadline = tokio::time::Instant::now() + KILL_CONFIRM_GRACE;
+    wait_for_reap(rx, pending, want, deadline).await;
+    for pid in &stragglers {
+        if pending.contains(pid) {
+            error!(
+                "{} survived SIGKILL; it may keep the runstatedir busy",
+                want[pid]
+            );
+        }
+    }
+}
+
 /// Map a reaped status to an exit code: pass through normal exits, signals
 /// map to `1`.
 fn status_code(status: &WaitStatus) -> i32 {
@@ -237,19 +400,26 @@ async fn shutdown(procs: &[Spawned], code: i32, grace: Duration) -> i32 {
 ///    completes every worker is disconnected from System A.
 /// 2. SIGTERM System A last, so the allocator keeps reporting state while
 ///    the system is draining, and wait for it as well.
-/// 3. Unmount the runstatedir (best-effort; failure is logged but does not
+/// 3. Release SysAInit's own references to the runstatedir — the notify
+///    listener socket lives under it and would otherwise keep the mount
+///    busy.
+/// 4. Unmount the runstatedir (best-effort; failure is logged but does not
 ///    abort the transition).
-/// 4. Execute the transition **in-process** (System Init manages the
+/// 5. Execute the transition **in-process** (System Init manages the
 ///    `power` unit type directly).  Terminal transitions never return from
 ///    this call.  When `--powerctl=never`, the transition is skipped and
 ///    System Init exits cleanly instead.
 ///
+/// Every step that can leave a process behind waits for its reap before the
+/// next one runs, because step 4 cannot succeed while anything still holds
+/// the mount open.
 async fn power_down(
     procs: &[Spawned],
     grace: Duration,
     action: &str,
     reaper_rx: &mut mpsc::UnboundedReceiver<ReaperEvent>,
     power_ctl: power::PowerCtl,
+    notify: &mut NotifyListener,
 ) -> Result<i32> {
     let power_action = power::PowerAction::from_unit_name(action).ok_or_else(|| {
         anyhow::anyhow!("System Init received an unknown power action: {action:?}")
@@ -261,7 +431,11 @@ async fn power_down(
     // "exited" implies "disconnected from System A" — the precondition for
     // touching System A in phase 2.
     let workers: Vec<&Spawned> = procs.iter().filter(|p| p.name != "sysa").collect();
-    let mut reaped: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let want: HashMap<i32, String> = workers
+        .iter()
+        .map(|p| (p.pid, format!("Worker {}", p.name)))
+        .collect();
+    let mut pending: HashSet<i32> = HashSet::new();
     let deadline = tokio::time::Instant::now() + grace;
     info!(
         "Power transition '{power_action}': stopping {} worker(s) gracefully",
@@ -272,71 +446,59 @@ async fn power_down(
         // System A died with it, so treat it as already disconnected instead
         // of spending the whole grace period waiting for a reap event that
         // will never come.
-        if let Err(nix::errno::Errno::ESRCH) = kill(Pid::from_raw(p.pid), Signal::SIGTERM) {
-            info!(
-                "Worker {} (pid={}) already exited; already disconnected",
-                p.name, p.pid
-            );
-            reaped.insert(p.pid);
-        }
-    }
-    while reaped.len() < workers.len() && tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            Some((pid, _status)) = reaper_rx.recv() => {
-                reaped.insert(pid);
+        match kill(Pid::from_raw(p.pid), Signal::SIGTERM) {
+            Err(Errno::ESRCH) => {
+                info!(
+                    "Worker {} (pid={}) already exited; already disconnected",
+                    p.name, p.pid
+                );
             }
-            _ = tokio::time::sleep_until(deadline) => {}
+            _ => {
+                pending.insert(p.pid);
+            }
         }
     }
-    for p in &workers {
-        if !reaped.contains(&p.pid) {
-            warn!(
-                "Worker {} (pid={}) did not exit in time; SIGKILL",
-                p.name, p.pid
-            );
-            let _ = kill(Pid::from_raw(p.pid), Signal::SIGKILL);
-        }
-    }
+    wait_for_reap(reaper_rx, &mut pending, &want, deadline).await;
+    kill_stragglers(reaper_rx, &mut pending, &want).await;
 
     // Phase 2: stop System A last — only now that every worker has
     // disconnected (phase 1 waits for each worker to exit, and a worker
     // exits after System A closed its `worker.exit` handshake).
     let allocator: Vec<&Spawned> = procs.iter().filter(|p| p.name == "sysa").collect();
+    let want: HashMap<i32, String> = allocator
+        .iter()
+        .map(|p| (p.pid, "System A".to_string()))
+        .collect();
+    // A fresh set probed with kill(2) rather than carried over from phase 1:
+    // an exit event drained while waiting for the workers would otherwise be
+    // lost and System A would look alive until the grace period expired.
+    let mut pending: HashSet<i32> = HashSet::new();
     let deadline = tokio::time::Instant::now() + grace;
-    let mut allocator_reaped = 0;
     info!("Power transition '{power_action}': stopping System A gracefully");
     for p in &allocator {
-        let _ = kill(Pid::from_raw(p.pid), Signal::SIGTERM);
-    }
-    while allocator_reaped < allocator.len() && tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            Some((pid, _status)) = reaper_rx.recv() => {
-                if allocator.iter().any(|p| p.pid == pid) {
-                    allocator_reaped += 1;
-                }
+        match kill(Pid::from_raw(p.pid), Signal::SIGTERM) {
+            Err(Errno::ESRCH) => {
+                debug!("System A (pid={}) already exited", p.pid);
             }
-            _ = tokio::time::sleep_until(deadline) => {}
+            _ => {
+                pending.insert(p.pid);
+            }
         }
     }
-    // Only a *timed-out* System A gets the hammer — checking the phase-1
-    // `reaped` set here would always report a failure, because System A is
-    // never a member of it.
-    if allocator_reaped < allocator.len() {
-        for p in &allocator {
-            warn!(
-                "System A (pid={}) did not exit in time; SIGKILL",
-                p.pid
-            );
-            let _ = kill(Pid::from_raw(p.pid), Signal::SIGKILL);
-        }
-    }
+    wait_for_reap(reaper_rx, &mut pending, &want, deadline).await;
+    kill_stragglers(reaper_rx, &mut pending, &want).await;
 
-    // Phase 3: unmount the runstatedir (best-effort).
+    // Phase 3: release SysAInit's own references to the runstatedir.  The
+    // notify listener socket lives under it, and unlinking the path would not
+    // free the mount — the FD itself has to be closed first.
+    notify.shutdown();
+
+    // Phase 4: unmount the runstatedir (best-effort).
     let runstatedir = sysa::paths::instance().runstatedir;
     info!("Power transition '{power_action}': unmounting {runstatedir}");
     mount_setup::umount_runstatedir(runstatedir);
 
-    // Phase 4: execute the transition or exit cleanly.
+    // Phase 5: execute the transition or exit cleanly.
     if power_ctl.enabled(std::process::id() == 1) {
         info!(
             "Power transition '{power_action}': executing in-process (System Init)"
@@ -688,35 +850,10 @@ pub async fn run(
     }
 
     // --- Bind the notify listener BEFORE spawning anything. ---
-    let notify_dir = default_notify_dir();
-    let sock_path = PathBuf::from(&notify_dir).join("init.sock");
-    if let Err(e) = std::fs::create_dir_all(&notify_dir) {
-        error!("Cannot create notify directory {}: {e}", notify_dir);
-    }
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = match UnixDatagram::bind(&sock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            error!("Cannot bind notify listener {}: {e}", sock_path.display());
-            return Ok(1);
-        }
-    };
-    info!("Notify listener bound at {}", sock_path.display());
     let (notify_tx, notify_rx) = mpsc::unbounded_channel::<String>();
-    let notify_thread = thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match listener.recv(&mut buf) {
-                Ok(n) => {
-                    let _ = notify_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
-                }
-                Err(e) => {
-                    warn!("notify listener error: {e}");
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }
-    });
+    let Some(mut notify) = NotifyListener::bind(&default_notify_dir(), notify_tx) else {
+        return Ok(1);
+    };
 
     let (reaper_tx, reaper_rx) = mpsc::unbounded_channel::<ReaperEvent>();
     let reaper = spawn_reaper(reaper_tx);
@@ -757,8 +894,7 @@ pub async fn run(
         None
     };
     if let Some(code) = code {
-        let _ = std::fs::remove_file(&sock_path);
-        drop(notify_thread);
+        notify.shutdown();
         drop(reaper);
         return Ok(code);
     }
@@ -767,8 +903,7 @@ pub async fn run(
     for rp in &workers {
         if let Some(code) = spawn_process(rp, &mut procs, debug, log_level, log_dir, extra_flags) {
             let code = shutdown(&procs, code, grace).await;
-            let _ = std::fs::remove_file(&sock_path);
-            drop(notify_thread);
+            notify.shutdown();
             drop(reaper);
             return Ok(code);
         }
@@ -788,8 +923,7 @@ pub async fn run(
         )
         .await?
         {
-            let _ = std::fs::remove_file(&sock_path);
-            drop(notify_thread);
+            notify.shutdown();
             drop(reaper);
             return Ok(code);
         }
@@ -797,8 +931,7 @@ pub async fn run(
 
     // --- Phase 3: control plane (daemon-reload + start enabled units). ---
     if let Some(code) = control_phase(&mut ctx, &procs, grace, ready_timeout, power_ctl).await? {
-        let _ = std::fs::remove_file(&sock_path);
-        drop(notify_thread);
+        notify.shutdown();
         drop(reaper);
         return Ok(code);
     }
@@ -835,7 +968,16 @@ pub async fn run(
             }
         }
         if let Some(action) = power_requested {
-            match power_down(&procs, grace, &action, &mut ctx.reaper_rx, power_ctl).await {
+            match power_down(
+                &procs,
+                grace,
+                &action,
+                &mut ctx.reaper_rx,
+                power_ctl,
+                &mut notify,
+            )
+            .await
+            {
                 Ok(code) => break code,
                 Err(e) => {
                     error!("Power transition '{action}' aborted: {e:#}");
@@ -845,8 +987,7 @@ pub async fn run(
         }
     };
 
-    let _ = std::fs::remove_file(&sock_path);
-    drop(notify_thread);
+    notify.shutdown();
     drop(reaper);
     Ok(code)
 }
@@ -890,5 +1031,123 @@ mod tests {
         let pid = Pid::from_raw(std::process::id() as i32);
         kill(pid, Signal::SIGHUP).unwrap();
         std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // =========================================================================
+    // Notify listener lifecycle
+    // =========================================================================
+
+    /// Scratch directory for socket tests; removed first so a leftover from a
+    /// previous run cannot mask a stale socket.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("systema-sysi-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The bug this guards against: SysAInit used to unlink `init.sock` and
+    /// detach the receive thread, leaving the socket FD open — enough to make
+    /// `umount /run` fail with EBUSY until SysAInit itself exited.
+    #[test]
+    fn notify_listener_shutdown_closes_the_socket() {
+        let dir = scratch_dir("notify");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut listener =
+            NotifyListener::bind(dir.to_str().expect("utf-8 temp path"), tx).expect("bind");
+        let sock = dir.join("init.sock");
+        assert!(sock.exists());
+
+        let client = UnixDatagram::unbound().expect("client socket");
+        client.send_to(b"MANAGER_READY=1", &sock).expect("send");
+        assert_eq!(rx.blocking_recv().as_deref(), Some("MANAGER_READY=1"));
+
+        listener.shutdown();
+
+        // The receive thread has ended, so its end of the channel is closed —
+        // which is exactly the FD release the unmount depends on.
+        assert!(rx.blocking_recv().is_none());
+        assert!(!sock.exists());
+
+        // Idempotent: shutdown paths may call it again.
+        listener.shutdown();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // Reap confirmation
+    // =========================================================================
+
+    fn want_set(pids: &[i32], label: &str) -> HashMap<i32, String> {
+        pids.iter().map(|pid| (*pid, label.to_string())).collect()
+    }
+
+    #[tokio::test]
+    async fn wait_for_reap_records_exits_it_was_not_asked_to_wait_for() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let want = want_set(&[101], "Worker a");
+        let mut pending = HashSet::from([101, 202]);
+
+        // 202 belongs to a later phase.  Draining it here must not swallow
+        // it, or that phase would wait out its whole grace period.
+        tx.send((202, WaitStatus::Exited(Pid::from_raw(202), 0)))
+            .expect("send");
+        tx.send((101, WaitStatus::Exited(Pid::from_raw(101), 0)))
+            .expect("send");
+
+        wait_for_reap(
+            &mut rx,
+            &mut pending,
+            &want,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(!pending.contains(&101));
+        assert!(!pending.contains(&202));
+    }
+
+    #[tokio::test]
+    async fn wait_for_reap_returns_immediately_when_everything_exited() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let want = want_set(&[101], "Worker a");
+        let mut pending = HashSet::new();
+
+        let started = std::time::Instant::now();
+        wait_for_reap(
+            &mut rx,
+            &mut pending,
+            &want,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn wait_for_reap_gives_up_at_the_deadline() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let want = want_set(&[101], "Worker a");
+        let mut pending = HashSet::from([101]);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        wait_for_reap(&mut rx, &mut pending, &want, deadline).await;
+
+        assert!(pending.contains(&101));
+    }
+
+    #[tokio::test]
+    async fn kill_stragglers_does_nothing_when_nothing_is_left() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let want = want_set(&[101], "Worker a");
+        let mut pending = HashSet::new();
+
+        let started = std::time::Instant::now();
+        kill_stragglers(&mut rx, &mut pending, &want).await;
+
+        assert!(pending.is_empty());
+        // No SIGKILL was issued, so the confirmation wait must not have run.
+        assert!(started.elapsed() < KILL_CONFIRM_GRACE);
     }
 }

@@ -555,8 +555,12 @@ fn add_type_default_dependencies(unit: &mut UnitFile, present: &std::collections
 
 /// The `mount_add_default_dependencies()` equivalent: ordering against the
 /// local/remote filesystem targets, umount.target, swap.target (tmpfs), and
-/// the network targets for network filesystems.  Extrinsic mounts (/, /usr,
-/// /etc, and the API filesystems) are left alone.
+/// the network targets for network filesystems.
+///
+/// This carries no mount-point knowledge of its own.  Whether a mount point
+/// is worth managing is decided once, by System M while it discovers mounts
+/// ([`sysa::mounts`]); whatever reaches System A as a `.mount` unit is by
+/// definition one it should order.
 fn add_mount_default_dependencies<F>(unit: &mut UnitFile, has: F)
 where
     F: Fn(&str) -> bool,
@@ -564,16 +568,6 @@ where
     let Some(mnt) = unit.mount.clone() else {
         return;
     };
-    let where_ = mnt.where_.clone();
-
-    // mount_is_extrinsic(): never manage the OS data or API filesystems.
-    if matches!(where_.as_str(), "/" | "/usr" | "/etc")
-        || ["/run/initramfs", "/run/nextroot", "/proc", "/sys", "/dev"]
-            .iter()
-            .any(|p| where_.starts_with(p))
-    {
-        return;
-    }
 
     let network = mount_is_network(&mnt);
 
@@ -1044,8 +1038,12 @@ mod tests {
         assert!(mnt.unit.after.contains("swap.target"));
     }
 
+    /// System A must not special-case mount points.  System M drops API and
+    /// extrinsic mount points during discovery, so a `.mount` unit that
+    /// arrives here always gets the normal default dependencies — including
+    /// the OS-base paths that used to be blacklisted inline.
     #[test]
-    fn test_mount_extrinsic_skipped() {
+    fn test_mount_default_dependencies_have_no_path_knowledge() {
         for where_ in ["/", "/usr", "/proc", "/sys", "/dev", "/run/initramfs/x"] {
             let name = format!("x-{}.mount", where_.replace('/', "-"));
             let units = run_injection(vec![
@@ -1055,8 +1053,19 @@ mod tests {
                 target("umount.target"),
             ]);
             let mnt = &units[&name];
-            assert!(mnt.unit.after.is_empty(), "where_={where_}");
-            assert!(mnt.unit.before.is_empty(), "where_={where_}");
+            assert!(
+                mnt.unit.before.contains("local-fs.target"),
+                "where_={where_}"
+            );
+            assert!(
+                mnt.unit.after.contains("local-fs-pre.target"),
+                "where_={where_}"
+            );
+            assert!(mnt.unit.before.contains("umount.target"), "where_={where_}");
+            assert!(
+                mnt.unit.conflicts.contains("umount.target"),
+                "where_={where_}"
+            );
         }
     }
 

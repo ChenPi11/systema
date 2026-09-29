@@ -119,8 +119,10 @@ mod imp {
     }
 }
 
-/// Path of the unified cgroup v2 hierarchy.
-const CGROUP_PATH: &str = "/sys/fs/cgroup";
+// Mount targets are derived from `sysa::mounts` rather than spelled out here,
+// so the root paths that gate discovery and the paths SysAInit actually
+// mounts cannot drift apart.  Only the mount *parameters* — flags, options and
+// their systemd `mount_table` provenance — are this module's business.
 
 /// Mount options for cgroup2, kept in sync with systemd's mount-table
 /// entry (`nsdelegate,memory_recursiveprot`).
@@ -128,12 +130,10 @@ const CGROUP_OPTIONS: &str = "nsdelegate,memory_recursiveprot";
 
 /// POSIX shared memory tmpfs, kept in sync with systemd's mount-table
 /// entry (`mode=01777`, MS_NOSUID|MS_NODEV|MS_STRICTATIME).
-const DEV_SHM_PATH: &str = "/dev/shm";
 const DEV_SHM_OPTIONS: &str = "mode=01777";
 
 /// /dev/pts devpts, kept in sync with systemd's mount-table entry
 /// (`mode=0620,gid=5`, MS_NOSUID|MS_NOEXEC).
-const DEV_PTS_PATH: &str = "/dev/pts";
 const DEV_PTS_OPTIONS: &str = "mode=0620,gid=5";
 
 /// Whether SysAInit may perform mounts: the effective user must be root.
@@ -211,41 +211,43 @@ fn mount_table_entry(
 /// when SysAInit lacks the privileges to mount (rootless environment).
 /// Returns `Err` when mounting should have been possible but failed.
 pub fn mount_cgroup2() -> anyhow::Result<()> {
+    let path = sysa::mounts::CGROUP.path();
+
     if !has_mount_privileges() {
         debug!("Running without mount privileges (rootless); not mounting cgroup2");
         return Ok(());
     }
 
-    if is_mount_point(CGROUP_PATH) {
-        info!("cgroup2 already mounted at {CGROUP_PATH}; not mounting again");
+    if is_mount_point(&path) {
+        info!("cgroup2 already mounted at {path}; not mounting again");
         return Ok(());
     }
 
-    fs::create_dir_all(CGROUP_PATH)
-        .with_context(|| format!("Cannot create cgroup mount point {CGROUP_PATH}"))?;
+    fs::create_dir_all(&path)
+        .with_context(|| format!("Cannot create cgroup mount point {path}"))?;
 
-    imp::do_mount("cgroup2", CGROUP_PATH, CGROUP_OPTIONS, imp::cgroup_flags()).map_err(|e| {
+    imp::do_mount("cgroup2", &path, CGROUP_OPTIONS, imp::cgroup_flags()).map_err(|e| {
         if imp::is_busy(&e) {
-            anyhow!("{CGROUP_PATH} is already occupied by another filesystem (cgroup v1?); hybrid cgroup hierarchy is not supported")
+            anyhow!("{path} is already occupied by another filesystem (cgroup v1?); hybrid cgroup hierarchy is not supported")
         } else {
-            anyhow!("Cannot mount cgroup2 at {CGROUP_PATH}: {e}")
+            anyhow!("Cannot mount cgroup2 at {path}: {e}")
         }
     })?;
 
     // systemd's MNT_CHECK_WRITABLE: undo the mount when the filesystem
     // is not actually writable.
     // SAFETY: access(2) only touches errno and returns -1 on failure.
-    let c_cgroup = CString::new(CGROUP_PATH).expect("cgroup path must not contain interior NUL");
+    let c_cgroup = CString::new(path.as_str()).expect("cgroup path must not contain interior NUL");
     if unsafe { nix::libc::access(c_cgroup.as_ptr(), nix::libc::W_OK) } != 0 {
         let err = std::io::Error::last_os_error();
-        let _ = imp::do_unmount(CGROUP_PATH);
-        let _ = fs::remove_dir(CGROUP_PATH);
+        let _ = imp::do_unmount(&path);
+        let _ = fs::remove_dir(&path);
         return Err(anyhow!(
-            "cgroup2 mount at {CGROUP_PATH} is not writable, undoing: {err}"
+            "cgroup2 mount at {path} is not writable, undoing: {err}"
         ));
     }
 
-    info!("Mounted cgroup2 at {CGROUP_PATH} ({CGROUP_OPTIONS})");
+    info!("Mounted cgroup2 at {path} ({CGROUP_OPTIONS})");
     Ok(())
 }
 
@@ -255,7 +257,8 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
 /// without it.  Never fatal: like systemd, the failure is logged by the
 /// caller and the boot continues.
 pub fn mount_dev_shm() -> anyhow::Result<()> {
-    mount_table_entry("tmpfs", DEV_SHM_PATH, DEV_SHM_OPTIONS, imp::dev_shm_flags())
+    let path = sysa::mounts::DEV_SHM.path();
+    mount_table_entry("tmpfs", &path, DEV_SHM_OPTIONS, imp::dev_shm_flags())
 }
 
 /// Mount devpts at `/dev/pts` (systemd's mount-table entry: devpts,
@@ -264,7 +267,8 @@ pub fn mount_dev_shm() -> anyhow::Result<()> {
 /// pseudo-terminal devpts must be remounted; harmless when already
 /// mounted by devtmpfs.  Never fatal.
 pub fn mount_dev_pts() -> anyhow::Result<()> {
-    mount_table_entry("devpts", DEV_PTS_PATH, DEV_PTS_OPTIONS, imp::dev_pts_flags())
+    let path = sysa::mounts::DEV_PTS.path();
+    mount_table_entry("devpts", &path, DEV_PTS_OPTIONS, imp::dev_pts_flags())
 }
 
 /// Unmount the runstatedir if it is a mount point.
