@@ -627,6 +627,11 @@ fn spawn_process(
 /// Returns `Ok(None)` when the predicate matched; `Ok(Some(code))` when
 /// SysAInit must exit with `code` (signal → 0, dead long-running child →
 /// its code, timeout → 1).
+///
+/// Every `Ok(Some(_))` return has already run [`shutdown`], so callers exit
+/// as they are.  The timeout branch included: children spawned before the
+/// deadline would otherwise survive SysAInit's exit and be reparented to
+/// init, still looping forever.
 async fn wait_ready(
     ctx: &mut WaitCtx,
     procs: &[Spawned],
@@ -667,7 +672,7 @@ async fn wait_ready(
                 error!(
                     "Timed out waiting for {what} to become ready after {ready_timeout:?}"
                 );
-                return Ok(Some(1));
+                return Ok(Some(shutdown(procs, 1, grace).await));
             }
         }
     }

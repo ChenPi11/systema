@@ -13,15 +13,17 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 use prost::Message;
 
@@ -30,8 +32,18 @@ use sysa::proto::{
     StartUnitsResult, UnitInfo, UnitStartResult,
 };
 
-/// Long-running shim: exits 0 on SIGTERM, otherwise sleeps forever.
-const LONG_RUNNING: &str = "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n";
+/// Long-running shim: records its pid, then exits 0 on SIGTERM and otherwise
+/// sleeps forever.
+///
+/// The pidfile is `$0.pid` — SysAInit resolves shims to absolute paths, so it
+/// lands beside the shim and is swept away with the temp dir.  Tests read it
+/// to assert the shim really died instead of merely going unnoticed under init.
+const LONG_RUNNING: &str = concat!(
+    "#!/bin/sh\n",
+    "printf '%s\\n' \"$$\" > \"$0.pid\"\n",
+    "trap 'exit 0' TERM\n",
+    "while :; do sleep 1; done\n",
+);
 
 /// One-shot finder shim: exits immediately (System F is not a daemon).
 const ONE_SHOT_FINDER: &str = "#!/bin/sh\nexit 0\n";
@@ -124,8 +136,10 @@ fn wait_for(buf: &Arc<Mutex<String>>, needle: &str, secs: u64) -> bool {
     }
 }
 
-fn run_sysi(dir: &Path, notify_dir: &Path, extra: &[&str]) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_systema-sysi"))
+/// Launch SysAInit in its own process group, so the guard can take the whole
+/// tree down in one `killpg` even when SysAInit itself is gone.
+fn run_sysi(dir: &Path, notify_dir: &Path, extra: &[&str]) -> SysiChild {
+    let child = Command::new(env!("CARGO_BIN_EXE_systema-sysi"))
         .arg("--bin-dir")
         .arg(dir)
         .arg("--shutdown-timeout")
@@ -139,8 +153,55 @@ fn run_sysi(dir: &Path, notify_dir: &Path, extra: &[&str]) -> Child {
         .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        // SysAInit is the leader of a fresh group (pgid == its pid), which
+        // every shim it spawns inherits.
+        .process_group(0)
         .spawn()
-        .unwrap()
+        .unwrap();
+    let pgid = Pid::from_raw(child.id() as i32);
+    SysiChild { child, pgid }
+}
+
+/// SysAInit under test, owning its process group.
+///
+/// Derefs to [`Child`] so call sites are unchanged.  The point is `Drop`:
+/// Rust does *not* kill a `Child` when it is dropped, so a test that fails an
+/// assertion — or SysAInit that dies before it can reap its own children —
+/// would otherwise strand the shims under init, looping in `sleep 1` forever.
+struct SysiChild {
+    child: Child,
+    pgid: Pid,
+}
+
+impl Deref for SysiChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl DerefMut for SysiChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for SysiChild {
+    fn drop(&mut self) {
+        // SIGTERM first, so the shims' `trap 'exit 0' TERM` runs.  Polling
+        // with SIGCONT is a harmless no-op on a running process and reports
+        // ESRCH once the last member of the group is gone — including on the
+        // happy path, where SysAInit already reaped everything and the very
+        // first probe costs two syscalls.
+        let _ = killpg(self.pgid, Signal::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && killpg(self.pgid, Signal::SIGCONT).is_ok() {
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Whatever is left goes down now.  This is the path that covers a
+        // SIGKILLed SysAInit, which cannot run `shutdown` for itself.
+        let _ = killpg(self.pgid, Signal::SIGKILL);
+    }
 }
 
 /// The "System A" side of the notify channel: sends datagrams to the
@@ -359,6 +420,57 @@ fn send_term(child: &Child) {
     kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
 }
 
+/// Existence probe.  `kill(pid, 0)` reports ESRCH once nothing holds the pid,
+/// which includes a process that has exited and been reaped.
+fn pid_exists(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Wait for `pid` to exit and be reaped; false if it is still alive.
+fn wait_for_gone(pid: i32, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while pid_exists(pid) {
+        if Instant::now() > deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// Read the pid a shim recorded next to itself, waiting for the file.
+fn read_shim_pid(path: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pid) = fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shim never recorded its pid at {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Assert that every named shim has exited and been reaped.
+///
+/// A survivor means SysAInit left without running `shutdown`, stranding the
+/// shim under init in an endless `sleep 1`.
+fn assert_no_survivors(dir: &Path, shims: &[&str]) {
+    for shim in shims {
+        let pid = read_shim_pid(&dir.join(format!("{shim}.pid")));
+        assert!(
+            wait_for_gone(pid, 5),
+            "{shim} (pid {pid}) outlived SysAInit"
+        );
+    }
+}
+
 /// Bring SysAInit up through the serial startup: allocator ready, then one
 /// worker at a time, verifying each worker is spawned before its ready
 /// event is acknowledged.  Returns the recorder of `manager.start_units`
@@ -566,6 +678,10 @@ fn allocator_timeout_exits_nonzero() {
     // Never send MANAGER_READY: --ready-timeout 2 must abort the boot.
     let status = wait_timeout(&mut child, 8).expect("should exit on timeout");
     assert_ne!(status.code(), Some(0), "got {status:?}");
+
+    // Aborting must also reap what Phase 1 had already spawned.
+    assert_no_survivors(&dir, &["systema-sysa"]);
+
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -584,6 +700,10 @@ fn worker_timeout_exits_nonzero() {
     assert!(wait_for(&buf, "Spawned syss", 5));
     let status = wait_timeout(&mut child, 8).expect("should exit on timeout");
     assert_ne!(status.code(), Some(0), "got {status:?}");
+
+    // Aborting must also reap System A *and* the worker left mid-startup.
+    assert_no_survivors(&dir, &["systema-sysa", "systema-syss"]);
+
     let _ = fs::remove_dir_all(&dir);
 }
 
