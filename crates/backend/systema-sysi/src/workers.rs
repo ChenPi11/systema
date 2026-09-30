@@ -315,12 +315,17 @@ mod tests {
         // System M / System W exist only on Linux.
         assert_eq!(binary_of(&linux, "sysm"), "systema-sysm.linux");
         assert_eq!(binary_of(&linux, "sysw"), "systema-sysw.systemd");
+        // System R carries the plain name on every platform — unlike M and W
+        // it has no per-platform suffix, so this is the name that must exist
+        // as a build artifact.
+        assert_eq!(binary_of(&linux, "sysr"), "systema-sysr");
 
         let other = build_worker_set_for(Platform::Other, &[]).unwrap();
         assert_eq!(
             names(&other),
             vec!["sysa", "syss", "syse", "syst", "sysc", "sysk", "sysn", "sysd", "sysr"]
         );
+        assert_eq!(binary_of(&other, "sysr"), "systema-sysr");
     }
 
     #[test]
@@ -419,5 +424,93 @@ mod tests {
         assert!(missing.iter().any(|m| m.name == "syss"));
         assert!(missing.iter().any(|m| m.name == "sysw"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Directory paths listed in the root workspace `members = [ ... ]`.
+    fn workspace_members(root: &std::path::Path) -> std::collections::HashSet<String> {
+        let text = std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml");
+        let mut members = std::collections::HashSet::new();
+        let mut in_list = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if in_list {
+                if line.starts_with(']') {
+                    in_list = false;
+                } else if let Some(rest) = line.strip_prefix('"') {
+                    if let Some(end) = rest.find('"') {
+                        members.insert(rest[..end].to_string());
+                    }
+                }
+            } else if line.starts_with("members") && line.contains('[') {
+                in_list = !line.contains(']');
+            }
+        }
+        members
+    }
+
+    /// Directories under `dir` that are crates with a binary of their own.
+    fn collect_bin_crates(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            if path.join("Cargo.toml").is_file() && path.join("src/main.rs").is_file() {
+                out.push(
+                    path.strip_prefix(root)
+                        .expect("crate path under workspace root")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+            // A crate may contain further crates (`systema-sysf/` does), so
+            // recurse either way.
+            collect_bin_crates(&path, root, out);
+        }
+    }
+
+    /// A crate with a `src/main.rs` that is absent from the workspace
+    /// `members` is never built: no artifact, and nothing anywhere complains.
+    ///
+    /// This happened to System R.  `56c2bc3` ("Delete System P, use System
+    /// Init to manage power") dropped `crates/backend/systema-sysr/systema-sysr`
+    /// from `members` on the line adjacent to the System P entry it meant to
+    /// delete, while leaving the crate's five source files in the tree.  Every
+    /// test stayed green — `platform_selects_binaries` only inspects the spec
+    /// table, and the integration tests synthesise their own shims from it —
+    /// so nothing noticed that `target/debug/systema-sysr` had stopped
+    /// existing, which a strict boot reports as a missing executable and
+    /// aborts on.
+    #[test]
+    fn every_bin_crate_is_a_workspace_member() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("workspace root");
+
+        let members = workspace_members(&root);
+        assert!(
+            !members.is_empty(),
+            "parsed no entries from the root Cargo.toml"
+        );
+
+        let mut bins = Vec::new();
+        collect_bin_crates(&root.join("crates"), &root, &mut bins);
+        assert!(bins.len() >= 10, "found only {} bin crate(s)", bins.len());
+
+        let orphans: Vec<&String> = bins.iter().filter(|d| !members.contains(*d)).collect();
+        assert!(
+            orphans.is_empty(),
+            "bin crate(s) on disk that cargo never builds because they are missing \
+             from the workspace `members`: {orphans:?}"
+        );
     }
 }
