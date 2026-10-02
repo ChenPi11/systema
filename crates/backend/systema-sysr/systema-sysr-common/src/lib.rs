@@ -16,14 +16,15 @@ mod config;
 mod controller;
 mod paths;
 
-pub use config::{DEFAULT_TASKS_MAX, ResourceConfig};
-pub use controller::{CgroupMetrics, CgroupProcess, NoopController, ResourceController, ResourceError};
+pub use config::{ResourceConfig, DEFAULT_TASKS_MAX};
+pub use controller::{
+    CgroupBaseline, CgroupMetrics, CgroupProcess, NoopController, ResourceController, ResourceError,
+};
 pub use paths::{
-    CGROUP_ROOT, USER_SLICE_NAME, bytes_to_string, cpu_quota_to_cpu_max,
-    cpu_quota_to_cpu_max_period, parse_cpu_period_us, parse_cpu_quota_percent,
-    parse_memory_size, slice_cgroup_path, slice_name_components, split_device_directive,
-    unit_cgroup_path, user_manager_cgroup_path, user_slice_cgroup_path, user_slice_name,
-    user_slice_root_path,
+    bytes_to_string, cpu_quota_to_cpu_max, cpu_quota_to_cpu_max_period, parse_cpu_period_us,
+    parse_cpu_quota_percent, parse_memory_size, slice_cgroup_path, slice_name_components,
+    split_device_directive, unit_cgroup_path, user_manager_cgroup_path, user_slice_cgroup_path,
+    user_slice_name, user_slice_root_path, CGROUP_ROOT, USER_SLICE_NAME,
 };
 
 /// The number of microseconds in the cgroup v2 `cpu.max` period.  systemd

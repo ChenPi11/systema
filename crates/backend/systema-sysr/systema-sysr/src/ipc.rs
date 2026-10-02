@@ -16,6 +16,12 @@
 //!
 //! The cgroup backend is (re)built on every connection attempt so a cgroup
 //! filesystem that appears later is picked up on reconnect.
+//!
+//! The hierarchy itself does not depend on that rebuild: [`run`] snapshots
+//! the cgroup tree before the first connection can create anything in it, and
+//! puts it back once the IPC loop returns.  System Init stops every worker
+//! before it stops System A, so the restore has run by the time System A
+//! exits and the tree is again the one the boot started from.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -47,7 +53,14 @@ pub async fn run() -> Result<()> {
     let current: Arc<Mutex<Option<ResourceWorker>>> = Arc::new(Mutex::new(None));
     let current_for_handler = current.clone();
 
-    WorkerIpc::new(WORKER_ID, WORKER_UNIT_TYPES)
+    // The hierarchy as System R found it, taken before the first connection
+    // gets the chance to `ensure` anything: this is the baseline that
+    // `restore` puts back on the way out.  `None` means there is no cgroup
+    // filesystem here to begin with, so there is nothing to restore either.
+    let controller = systema_sysr_linux::linux_controller();
+    let baseline = controller.snapshot();
+
+    let result = WorkerIpc::new(WORKER_ID, WORKER_UNIT_TYPES)
         .supports_unit_define()
         .run(
             move |event_pub| {
@@ -91,7 +104,20 @@ pub async fn run() -> Result<()> {
                 Ok(false)
             },
         )
-        .await
+        .await;
+
+    // The last thing System R does before exiting.  Every way the loop can
+    // end — the `worker.exit` handshake, a System A that went away, a fatal
+    // error — returns through here, and System Init does not stop System A
+    // until every worker has been reaped, so by the time System A exits the
+    // cgroups are back in the state the baseline recorded at boot.
+    if let Some(baseline) = &baseline {
+        if let Err(e) = controller.restore(baseline) {
+            warn!("Cannot restore the cgroup hierarchy: {e}");
+        }
+    }
+
+    result
 }
 
 /// Spawn the registration of `user.slice` plus every currently active user

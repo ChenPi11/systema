@@ -1,6 +1,6 @@
 //! The [`ResourceController`] trait, its error type and the no-op fallback.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use crate::config::ResourceConfig;
@@ -72,6 +72,28 @@ impl std::error::Error for ResourceError {
     }
 }
 
+/// The cgroup hierarchy as it was before System R touched it.
+///
+/// Everything is recorded relative to the hierarchy root, so the value is
+/// independent of where the backend has the root mounted.  [`dirs`](Self::dirs)
+/// lists the cgroup directories that already existed (the root itself is
+/// never listed, because it must never be removed); [`subtree_control`](Self::subtree_control)
+/// maps each of those directories — the root under the empty key `""` — to the
+/// verbatim contents of its `cgroup.subtree_control`.
+///
+/// The snapshot is what lets [`ResourceController::restore`] tell "created by
+/// System R" apart from "was already there" without hard-coding any directory
+/// name: the two things [`ResourceController::ensure`] does to an existing
+/// tree are create directories and add controllers to `subtree_control`, and
+/// the baseline records the prior value of both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgroupBaseline {
+    /// cgroup directories that existed at snapshot time, relative to the root.
+    pub dirs: BTreeSet<String>,
+    /// Relative directory path (root = `""`) → its `cgroup.subtree_control`.
+    pub subtree_control: BTreeMap<String, String>,
+}
+
 /// Backend for enforcing resource-control configuration on a cgroup
 /// hierarchy.
 ///
@@ -109,6 +131,21 @@ pub trait ResourceController: Send + Sync {
     /// `control_group` path and the cgroup inode are filled in by the
     /// backend (which knows the mount point).
     fn metrics(&self, path: &str) -> CgroupMetrics;
+
+    /// Record the hierarchy as it is now, before any [`Self::ensure`] runs.
+    ///
+    /// `None` means there is no cgroup filesystem to look at, in which case
+    /// there is nothing for [`Self::restore`] to undo either.
+    fn snapshot(&self) -> Option<CgroupBaseline>;
+
+    /// Put the hierarchy back to `baseline`: remove every directory created
+    /// since the snapshot, move the processes still sitting in them back to
+    /// the root, and re-disable the controllers that were added to the
+    /// directories that stay.
+    ///
+    /// Best-effort: a step that fails is logged and skipped, so a cgroup that
+    /// will not go away can never keep the worker from exiting.
+    fn restore(&self, baseline: &CgroupBaseline) -> Result<(), ResourceError>;
 }
 
 /// A controller that reports `available() == false` and is a no-op
@@ -144,5 +181,13 @@ impl ResourceController for NoopController {
 
     fn metrics(&self, _path: &str) -> CgroupMetrics {
         CgroupMetrics::default()
+    }
+
+    fn snapshot(&self) -> Option<CgroupBaseline> {
+        None
+    }
+
+    fn restore(&self, _baseline: &CgroupBaseline) -> Result<(), ResourceError> {
+        Ok(())
     }
 }

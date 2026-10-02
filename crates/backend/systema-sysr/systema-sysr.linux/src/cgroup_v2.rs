@@ -6,8 +6,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use systema_sysr_common::{
-    CGROUP_ROOT, CgroupMetrics, CgroupProcess, DEFAULT_TASKS_MAX, ResourceConfig,
-    ResourceController, ResourceError, split_device_directive,
+    CGROUP_ROOT, CgroupBaseline, CgroupMetrics, CgroupProcess, DEFAULT_TASKS_MAX,
+    ResourceConfig, ResourceController, ResourceError, split_device_directive,
 };
 use tracing::{debug, warn};
 
@@ -361,6 +361,63 @@ fn write_file(path: &Path, value: &str) -> std::io::Result<()> {
     fs::write(path, value)
 }
 
+/// Every cgroup directory at and below `root`, as paths relative to it, with
+/// the root itself as `""`.  Parents come before their children.
+fn walk_cgroups(root: &Path) -> Vec<String> {
+    fn rec(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        out.push(rel.to_string());
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            rec(&path, &child, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    rec(root, "", &mut out);
+    out
+}
+
+/// The PIDs listed in `dir`'s `cgroup.procs`.
+fn read_pids(dir: &Path) -> Vec<u32> {
+    read_file(&dir.join("cgroup.procs"))
+        .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// The `-controller` entries that turn `dir`'s `cgroup.subtree_control` back
+/// into `keep` — i.e. every controller enabled there that `keep` did not
+/// record.  `None` when the directory (or its control file) is gone, so
+/// there is nothing left to undo.
+fn extra_controllers(dir: &Path, keep: &str) -> Option<Vec<String>> {
+    let current = read_file(&dir.join("cgroup.subtree_control")).ok()?;
+    let keep: HashSet<&str> = keep
+        .split_whitespace()
+        .filter_map(|t| t.strip_prefix('+'))
+        .collect();
+    Some(
+        current
+            .split_whitespace()
+            .filter_map(|t| t.strip_prefix('+'))
+            .filter(|c| !keep.contains(c))
+            .map(|c| format!("-{c}"))
+            .collect(),
+    )
+}
+
 impl Default for CgroupV2Controller {
     fn default() -> Self {
         Self::new()
@@ -532,6 +589,123 @@ impl ResourceController for CgroupV2Controller {
             processes,
         }
     }
+
+    fn snapshot(&self) -> Option<CgroupBaseline> {
+        if !self.root.join("cgroup.controllers").exists() {
+            return None;
+        }
+        let mut baseline = CgroupBaseline::default();
+        for rel in walk_cgroups(&self.root) {
+            let dir = self.full(Path::new(&rel));
+            if let Ok(s) = read_file(&dir.join("cgroup.subtree_control")) {
+                baseline.subtree_control.insert(rel.clone(), s);
+            }
+            if !rel.is_empty() {
+                baseline.dirs.insert(rel);
+            }
+        }
+        debug!(
+            "Snapshot of the cgroup hierarchy: {} director(y/ies) present",
+            baseline.dirs.len()
+        );
+        Some(baseline)
+    }
+
+    fn restore(&self, baseline: &CgroupBaseline) -> Result<(), ResourceError> {
+        // No cgroup v2 hierarchy (never mounted here, or gone again): we
+        // cannot have created anything in it.
+        if !self.root.join("cgroup.controllers").exists() {
+            debug!("No cgroup hierarchy to restore");
+            return Ok(());
+        }
+
+        // Directories that were not there when the baseline was taken are
+        // ours — no directory name is ever matched.  Deepest first, so a
+        // directory never outlives its children.
+        let mut created: Vec<String> = walk_cgroups(&self.root)
+            .into_iter()
+            .filter(|rel| !rel.is_empty() && !baseline.dirs.contains(rel))
+            .collect();
+        created.sort_by(|a, b| {
+            b.matches('/')
+                .count()
+                .cmp(&a.matches('/').count())
+                .then_with(|| b.cmp(a))
+        });
+
+        // Logged individually so every problem shows up in the log, but only
+        // the first one is reported: a restore never blocks the exit.
+        let mut outcome = Ok(());
+
+        // Processes go back to the root cgroup first — that is where the
+        // baseline found them, and it is also what empties each directory
+        // for the removal below.
+        for rel in &created {
+            let dir = self.full(Path::new(rel));
+            for pid in read_pids(&dir) {
+                let root_procs = self.root.join("cgroup.procs");
+                if let Err(e) = write_file(&root_procs, &pid.to_string()) {
+                    warn!("Cannot move pid {pid} back to the root cgroup: {e}");
+                    if outcome.is_ok() {
+                        outcome = Err(ResourceError::Io {
+                            path: root_procs.display().to_string(),
+                            source: e,
+                        });
+                    }
+                }
+            }
+        }
+
+        for rel in &created {
+            let dir = self.full(Path::new(rel));
+            match fs::remove_dir(&dir) {
+                Ok(()) => debug!("Removed cgroup {rel}"),
+                // Already gone: nothing to undo.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!("Cannot remove cgroup {rel}: {e}");
+                    if outcome.is_ok() {
+                        outcome = Err(ResourceError::Io {
+                            path: dir.display().to_string(),
+                            source: e,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Controllers enabled on a directory that stays have to go again.
+        // `ensure` only ever adds controllers, so disabling the surplus
+        // restores exactly the recorded value.
+        for (rel, keep) in &baseline.subtree_control {
+            let dir = self.full(Path::new(rel));
+            let Some(extra) = extra_controllers(&dir, keep) else {
+                continue;
+            };
+            if extra.is_empty() {
+                continue;
+            }
+            let file = dir.join("cgroup.subtree_control");
+            if let Err(e) = write_file(&file, &extra.join(" ")) {
+                warn!(
+                    "Cannot restore cgroup.subtree_control on {}: {e}",
+                    dir.display()
+                );
+                if outcome.is_ok() {
+                    outcome = Err(ResourceError::Invalid {
+                        path: file.display().to_string(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        match &outcome {
+            Ok(()) => debug!("Cgroup hierarchy restored to its baseline"),
+            Err(e) => warn!("Cgroup hierarchy restored imperfectly: {e}"),
+        }
+        outcome
+    }
 }
 
 impl CgroupV2Controller {
@@ -556,7 +730,7 @@ impl CgroupV2Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use systema_sysr_common::ResourceController;
+    use systema_sysr_common::{NoopController, ResourceController};
 
     #[test]
     fn path_rel_math() {
@@ -644,5 +818,195 @@ mod tests {
         assert_eq!(m.get("IOWriteOperations"), Some(&8));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A throw-away stand-in for a freshly mounted cgroup2: the marker file
+    /// that makes `snapshot()` recognise it, and an empty root
+    /// `cgroup.subtree_control` for it to record.
+    fn fake_hierarchy(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("sysr-restore-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("cgroup.controllers"),
+            "cpuset cpu memory pids io\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cgroup.subtree_control"), "").unwrap();
+        root
+    }
+
+    /// Absolute path of `rel` under `root`, the form `ensure()` takes.
+    fn abs(root: &Path, rel: &str) -> String {
+        root.join(rel).to_string_lossy().into_owned()
+    }
+
+    /// Drop a throw-away hierarchy again.
+    fn discard(root: &Path) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_records_the_hierarchy_it_found() {
+        let root = fake_hierarchy("snapshot");
+        std::fs::create_dir_all(root.join("pre.slice")).unwrap();
+        std::fs::write(root.join("cgroup.subtree_control"), "+memory\n").unwrap();
+        std::fs::write(root.join("pre.slice/cgroup.subtree_control"), "+cpu\n").unwrap();
+
+        let c = CgroupV2Controller { root: root.clone() };
+        let baseline = c.snapshot().unwrap();
+
+        let dirs: Vec<&str> = baseline.dirs.iter().map(String::as_str).collect();
+        assert_eq!(dirs, vec!["pre.slice"]);
+        assert_eq!(
+            baseline.subtree_control.get("").map(String::as_str),
+            Some("+memory\n")
+        );
+        assert_eq!(
+            baseline
+                .subtree_control
+                .get("pre.slice")
+                .map(String::as_str),
+            Some("+cpu\n")
+        );
+        discard(&root);
+    }
+
+    #[test]
+    fn restore_removes_everything_created_since_the_snapshot() {
+        let root = fake_hierarchy("remove");
+        let c = CgroupV2Controller { root: root.clone() };
+        let baseline = c.snapshot().unwrap();
+
+        c.ensure(
+            &abs(&root, "work.slice/plain.service"),
+            &ResourceConfig::default(),
+        )
+        .unwrap();
+        assert!(root.join("work.slice/plain.service").is_dir());
+
+        c.restore(&baseline).unwrap();
+
+        // Deepest first, so the parent never outlives its child.
+        assert!(!root.join("work.slice").exists());
+        assert_eq!(walk_cgroups(&root), vec![String::new()]);
+        discard(&root);
+    }
+
+    #[test]
+    fn restore_puts_processes_back_in_the_root() {
+        let root = fake_hierarchy("procs");
+        let c = CgroupV2Controller { root: root.clone() };
+        let baseline = c.snapshot().unwrap();
+
+        c.ensure(&abs(&root, "plain.service"), &ResourceConfig::default())
+            .unwrap();
+        let pid = std::process::id();
+        std::fs::write(root.join("plain.service/cgroup.procs"), format!("{pid}\n")).unwrap();
+
+        let outcome = c.restore(&baseline);
+
+        // Back where the baseline found them: the root cgroup.
+        assert_eq!(read_pids(&root), vec![pid]);
+        // Here `cgroup.procs` is a plain file where a real cgroup2 has a
+        // pseudo-file that `rmdir` ignores, so the directory is left behind
+        // — which is exactly the imperfect-restore path `restore` reports.
+        assert!(root.join("plain.service").is_dir());
+        assert!(outcome.is_err());
+        discard(&root);
+    }
+
+    #[test]
+    fn restore_leaves_the_recorded_hierarchy_alone() {
+        let root = fake_hierarchy("keep");
+        std::fs::create_dir_all(root.join("pre.slice")).unwrap();
+        std::fs::write(root.join("pre.slice/cgroup.subtree_control"), "+cpu\n").unwrap();
+
+        let c = CgroupV2Controller { root: root.clone() };
+        let baseline = c.snapshot().unwrap();
+
+        c.ensure(&abs(&root, "new.service"), &ResourceConfig::default())
+            .unwrap();
+        c.restore(&baseline).unwrap();
+
+        assert!(root.join("pre.slice").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(root.join("pre.slice/cgroup.subtree_control")).unwrap(),
+            "+cpu\n"
+        );
+        assert!(!root.join("new.service").exists());
+        discard(&root);
+    }
+
+    #[test]
+    fn extra_controllers_lists_only_the_surplus() {
+        let root = fake_hierarchy("extra");
+        std::fs::write(root.join("cgroup.subtree_control"), "+cpu +memory\n").unwrap();
+
+        assert_eq!(
+            extra_controllers(&root, "+cpu\n"),
+            Some(vec!["-memory".to_string()])
+        );
+        assert_eq!(extra_controllers(&root, "+cpu +memory\n"), Some(Vec::new()));
+        assert_eq!(extra_controllers(&root.join("gone"), "+cpu\n"), None);
+        discard(&root);
+    }
+
+    #[test]
+    fn restore_disables_the_controllers_it_enabled() {
+        let root = fake_hierarchy("subtree");
+        std::fs::write(root.join("cgroup.subtree_control"), "+cpu\n").unwrap();
+        let c = CgroupV2Controller { root: root.clone() };
+        let baseline = c.snapshot().unwrap();
+
+        // What the backend leaves behind: the recorded value plus whatever
+        // it enabled on the way in.
+        std::fs::write(root.join("cgroup.subtree_control"), "+cpu +memory +pids\n").unwrap();
+
+        c.restore(&baseline).unwrap();
+
+        // The write carries only the surplus.  On a real cgroup2 that leaves
+        // the root at `+cpu`, its recorded value; this fake file simply ends
+        // up holding what was written.
+        assert_eq!(
+            std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(),
+            "-memory -pids"
+        );
+        discard(&root);
+    }
+
+    #[test]
+    fn restoring_twice_changes_nothing_the_second_time() {
+        let root = fake_hierarchy("idempotent");
+        let c = CgroupV2Controller { root: root.clone() };
+        let baseline = c.snapshot().unwrap();
+
+        c.ensure(&abs(&root, "a/b.service"), &ResourceConfig::default())
+            .unwrap();
+        c.restore(&baseline).unwrap();
+        let after_first = walk_cgroups(&root);
+
+        c.restore(&baseline).unwrap();
+        assert_eq!(walk_cgroups(&root), after_first);
+        assert_eq!(after_first, vec![String::new()]);
+        discard(&root);
+    }
+
+    #[test]
+    fn snapshot_without_a_cgroup_filesystem_is_none() {
+        let root = std::env::temp_dir().join(format!("sysr-nomarker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let c = CgroupV2Controller { root: root.clone() };
+        assert!(c.snapshot().is_none());
+        assert!(c.restore(&CgroupBaseline::default()).is_ok());
+        discard(&root);
+    }
+
+    #[test]
+    fn noop_controller_has_nothing_to_restore() {
+        assert!(NoopController.snapshot().is_none());
+        assert!(NoopController.restore(&CgroupBaseline::default()).is_ok());
     }
 }
