@@ -5,6 +5,7 @@
 //! (populated via the control-port bus) and translating every mutation to a
 //! `manager.*` control RPC.  The bridge never touches System A's allocator.
 
+pub mod activator;
 pub mod manager;
 pub mod mount_obj;
 pub mod properties;

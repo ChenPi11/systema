@@ -1435,7 +1435,7 @@ fn transient_unit_from_properties(
     // of 0) denote the *sender* of the call.
     if uf.kind == UnitKind::Scope {
         let mut scope = ScopeSection::default();
-        if let Some(pids) = prop_u32s(props, "PIDs") {
+        if let Some(pids) = scope_pids(props) {
             if pids.is_empty() {
                 if let Some(pid) = sender_pid {
                     scope.pids = vec![pid.to_string()];
@@ -1452,13 +1452,32 @@ fn transient_unit_from_properties(
                     })
                     .collect();
             }
-        } else if let Some(pid) = sender_pid {
-            scope.pids = vec![pid.to_string()];
         }
         uf.scope = Some(scope);
     }
 
     uf
+}
+
+/// The processes a transient scope wraps, as `PIDs=` / `PIDFDs=` list them.
+///
+/// `PIDFDs=` reaches here already resolved to PIDs by the D-Bus bridge (see
+/// `push_prop_value`), so both spellings mean the same thing over this link.
+///
+/// `None` means *neither* key was present, i.e. the call named no processes
+/// at all.  That is deliberately not the same as an explicitly empty list:
+/// falling back to the sender would drag whatever process asked — logind asks
+/// for every session scope — into the scope's cgroup, to die with it.
+fn scope_pids(props: &[TransientProperty]) -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
+    let mut any_key = false;
+    for key in ["PIDs", "PIDFDs"] {
+        if let Some(listed) = prop_u32s(props, key) {
+            any_key = true;
+            pids.extend(listed);
+        }
+    }
+    any_key.then_some(pids)
 }
 
 fn prop_string<'a>(props: &'a [TransientProperty], key: &str) -> Option<String> {
@@ -2132,5 +2151,51 @@ use std::collections::{HashMap, HashSet};
             wanted_by: None,
             required_by: None,
         }
+    }
+
+    fn scope_prop(key: &str, pid: u64) -> TransientProperty {
+        TransientProperty {
+            key: key.to_string(),
+            value: Some(ManagerValue {
+                value: Some(Value::U(pid)),
+            }),
+        }
+    }
+
+    #[test]
+    fn scope_pids_reads_both_spellings() {
+        // Neither key present names nobody at all — that is a different
+        // statement from an explicitly empty list.
+        assert_eq!(scope_pids(&[]), None);
+        assert_eq!(scope_pids(&[scope_prop("Description", 0)]), None);
+
+        assert_eq!(scope_pids(&[scope_prop("PIDs", 1)]), Some(vec![1]));
+        assert_eq!(scope_pids(&[scope_prop("PIDFDs", 4111)]), Some(vec![4111]));
+        assert_eq!(
+            scope_pids(&[scope_prop("PIDs", 1), scope_prop("PIDFDs", 4111)]),
+            Some(vec![1, 4111])
+        );
+    }
+
+    #[test]
+    fn transient_scope_takes_pids_from_pidfds() {
+        // logind names a session scope's processes by pidfd; the D-Bus bridge
+        // resolves them to PIDs (push_prop_value), so they arrive here under
+        // `PIDFDs=` and must end up as the scope's own PIDs=.
+        let props = vec![scope_prop("PIDFDs", 4111)];
+        let uf = transient_unit_from_properties("session-c3.scope", &props, Some(888));
+        let scope = uf.scope.expect("scope section");
+        assert_eq!(scope.pids, vec!["4111".to_string()]);
+    }
+
+    #[test]
+    fn transient_scope_without_pids_does_not_swallow_the_sender() {
+        // A scope that lists no processes must stay empty rather than default
+        // to whoever asked.  logind issues every session scope, so the old
+        // sender fallback moved logind itself into the sessions it was
+        // creating — and would have taken it down with them.
+        let uf = transient_unit_from_properties("session-c3.scope", &[], Some(888));
+        let scope = uf.scope.expect("scope section");
+        assert!(scope.pids.is_empty());
     }
 }

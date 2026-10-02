@@ -5,6 +5,7 @@
 //! systemd blocking semantics by waiting on the bridge's [`JobWatcher`]
 //! (fed by `job.completed` events), instead of polling the allocator.
 
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use zbus::interface;
@@ -154,6 +155,19 @@ fn unit_info_entry(snap: &UnitSnapshot) -> UnitInfo {
 // Value translation for property bags (a(sv) → proto PropertyBag)
 // --------------------------------------------------------------------------
 
+/// Read the PID a pidfd refers to.
+///
+/// The kernel writes a `Pid:` line into a pidfd's `fdinfo` and nothing of the
+/// sort for any other kind of descriptor, which is how the two are told apart;
+/// `Ok(None)` therefore means "this is not a pidfd".
+fn pid_from_pidfd(raw: std::os::fd::RawFd) -> std::io::Result<Option<u32>> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{raw}"))?;
+    Ok(info
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:").map(str::trim))
+        .and_then(|pid| pid.parse().ok()))
+}
+
 /// Push one proto property entry for `key`, expanding string/u32/u64/bool
 /// arrays into multiple same-key `Value::S` / `Value::U` / `Value::B` entries
 /// so the server's `prop_strings` / `prop_u32s` bag readers reconstruct the
@@ -202,6 +216,29 @@ fn push_prop_value(out: &mut Vec<TransientProperty>, key: &str, value: &OwnedVal
                                 key,
                                 sysa::proto::manager_value::Value::B(*b),
                             );
+                        }
+                    }
+                    "h" => {
+                        // `PIDFDs=` (ah) — logind names a session scope's
+                        // processes by pidfd.  The control protocol has no
+                        // file-descriptor type, so resolve each descriptor to
+                        // the PID it refers to while it is still open here.
+                        if let zvariant::Value::Fd(fd) = item {
+                            match pid_from_pidfd(fd.as_raw_fd()) {
+                                Ok(Some(pid)) => push_prop_entry(
+                                    out,
+                                    key,
+                                    sysa::proto::manager_value::Value::U(pid as u64),
+                                ),
+                                Ok(None) => debug!(
+                                    "dropping {key} entry: fd {} is not a pidfd",
+                                    fd.as_raw_fd()
+                                ),
+                                Err(e) => debug!(
+                                    "dropping {key} entry: cannot read fdinfo for fd {}: {e}",
+                                    fd.as_raw_fd()
+                                ),
+                            }
                         }
                     }
                     _ => {}
@@ -392,20 +429,20 @@ impl ManagerInterface {
     }
 
     async fn get_unit_by_pidfd(&self, fd: zvariant::OwnedFd) -> zbus::fdo::Result<OwnedObjectPath> {
-        use std::os::fd::AsRawFd;
         debug!("D-Bus GetUnitByPIDFD");
         let raw = fd.as_raw_fd();
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{raw}")).map_err(|e| {
-            zbus::fdo::Error::InvalidArgs(format!("cannot read fdinfo for fd {raw}: {e}"))
-        })?;
-        let pid = info
-            .lines()
-            .find_map(|line| line.strip_prefix("Pid:").map(str::trim))
-            .and_then(|pid| pid.parse::<u32>().ok());
-        let Some(pid) = pid else {
-            return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "fd {raw} is not a pidfd (no Pid: entry in fdinfo)"
-            )));
+        let pid = match pid_from_pidfd(raw) {
+            Ok(Some(pid)) => pid,
+            Ok(None) => {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "fd {raw} is not a pidfd (no Pid: entry in fdinfo)"
+                )));
+            }
+            Err(e) => {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "cannot read fdinfo for fd {raw}: {e}"
+                )));
+            }
         };
         self.get_unit_by_pid(pid).await
     }
@@ -436,6 +473,20 @@ impl ManagerInterface {
         info!("D-Bus StartUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
         self.enqueue_and_wait(name, "start", mode, false, true).await
+    }
+
+    /// Queue a start job without waiting for it — the enqueue half of an
+    /// `org.freedesktop.systemd1.Activator.ActivationRequest`.
+    ///
+    /// systemd's `signal_activation_request()` only enqueues: a signal has no
+    /// reply, so dbus-daemon learns the activation succeeded by watching the
+    /// unit claim its bus name, not from us.  Waiting here would park the
+    /// activation listener for [`JOB_WAIT_TIMEOUT`] per request without telling
+    /// dbus-daemon anything it does not already discover on its own.
+    pub(crate) async fn enqueue_for_activation(&self, unit: &str) -> zbus::fdo::Result<()> {
+        self.enqueue_and_wait(unit, "start", "replace", false, false)
+            .await?;
+        Ok(())
     }
 
     async fn stop_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
@@ -1477,5 +1528,76 @@ mod tests {
             .any(|p| p.key == "Description"
                 && matches!(p.value.as_ref().unwrap().value, Some(sysa::proto::manager_value::Value::S(_)))));
         assert!(bag.properties.iter().any(|p| p.key == "DefaultDependencies"));
+    }
+
+    /// Open a pidfd naming `pid`.  Needs Linux 5.3+.
+    fn pidfd_for(pid: u32) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        assert!(
+            raw >= 0,
+            "pidfd_open({pid}): {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) }
+    }
+
+    #[test]
+    fn pid_from_pidfd_reads_the_pid_it_names() {
+        let fd = pidfd_for(std::process::id());
+        assert_eq!(
+            pid_from_pidfd(fd.as_raw_fd()).expect("fdinfo readable"),
+            Some(std::process::id())
+        );
+    }
+
+    #[test]
+    fn pid_from_pidfd_rejects_ordinary_descriptors() {
+        // An ordinary descriptor's fdinfo carries no `Pid:` line at all, and
+        // that absence is the only thing separating a pidfd from the rest.
+        let file = std::fs::File::open("/proc/self").expect("open /proc/self");
+        assert_eq!(
+            pid_from_pidfd(file.as_raw_fd()).expect("fdinfo readable"),
+            None
+        );
+    }
+
+    /// `PIDFDs=` (ah) is how logind names a session scope's processes.  The
+    /// control protocol carries no file descriptors, so the bridge has to
+    /// resolve each one to the PID it names before the request goes over IPC.
+    #[test]
+    fn properties_to_bag_resolves_pidfds_into_pids() {
+        let own = pidfd_for(std::process::id());
+        let mut arr = zvariant::Array::new(zvariant::Signature::from_str_unchecked("h"));
+        arr.append(zvariant::Value::Fd(zvariant::Fd::Owned(own)))
+            .expect("h element inside ah array");
+        let pidfd_list = OwnedValue::try_from(zvariant::Value::Array(arr)).expect("owned array");
+
+        let bag = properties_to_bag(&[("PIDFDs".to_string(), pidfd_list)]).expect("bag");
+        let resolved: Vec<_> = bag
+            .properties
+            .iter()
+            .filter(|p| p.key == "PIDFDs")
+            .collect();
+
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(
+            resolved[0].value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(sysa::proto::manager_value::Value::U(pid)) if *pid == std::process::id() as u64
+        ));
+    }
+
+    /// A descriptor that is not a pidfd must be dropped, not turned into a
+    /// plausible-looking PID.
+    #[test]
+    fn properties_to_bag_drops_non_pidfd_handles() {
+        let file = std::fs::File::open("/proc/self").expect("open /proc/self");
+        let mut arr = zvariant::Array::new(zvariant::Signature::from_str_unchecked("h"));
+        arr.append(zvariant::Value::Fd(zvariant::Fd::Owned(file.into())))
+            .expect("h element inside ah array");
+        let value = OwnedValue::try_from(zvariant::Value::Array(arr)).expect("owned array");
+
+        let bag = properties_to_bag(&[("PIDFDs".to_string(), value)]).expect("bag");
+        assert!(bag.properties.iter().all(|p| p.key != "PIDFDs"));
     }
 }

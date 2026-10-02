@@ -29,3 +29,6 @@ zbus.workspace = true
 zvariant.workspace = true
 uuid.workspace = true
 once_cell.workspace = true
+
+[dev-dependencies]
+libc = "0.2"

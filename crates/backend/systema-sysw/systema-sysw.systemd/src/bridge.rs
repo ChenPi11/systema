@@ -169,6 +169,13 @@ pub async fn run() -> Result<()> {
     let conn = dbus::run_dbus(&ctx).await?;
     let _conn = conn; // kept alive by ctx.conn, but hold it for safety
 
+    // dbus-daemon's systemd-style activation reaches us over a signal rather
+    // than a method call, so it needs its own listener beside the object
+    // server.  Tie it to this bridge session: a listener that outlived it
+    // would keep `conn` — and with it `org.freedesktop.systemd1` — alive, and
+    // the safety check in `run_dbus` would then refuse every reconnect.
+    let activation = tokio::spawn(dbus::activator::run(ctx.clone()));
+
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let events = client.events();
     tokio::spawn(async move {
@@ -190,6 +197,10 @@ pub async fn run() -> Result<()> {
 
     info!("systema-sysw.systemd bridge running");
     let _ = event_task.await;
+    // Drop the activation listener — and with it the `zbus::Connection` it
+    // holds — before the reconnect loop claims the bus name again.
+    activation.abort();
+    let _ = activation.await;
     anyhow::bail!("control session ended — reconnect required")
 }
 
