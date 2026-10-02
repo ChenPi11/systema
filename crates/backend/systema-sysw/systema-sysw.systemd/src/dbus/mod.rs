@@ -108,7 +108,6 @@ pub async fn register_unit_object(
         }
         "slice" => {
             let obj = slice_obj::SliceObject {
-                ctx: ctx.clone(),
                 unit_name: unit_name.to_string(),
             };
             if let Err(e) = conn.object_server().at(path.clone(), obj).await {

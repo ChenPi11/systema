@@ -5,6 +5,7 @@ name = "systema-sysm-linux"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "systema-sysm-linux"
@@ -22,7 +23,6 @@ systema-sysm-common = { path = "../systema-sysm-common" }
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true

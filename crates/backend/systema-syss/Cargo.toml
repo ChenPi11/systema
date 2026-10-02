@@ -3,6 +3,7 @@ name = "systema-syss"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "systema-syss"
@@ -14,14 +15,12 @@ sysa = { path = "../../libsysa" }
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 parking_lot.workspace = true
 zbus.workspace = true
 

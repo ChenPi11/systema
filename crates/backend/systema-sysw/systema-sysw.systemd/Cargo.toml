@@ -5,6 +5,7 @@ name = "systema-sysw-systemd"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "systema-sysw-systemd"

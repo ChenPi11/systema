@@ -1376,8 +1376,6 @@ dependencies = [
  "libc",
  "prost",
  "prost-build",
- "prost-types",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1426,7 +1424,6 @@ dependencies = [
  "sysa",
  "systema-sysf",
  "systema-sysf-systemd",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1484,11 +1481,8 @@ dependencies = [
  "nix",
  "parking_lot",
  "prost",
- "serde",
- "serde_json",
  "sysa",
  "systema-sysr-common",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1522,7 +1516,6 @@ dependencies = [
  "serde_json",
  "sysa",
  "systema-sysf",
- "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1592,7 +1585,6 @@ dependencies = [
  "sysa",
  "systema-sysf",
  "systema-sysm-common",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1614,7 +1606,6 @@ dependencies = [
  "sysa",
  "systema-sysf",
  "systema-sysm-common",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1662,7 +1653,6 @@ name = "systema-sysr-common"
 version = "0.1.0"
 dependencies = [
  "sysa",
- "thiserror",
  "tracing",
 ]
 
@@ -1686,9 +1676,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "serde",
- "serde_json",
  "sysa",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1783,26 +1771,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
 ]
 
 [[package]]

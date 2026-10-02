@@ -234,9 +234,6 @@ pub fn execute_action(action: PowerAction, policy: PowerCtl) -> Result<()> {
 /// backend performs the real `reboot(2)` transition; the no-op backend
 /// reports the transition as unsupported so the unit is left inert.
 pub trait PowerController: Send + Sync {
-    /// Whether this backend can actually perform power transitions.
-    fn available(&self) -> bool;
-
     /// Execute a power transition.
     ///
     /// On the Linux backend this calls the libc `reboot(2)` system call,
@@ -248,20 +245,16 @@ pub trait PowerController: Send + Sync {
 
 /// The Linux `reboot(2)` backend.
 ///
-/// `available()` is always true on Linux.  `execute()` calls `libc::reboot`
-/// with the appropriate `LINUX_REBOOT_CMD_*` constant; on success it does
-/// **not return** (the machine goes down).  If the caller still observes a
-/// return value it means the transition failed (an error result).
+/// `execute()` calls `libc::reboot` with the appropriate
+/// `LINUX_REBOOT_CMD_*` constant; on success it does **not return** (the
+/// machine goes down).  If the caller still observes a return value it means
+/// the transition failed (an error result).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxPowerController;
 
 #[cfg(target_os = "linux")]
 impl PowerController for LinuxPowerController {
-    fn available(&self) -> bool {
-        true
-    }
-
     fn execute(&self, action: PowerAction) -> Result<()> {
         let cmd = match action {
             PowerAction::Poweroff => libc::LINUX_REBOOT_CMD_POWER_OFF,
@@ -286,16 +279,16 @@ impl PowerController for LinuxPowerController {
     }
 }
 
-/// A controller that reports `available() == false` and refuses every
-/// transition.  Used on platforms without a power backend.
+/// A controller that refuses every transition.
+///
+/// Used on platforms without a power backend, so `execute_action` still has
+/// something to call.  On Linux nothing constructs it — `LinuxPowerController`
+/// is compiled in instead — hence the `allow`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopController;
 
 impl PowerController for NoopController {
-    fn available(&self) -> bool {
-        false
-    }
-
     fn execute(&self, action: PowerAction) -> Result<()> {
         anyhow::bail!("power action '{action}' not supported: no power backend available")
     }
@@ -367,8 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn noop_controller_is_unavailable() {
-        assert!(!NoopController.available());
+    fn noop_controller_refuses_every_transition() {
         assert!(
             NoopController.execute(PowerAction::Poweroff).is_err(),
             "no-op backend must refuse every transition"

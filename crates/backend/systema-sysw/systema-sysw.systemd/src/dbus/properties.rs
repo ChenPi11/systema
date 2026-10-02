@@ -78,7 +78,6 @@ impl Properties {
             }
             "org.freedesktop.systemd1.Slice" if kind == "slice" => {
                 let obj = SliceObject {
-                    ctx: self.ctx.clone(),
                     unit_name: self.unit_name.clone(),
                 };
                 Some(obj.get_all().await)
@@ -222,7 +221,6 @@ impl Properties {
             }
             "org.freedesktop.systemd1.Slice" if kind == "slice" => {
                 let obj = SliceObject {
-                    ctx: self.ctx.clone(),
                     unit_name: self.unit_name.clone(),
                 };
                 obj.get(&prop_name).await

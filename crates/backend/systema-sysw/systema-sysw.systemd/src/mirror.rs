@@ -45,6 +45,7 @@ impl UnitMirror {
     }
 
     /// Replace the live-jobs projection wholesale.
+    #[cfg(test)]
     pub fn set_jobs(&mut self, jobs: Vec<JobInfo>) {
         self.running_jobs = jobs;
     }

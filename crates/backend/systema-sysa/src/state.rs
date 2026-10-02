@@ -1501,7 +1501,7 @@ mod tests {
         // would make lightdm never start in the VM.
         let mut state = AllocatorState::new();
 
-        let mut lightdm = UnitIR {
+        let lightdm = UnitIR {
             id: "lightdm.service".to_string(),
             unit_type: Some(UnitType::Service),
             description: None,

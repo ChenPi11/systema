@@ -5,6 +5,7 @@ name = "systema-sysf-systemd"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "systema-sysf-systemd"
@@ -16,7 +17,6 @@ sysa = { path = "../../../libsysa" }
 systema-sysf = { path = ".." }
 tokio.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true

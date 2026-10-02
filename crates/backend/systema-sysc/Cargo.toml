@@ -3,6 +3,7 @@ name = "systema-sysc"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "systema-sysc"

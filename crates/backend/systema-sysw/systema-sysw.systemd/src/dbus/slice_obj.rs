@@ -1,13 +1,8 @@
 //! Per-unit `Slice` interface (bridge).
 
-use std::sync::Arc;
-
 use zbus::interface;
 
-use super::BridgeContext;
-
 pub struct SliceObject {
-    pub ctx: Arc<BridgeContext>,
     pub unit_name: String,
 }
 

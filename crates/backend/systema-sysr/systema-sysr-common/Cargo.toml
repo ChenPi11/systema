@@ -3,8 +3,8 @@ name = "systema-sysr-common"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 sysa = { path = "../../../libsysa" }
-thiserror.workspace = true
 tracing.workspace = true

@@ -690,7 +690,6 @@ async fn control_phase(
     procs: &[Spawned],
     grace: Duration,
     ready_timeout: Duration,
-    power_ctl: power::PowerCtl,
 ) -> Result<Option<i32>> {
     if !procs.iter().any(|p| p.name == "sysa") {
         warn!("System A is not in the process set; skipping control phase");
@@ -935,7 +934,7 @@ pub async fn run(
     }
 
     // --- Phase 3: control plane (daemon-reload + start enabled units). ---
-    if let Some(code) = control_phase(&mut ctx, &procs, grace, ready_timeout, power_ctl).await? {
+    if let Some(code) = control_phase(&mut ctx, &procs, grace, ready_timeout).await? {
         notify.shutdown();
         drop(reaper);
         return Ok(code);
