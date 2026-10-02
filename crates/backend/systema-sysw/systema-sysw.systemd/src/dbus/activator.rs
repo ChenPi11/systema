@@ -181,7 +181,6 @@ async fn emit_activation_failure(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use futures::StreamExt as _;
     use prost::Message as _;
     use tokio::net::UnixStream;
 
@@ -192,7 +191,6 @@ mod tests {
     use super::*;
     use crate::dbus::BridgeContext;
     use crate::mirror::{MirrorHandle, UnitMirror};
-    use crate::watcher::JobWatcher;
 
     /// Control-port server that records every `manager.enqueue` it is asked
     /// to perform and never reports the job terminal — so a caller that waits
@@ -267,7 +265,7 @@ mod tests {
                 .unwrap(),
         );
         let mirror: MirrorHandle = Arc::new(parking_lot::RwLock::new(UnitMirror::new()));
-        let ctx = BridgeContext::new(mirror, client, JobWatcher::new());
+        let ctx = BridgeContext::new(mirror, client);
         (ctx, seen)
     }
 

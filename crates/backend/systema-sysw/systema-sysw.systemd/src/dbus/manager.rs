@@ -1,22 +1,20 @@
 //! Bridge implementation of `org.freedesktop.systemd1.Manager`.
 //!
 //! Reads come from the control-port [`UnitMirror`]; every mutation is
-//! translated to a `manager.*` control RPC.  StartUnit & friends keep their
-//! systemd blocking semantics by waiting on the bridge's [`JobWatcher`]
-//! (fed by `job.completed` events), instead of polling the allocator.
+//! translated to a `manager.*` control RPC.  Job methods reply as soon as the
+//! job is queued — the returned job path is a reference value and completion
+//! arrives as the `JobRemoved` signal, exactly as systemd does.  Holding the
+//! reply until the job finished would pin a caller's connection for the whole
+//! job: logind sits inside `CreateSession` waiting for its `StartUnit`, so
+//! every other request made against logind queues up behind that one reply.
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use zbus::interface;
 use zvariant::{OwnedObjectPath, OwnedValue};
 
 use super::BridgeContext;
-
-/// How long StartUnit & friends wait for their job to reach a terminal state
-/// before replying with the job path anyway (sd-bus clients default to a 25s
-/// method timeout, so this bounds the wait below that).
-const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 use sysa::proto::{
     EnqueueJobRequest, EnqueueJobResult, LoadUnitRequest, LoadUnitResult, RefUnitRequest,
@@ -298,15 +296,21 @@ impl ManagerInterface {
         ManagerInterface { ctx }
     }
 
-    /// Enqueue a job by type string and block until it completes (systemd
-    /// StartUnit semantics), returning the job path.
-    async fn enqueue_and_wait(
+    /// Enqueue a job by type string and return its job path immediately.
+    ///
+    /// systemd's `bus_unit_queue_job()` sends the reply before the job has run
+    /// (`sd_bus_message_send(reply)` sits ahead of the job's own state
+    /// machine), so callers learn the outcome from `JobRemoved` rather than
+    /// from this method's reply.  Waiting here would pin a caller's connection
+    /// for the whole job, which is what froze logind: it blocks inside
+    /// `CreateSession` on this reply, and `systemd-user-runtime-dir`'s property
+    /// reads against logind then queue up until the reply finally lands.
+    async fn enqueue_job(
         &self,
         name: &str,
         job_type: &str,
         mode: &str,
         reload_if_possible: bool,
-        wait: bool,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         let req = EnqueueJobRequest {
             name: name.to_string(),
@@ -324,22 +328,7 @@ impl ManagerInterface {
             return Err(zbus::fdo::Error::Failed(reply.message));
         }
         super::ensure_unit_object(&self.ctx, &reply.unit_name).await;
-        if wait {
-            self.wait_job_completion(reply.job_id).await;
-        }
         Ok(job_object_path(reply.job_id))
-    }
-
-    async fn wait_job_completion(&self, job_id: u64) {
-        match tokio::time::timeout(JOB_WAIT_TIMEOUT, self.ctx.jobs.wait(job_id)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                debug!("waiting on job {job_id} ended with disconnection: {e}");
-            }
-            Err(_) => {
-                warn!("Job {job_id} did not complete within {JOB_WAIT_TIMEOUT:?}; replying with the job path anyway");
-            }
-        }
     }
 
     async fn emit_reloading(&self) {
@@ -472,51 +461,48 @@ impl ManagerInterface {
     async fn start_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus StartUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "start", mode, false, true).await
+        self.enqueue_job(name, "start", mode, false).await
     }
 
-    /// Queue a start job without waiting for it — the enqueue half of an
+    /// Queue a start job on behalf of an
     /// `org.freedesktop.systemd1.Activator.ActivationRequest`.
     ///
     /// systemd's `signal_activation_request()` only enqueues: a signal has no
     /// reply, so dbus-daemon learns the activation succeeded by watching the
-    /// unit claim its bus name, not from us.  Waiting here would park the
-    /// activation listener for [`JOB_WAIT_TIMEOUT`] per request without telling
-    /// dbus-daemon anything it does not already discover on its own.
+    /// unit claim its bus name, not from us.
     pub(crate) async fn enqueue_for_activation(&self, unit: &str) -> zbus::fdo::Result<()> {
-        self.enqueue_and_wait(unit, "start", "replace", false, false)
-            .await?;
+        self.enqueue_job(unit, "start", "replace", false).await?;
         Ok(())
     }
 
     async fn stop_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus StopUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "stop", mode, false, true).await
+        self.enqueue_job(name, "stop", mode, false).await
     }
 
     async fn restart_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus RestartUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "restart", mode, false, true).await
+        self.enqueue_job(name, "restart", mode, false).await
     }
 
     async fn reload_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus ReloadUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "reload", mode, false, true).await
+        self.enqueue_job(name, "reload", mode, false).await
     }
 
     async fn try_restart_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus TryRestartUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "try-restart", mode, false, true).await
+        self.enqueue_job(name, "try-restart", mode, false).await
     }
 
     async fn try_reload_unit(&self, name: &str, mode: &str) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus TryReloadUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "try-reload", mode, false, true).await
+        self.enqueue_job(name, "try-reload", mode, false).await
     }
 
     async fn reload_or_restart_unit(
@@ -526,7 +512,7 @@ impl ManagerInterface {
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus ReloadOrRestartUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "reload-or-restart", mode, true, true)
+        self.enqueue_job(name, "reload-or-restart", mode, true)
             .await
     }
 
@@ -537,7 +523,7 @@ impl ManagerInterface {
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         info!("D-Bus ReloadOrTryRestartUnit: {} (mode={})", name, mode);
         parse_job_mode(mode)?;
-        self.enqueue_and_wait(name, "reload-or-try-restart", mode, true, true)
+        self.enqueue_job(name, "reload-or-try-restart", mode, true)
             .await
     }
 
@@ -668,7 +654,6 @@ impl ManagerInterface {
             return Err(zbus::fdo::Error::Failed(reply.message));
         }
         super::ensure_unit_object(&self.ctx, &reply.unit_name).await;
-        self.wait_job_completion(reply.job_id).await;
         Ok(job_object_path(reply.job_id))
     }
 

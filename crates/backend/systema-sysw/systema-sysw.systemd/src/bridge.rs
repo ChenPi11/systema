@@ -15,7 +15,6 @@ use systema_sysw_common::ControlClient;
 use crate::dbus;
 use crate::dbus::manager::{job_object_path, ManagerInterface};
 use crate::mirror::{MirrorHandle, UnitMirror};
-use crate::watcher::JobWatcher;
 
 /// Prime the mirror from the initial snapshot + job listings.
 async fn seed(ctx: &Arc<dbus::BridgeContext>) -> Result<()> {
@@ -137,7 +136,6 @@ async fn event_loop(ctx: Arc<dbus::BridgeContext>, mut rx: mpsc::UnboundedReceiv
             ControlEventKind::JobCompleted => {
                 if let Ok(payload) = sysa::proto::JobEvent::decode(event.envelope.payload.as_slice())
                 {
-                    ctx.jobs.notify(payload.job_id, &payload.result);
                     ctx.mirror.write().remove_job(payload.job_id);
                 }
             }
@@ -161,8 +159,7 @@ pub async fn run() -> Result<()> {
     let client = Arc::new(ControlClient::connect(flavor, Some("system-w-1")).await?);
 
     let mirror: MirrorHandle = Arc::new(parking_lot::RwLock::new(UnitMirror::new()));
-    let jobs: Arc<JobWatcher> = JobWatcher::new();
-    let ctx = dbus::BridgeContext::new(mirror, client.clone(), jobs);
+    let ctx = dbus::BridgeContext::new(mirror, client.clone());
 
     seed(&ctx).await?;
 
@@ -217,7 +214,7 @@ mod tests {
 
     use crate::dbus::BridgeContext;
 
-    /// Minimal control-bus server for the blocking-StartUnit test: answers
+    /// Minimal control-bus server for the StartUnit test: answers
     /// `manager.enqueue` and immediately pushes `job.new` + `job.completed`.
     async fn mock_server(mut framed: sysa::ipc::EnvelopeFramed) -> anyhow::Result<()> {
         loop {
@@ -254,10 +251,11 @@ mod tests {
                     )?;
                     send_envelope(&mut framed, &reply).await?;
 
-                    for (method, result) in [
+                    let events = [
                         ("job.new", String::new()),
                         ("job.completed", "done".to_string()),
-                    ] {
+                    ];
+                    for (i, (method, result)) in events.into_iter().enumerate() {
                         let event = make_envelope(
                             0,
                             "system-a",
@@ -270,6 +268,14 @@ mod tests {
                             },
                         )?;
                         send_envelope(&mut framed, &event).await?;
+                        if i == 0 {
+                            // Hold `job.completed` back for a beat: both events
+                            // are pushed back-to-back, so without a gap the
+                            // mirror's "job present" state is only ever visible
+                            // inside one event-loop pass and the test could
+                            // never observe it.
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
                     }
                 }
                 other => {
@@ -289,16 +295,35 @@ mod tests {
         }
     }
 
+    /// Wait until `job_id` has shown up in the mirror and has then been
+    /// dropped from it — i.e. the event loop applied both `job.new` and
+    /// `job.completed`.
+    async fn mirror_sees_job_transition(ctx: &Arc<BridgeContext>, job_id: u64) {
+        for expect_present in [true, false] {
+            loop {
+                let present = ctx
+                    .mirror
+                    .read()
+                    .running_jobs()
+                    .iter()
+                    .any(|j| j.job_id == job_id);
+                if present == expect_present {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn blocking_start_unit_resolves_on_job_completed() {
+    async fn start_unit_reply_is_queued_then_job_events_reach_the_mirror() {
         let (server, client) = UnixStream::pair().unwrap();
         let server_framed = sysa::ipc::frame_stream(server);
         tokio::spawn(async move { mock_server(server_framed).await });
 
         let client = Arc::new(ControlClient::connect_on(client, "test", None).await.unwrap());
         let mirror: MirrorHandle = Arc::new(parking_lot::RwLock::new(UnitMirror::new()));
-        let jobs = JobWatcher::new();
-        let ctx = BridgeContext::new(mirror, client.clone(), jobs.clone());
+        let ctx = BridgeContext::new(mirror, client.clone());
 
         // Forward pushed control events into the event loop, exactly like
         // `run()` does.
@@ -320,8 +345,8 @@ mod tests {
         });
         let event_task = tokio::spawn(event_loop(ctx.clone(), event_rx));
 
-        // Replicate `Manager::StartUnit`: enqueue the job, then block on its
-        // terminal result.
+        // Replicate `Manager::StartUnit`: it enqueues the job and replies with
+        // the job path straight away, without waiting for the job to run.
         let reply: EnqueueJobResult = client
             .call(
                 "manager.enqueue",
@@ -337,23 +362,20 @@ mod tests {
         assert_eq!(reply.job_id, 7);
         assert_eq!(reply.unit_name, "demo.service");
 
-        // The blocking half: `StartUnit` waits until `job.completed` arrives
-        // on the event stream and is relayed to the JobWatcher by the event
-        // loop.  Guard with a timeout so a regression fails fast instead of
-        // hanging the test suite.
-        let terminal = tokio::time::timeout(
+        // Completion then arrives asynchronously over the event stream:
+        // `job.new` populates the mirror, `job.completed` drains it, and on a
+        // live bus the same event emits `JobRemoved` carrying the result.
+        // Guard with a timeout so a regression fails fast instead of hanging
+        // the test suite.
+        tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            jobs.wait(reply.job_id),
+            mirror_sees_job_transition(&ctx, reply.job_id),
         )
         .await
-        .expect("job.completed must arrive within 5s")
-        .unwrap();
-        assert_eq!(terminal, "done");
+        .expect("job.new then job.completed must arrive within 5s");
 
         // The mirror tracked the job and removed it once terminal.
-        let mirror = ctx.mirror.read();
-        assert!(mirror.running_jobs().is_empty());
-        drop(mirror);
+        assert!(ctx.mirror.read().running_jobs().is_empty());
 
         event_task.abort();
     }

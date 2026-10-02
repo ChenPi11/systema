@@ -9,7 +9,6 @@
 mod bridge;
 mod dbus;
 mod mirror;
-mod watcher;
 
 use anyhow::Result;
 use clap::Parser;

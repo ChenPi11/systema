@@ -35,7 +35,6 @@ const BUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 use systema_sysw_common::ControlClient;
 
 use crate::mirror::MirrorHandle;
-use crate::watcher::JobWatcher;
 
 /// The well-known D-Bus bus name we claim.
 pub const BUS_NAME: &str = "org.freedesktop.systemd1";
@@ -45,20 +44,14 @@ pub const BUS_NAME: &str = "org.freedesktop.systemd1";
 pub struct BridgeContext {
     pub mirror: MirrorHandle,
     pub client: Arc<ControlClient>,
-    pub jobs: Arc<JobWatcher>,
     pub conn: Arc<OnceCell<zbus::Connection>>,
 }
 
 impl BridgeContext {
-    pub fn new(
-        mirror: MirrorHandle,
-        client: Arc<ControlClient>,
-        jobs: Arc<JobWatcher>,
-    ) -> Arc<Self> {
+    pub fn new(mirror: MirrorHandle, client: Arc<ControlClient>) -> Arc<Self> {
         Arc::new(Self {
             mirror,
             client,
-            jobs,
             conn: Arc::new(OnceCell::new()),
         })
     }
