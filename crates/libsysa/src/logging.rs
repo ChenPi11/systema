@@ -160,8 +160,14 @@ fn resolve_target(log_dir: &str, log_name: &str) -> LogTarget {
         Ok(_) => LogTarget::File(path),
         Err(e) => {
             eprintln!(
-                "Cannot open log file {} ({e}); falling back to stderr",
-                path.display()
+                "{}",
+                crate::l10n::fmt(
+                    crate::l10n::t_("Cannot open log file {path} ({e}); falling back to stderr"),
+                    &[
+                        ("path", &(path.display()).to_string()),
+                        ("e", &e.to_string())
+                    ]
+                )
             );
             LogTarget::Stderr
         }
@@ -225,7 +231,13 @@ pub fn init(log_dir: &str, log_name: &str, level: &str) -> LogTarget {
     let filter = match level.parse::<EnvFilter>() {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Invalid log level '{level}' ({e}); using info");
+            eprintln!(
+                "{}",
+                crate::l10n::fmt(
+                    crate::l10n::t_("Invalid log level '{level}' ({e}); using info"),
+                    &[("level", &level.to_string()), ("e", &e.to_string())]
+                )
+            );
             EnvFilter::new("info")
         }
     };
@@ -244,8 +256,16 @@ pub fn init(log_dir: &str, log_name: &str, level: &str) -> LogTarget {
                 Ok(file) => Box::new(file),
                 Err(e) => {
                     eprintln!(
-                        "Cannot open log file {} ({e}); falling back to stderr",
-                        path.display()
+                        "{}",
+                        crate::l10n::fmt(
+                            crate::l10n::t_(
+                                "Cannot open log file {path} ({e}); falling back to stderr"
+                            ),
+                            &[
+                                ("path", &(path.display()).to_string()),
+                                ("e", &e.to_string())
+                            ]
+                        )
                     );
                     Box::new(std::io::stderr())
                 }

@@ -97,7 +97,9 @@ fn ensure_dev_autofs() -> Result<i32> {
             libc::O_RDONLY | libc::O_CLOEXEC,
         );
         if fd < 0 {
-            anyhow::bail!("Failed to open /dev/autofs (is autofs kernel module loaded?)");
+            anyhow::bail!(sysa::l10n::t_(
+                "Failed to open /dev/autofs (is autofs kernel module loaded?)"
+            ));
         }
 
         // Verify version
@@ -109,7 +111,7 @@ fn ensure_dev_autofs() -> Result<i32> {
         );
         if rc < 0 {
             libc::close(fd);
-            anyhow::bail!("AUTOFS_DEV_IOCTL_VERSION failed");
+            anyhow::bail!(sysa::l10n::t_("AUTOFS_DEV_IOCTL_VERSION failed"));
         }
 
         info!(
@@ -151,12 +153,17 @@ fn open_ioctl_fd(dev_autofs_fd: i32, where_: &str, dev_id: u64) -> Result<i32> {
             buf.as_ptr() as *const libc::c_void,
         );
         if rc < 0 {
-            anyhow::bail!("AUTOFS_DEV_IOCTL_OPENMOUNT failed for {}", where_);
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("AUTOFS_DEV_IOCTL_OPENMOUNT failed for {path}"),
+                &[("path", &where_.to_string())]
+            ));
         }
 
         let ioctl_fd = params.ioctlfd;
         if ioctl_fd < 0 {
-            anyhow::bail!("AUTOFS_DEV_IOCTL_OPENMOUNT returned invalid fd");
+            anyhow::bail!(sysa::l10n::t_(
+                "AUTOFS_DEV_IOCTL_OPENMOUNT returned invalid fd"
+            ));
         }
 
         Ok(ioctl_fd)
@@ -176,7 +183,7 @@ fn check_autofs_protocol(dev_autofs_fd: i32, ioctl_fd: i32) -> Result<()> {
             &mut params as *mut _ as *mut libc::c_void,
         );
         if rc < 0 {
-            anyhow::bail!("AUTOFS_DEV_IOCTL_PROTOVER failed");
+            anyhow::bail!(sysa::l10n::t_("AUTOFS_DEV_IOCTL_PROTOVER failed"));
         }
         let major = params.arg1 as u32;
 
@@ -190,7 +197,7 @@ fn check_autofs_protocol(dev_autofs_fd: i32, ioctl_fd: i32) -> Result<()> {
             &mut params2 as *mut _ as *mut libc::c_void,
         );
         if rc < 0 {
-            anyhow::bail!("AUTOFS_DEV_IOCTL_PROTOSUBVER failed");
+            anyhow::bail!(sysa::l10n::t_("AUTOFS_DEV_IOCTL_PROTOSUBVER failed"));
         }
         let minor = params2.arg1 as u32;
 
@@ -213,7 +220,7 @@ fn set_autofs_timeout(dev_autofs_fd: i32, ioctl_fd: i32, timeout_sec: u32) -> Re
             &mut params as *mut _ as *mut libc::c_void,
         );
         if rc < 0 {
-            anyhow::bail!("AUTOFS_DEV_IOCTL_TIMEOUT failed");
+            anyhow::bail!(sysa::l10n::t_("AUTOFS_DEV_IOCTL_TIMEOUT failed"));
         }
     }
     Ok(())
@@ -238,11 +245,13 @@ fn send_ack_or_fail(ioctl_fd: i32, token: u32, success: bool) -> Result<()> {
             &mut params as *mut _ as *mut libc::c_void,
         );
         if rc < 0 {
-            anyhow::bail!(
-                "autofs reply (token={}) failed: {}",
-                token,
-                std::io::Error::last_os_error()
-            );
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("autofs reply (token={token}) failed: {error}"),
+                &[
+                    ("token", &token.to_string()),
+                    ("error", &(std::io::Error::last_os_error()).to_string())
+                ]
+            ));
         }
     }
     Ok(())
@@ -292,11 +301,13 @@ fn mount_autofs(pipe_write_fd: RawFd, where_: &str, extra_options: &str) -> Resu
             options_c.as_ptr() as *const libc::c_void,
         );
         if rc < 0 {
-            anyhow::bail!(
-                "mount(2) autofs failed for {}: {}",
-                where_,
-                std::io::Error::last_os_error()
-            );
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("mount(2) autofs failed for {path}: {error}"),
+                &[
+                    ("path", &where_.to_string()),
+                    ("error", &(std::io::Error::last_os_error()).to_string())
+                ]
+            ));
         }
     }
     Ok(())
@@ -332,7 +343,7 @@ pub async fn automount_enter_waiting(
     unsafe {
         let rc = libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC);
         if rc < 0 {
-            anyhow::bail!("pipe2 for automount failed");
+            anyhow::bail!(sysa::l10n::t_("pipe2 for automount failed"));
         }
         // Make read side non-blocking.
         let flags = libc::fcntl(pipe_fds[0], libc::F_GETFL, 0);
@@ -372,7 +383,10 @@ pub async fn automount_enter_waiting(
             let rc = libc::stat(path_c.as_ptr(), &mut st);
             if rc < 0 {
                 unmount_autofs(&where_)?;
-                anyhow::bail!("stat of automount point {} failed", where_);
+                anyhow::bail!(sysa::l10n::fmt(
+                    sysa::l10n::t_("stat of automount point {path} failed"),
+                    &[("path", &where_.to_string())]
+                ));
             }
         }
         st.st_dev

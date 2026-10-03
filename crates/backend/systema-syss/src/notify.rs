@@ -286,6 +286,8 @@ impl NotifyManager {
             pid,
             timeout_secs,
             |e| e.reload.as_ref().is_some_and(|r| r.done),
+            // sd_notify protocol tokens, not prose — interpolated verbatim
+            // into the translated "{what}" slot below.
             "READY=1 after RELOADING=1",
         )
         .await
@@ -305,7 +307,10 @@ impl NotifyManager {
                 let map = self.tracker.lock().unwrap();
                 match map.by_pid.get(&pid) {
                     None => {
-                        return Err(anyhow!("{unit_name}: sd_notify entry vanished"));
+                        return Err(anyhow!(sysa::l10n::fmt(
+                            sysa::l10n::t_("{unit_name}: sd_notify entry vanished"),
+                            &[("unit_name", &unit_name.to_string())]
+                        )));
                     }
                     Some(e) => done(e),
                 }
@@ -318,14 +323,26 @@ impl NotifyManager {
             if !is_alive(pid) || pid_is_zombie(pid) {
                 let mut map = self.tracker.lock().unwrap();
                 map.by_pid.remove(&pid);
-                return Err(anyhow!("{unit_name} (PID {pid}) exited before {what}"));
+                return Err(anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("{unit_name} (PID {pid}) exited before {what}"),
+                    &[
+                        ("unit_name", &unit_name.to_string()),
+                        ("pid", &pid.to_string()),
+                        ("what", &what.to_string())
+                    ]
+                )));
             }
             if Instant::now() >= deadline {
                 let mut map = self.tracker.lock().unwrap();
                 map.by_pid.remove(&pid);
-                return Err(anyhow!(
-                    "{unit_name} timed out waiting for {what} ({timeout_secs}s)"
-                ));
+                return Err(anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("{unit_name} timed out waiting for {what} ({timeout_secs}s)"),
+                    &[
+                        ("unit_name", &unit_name.to_string()),
+                        ("what", &what.to_string()),
+                        ("timeout_secs", &timeout_secs.to_string())
+                    ]
+                )));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

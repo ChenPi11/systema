@@ -253,7 +253,12 @@ pub async fn ensure_loaded_from_disk_in(
     });
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
-        .map_err(|_| anyhow::anyhow!("ensure_loaded_from_disk timed out loading '{name_err}'"))?;
+        .map_err(|_| {
+            anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("ensure_loaded_from_disk timed out loading '{name_err}'"),
+                &[("name_err", &name_err.to_string())]
+            ))
+        })?;
     result?
 }
 

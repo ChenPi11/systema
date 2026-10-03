@@ -27,7 +27,12 @@ pub fn scope_cgroup_path(slice: &str, unit_name: &str) -> String {
 /// Read the PIDs currently in the scope's cgroup (`cgroup.procs`).
 pub fn read_cgroup_procs(cgroup_path: &str) -> Result<Vec<u32>> {
     let content = fs::read_to_string(PathBuf::from(cgroup_path).join("cgroup.procs"))
-        .with_context(|| format!("cannot read {} cgroup.procs", cgroup_path))?;
+        .with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("cannot read {cgroup_path} cgroup.procs"),
+                &[("cgroup_path", &cgroup_path.to_string())],
+            )
+        })?;
     Ok(content
         .lines()
         .filter_map(|l| l.trim().parse::<u32>().ok())
@@ -61,8 +66,12 @@ pub fn signal_cgroup(cgroup_path: &str, signal: nix::sys::signal::Signal) -> Res
 /// Kill every process in the scope's cgroup subtree via the cgroup v2
 /// `cgroup.kill` file (equivalent to SIGKILL on all member processes).
 pub fn kill_cgroup(cgroup_path: &str) -> Result<()> {
-    fs::write(PathBuf::from(cgroup_path).join("cgroup.kill"), "1")
-        .with_context(|| format!("cannot write {} cgroup.kill", cgroup_path))
+    fs::write(PathBuf::from(cgroup_path).join("cgroup.kill"), "1").with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("cannot write {cgroup_path} cgroup.kill"),
+            &[("cgroup_path", &cgroup_path.to_string())],
+        )
+    })
 }
 
 /// Parse a `KillSignal=` value into a `nix` signal.  Accepts `"SIGTERM"`,

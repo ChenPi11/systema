@@ -92,13 +92,18 @@ impl UnitController for DeviceController {
 
     async fn start(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
         if !unit_name.ends_with(".device") {
-            anyhow::bail!("'{unit_name}' is not a .device unit");
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("'{unit_name}' is not a .device unit"),
+                &[("unit_name", &unit_name.to_string())]
+            ));
         }
         let cfg = decode_unit_config(config)?;
-        let device_cfg = cfg
-            .device
-            .clone()
-            .ok_or_else(|| anyhow!("No DeviceConfig for '{unit_name}'"))?;
+        let device_cfg = cfg.device.clone().ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No DeviceConfig for '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
 
         let dev = self.resolve_unit(unit_name, &device_cfg);
         let Some(dev) = dev else {
@@ -109,9 +114,12 @@ impl UnitController for DeviceController {
                 Some(device_cfg),
                 None,
                 (!invocation_id.is_empty()).then(|| invocation_id.to_string()),
-                Some("Device is not present".to_string()),
+                Some(sysa::l10n::t_("Device is not present").to_string()),
             );
-            anyhow::bail!("Device for '{unit_name}' is not present");
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Device for '{unit_name}' is not present"),
+                &[("unit_name", &unit_name.to_string())]
+            ));
         };
 
         self.commit_instance(
@@ -126,7 +134,9 @@ impl UnitController for DeviceController {
 
     async fn stop(&self, _unit_name: &str) -> Result<()> {
         // Devices cannot be stopped; they disappear when the hardware does.
-        anyhow::bail!("Operation refused: device units are managed by hardware state")
+        anyhow::bail!(sysa::l10n::t_(
+            "Operation refused: device units are managed by hardware state"
+        ))
     }
 
     async fn restart(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
@@ -135,13 +145,18 @@ impl UnitController for DeviceController {
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
         if !unit_name.ends_with(".device") {
-            anyhow::bail!("'{unit_name}' is not a .device unit");
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("'{unit_name}' is not a .device unit"),
+                &[("unit_name", &unit_name.to_string())]
+            ));
         }
         let cfg = decode_unit_config(config)?;
-        let device_cfg = cfg
-            .device
-            .clone()
-            .ok_or_else(|| anyhow!("No DeviceConfig for '{unit_name}'"))?;
+        let device_cfg = cfg.device.clone().ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No DeviceConfig for '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
 
         let dev = self.resolve_unit(unit_name, &device_cfg);
         self.commit_instance(

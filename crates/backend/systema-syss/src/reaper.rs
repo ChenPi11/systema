@@ -191,10 +191,19 @@ fn describe(pid: u32, status: i32) -> String {
     use nix::sys::wait::WaitStatus;
     let pid = nix::unistd::Pid::from_raw(pid as i32);
     match WaitStatus::from_raw(pid, status) {
-        Ok(WaitStatus::Exited(_, code)) => format!("exit code {code}"),
-        Ok(WaitStatus::Signaled(_, sig, _)) => format!("killed by {sig}"),
+        Ok(WaitStatus::Exited(_, code)) => sysa::l10n::fmt(
+            sysa::l10n::t_("exit code {code}"),
+            &[("code", &code.to_string())],
+        ),
+        Ok(WaitStatus::Signaled(_, sig, _)) => sysa::l10n::fmt(
+            sysa::l10n::t_("killed by {sig}"),
+            &[("sig", &sig.to_string())],
+        ),
         Ok(other) => format!("{other:?}"),
-        Err(_) => format!("raw status {status}"),
+        Err(_) => sysa::l10n::fmt(
+            sysa::l10n::t_("raw status {status}"),
+            &[("status", &status.to_string())],
+        ),
     }
 }
 

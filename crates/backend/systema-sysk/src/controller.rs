@@ -80,7 +80,7 @@ impl UnitController for SocketController {
         let sc = cfg
             .socket
             .as_ref()
-            .context("no SocketConfig in UnitConfig")?;
+            .context(sysa::l10n::t_("no SocketConfig in UnitConfig"))?;
         socket::start_socket(&self.manager, unit_name, sc)?;
         let service = Self::service_name(sc, unit_name);
         if sc.accept {

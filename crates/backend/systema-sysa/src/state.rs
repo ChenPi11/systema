@@ -440,7 +440,7 @@ impl AllocatorState {
             return;
         }
         let mut unit = UnitFile::new(ROOT_SLICE_NAME);
-        unit.unit.description = "Root Slice".to_string();
+        unit.unit.description = sysa::l10n::t_("Root Slice").to_string();
         unit.slice = Some(SliceSection::default());
         self.units.insert(ROOT_SLICE_NAME.to_string(), unit);
 
@@ -598,9 +598,12 @@ impl AllocatorState {
         units: HashMap<String, UnitIR>,
     ) -> Result<u32, String> {
         if !is_valid_staging_name(name) {
-            return Err(format!(
-                "invalid staging area name '{name}': must be at most 64 characters long \
-                 and contain only letters, underscores, slashes, backslashes, or hyphens"
+            return Err(sysa::l10n::fmt(
+                sysa::l10n::t_(
+                    "invalid staging area name '{name}': must be at most 64 characters long \
+                 and contain only letters, underscores, slashes, backslashes, or hyphens",
+                ),
+                &[("name", &name.to_string())],
             ));
         }
         let count = {
@@ -884,9 +887,9 @@ fn apply_ir_patch(ir: &UnitIR, uf: &mut UnitFile) {
 /// error so the worker that submitted the IR receives the failure.
 fn unit_file_from_ir(ir: &UnitIR) -> Result<(String, UnitFile), String> {
     let unit_type = ir.unit_type.as_ref().ok_or_else(|| {
-        format!(
-            "cannot create new unit \"{}\": missing required field \"unit_type\"",
-            ir.id
+        sysa::l10n::fmt(
+            sysa::l10n::t_("cannot create new unit \"{id}\": missing required field \"unit_type\""),
+            &[("id", &(ir.id).to_string())],
         )
     })?;
     let mut uf = UnitFile::new(&ir.id);

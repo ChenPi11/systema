@@ -18,6 +18,9 @@ async fn main() -> anyhow::Result<()> {
 /// Inert stub on non-Linux platforms: this worker is Linux-only.
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("systema-sysm.linux is a Linux-only worker; nothing to do.");
+    eprintln!(
+        "{}",
+        sysa::l10n::t_("systema-sysm.linux is a Linux-only worker; nothing to do.")
+    );
     std::process::exit(0);
 }

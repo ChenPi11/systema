@@ -347,10 +347,7 @@ async fn main() -> Result<()> {
                 count = missing.len()
             );
         } else {
-            bail!(
-                "{count} required executable(s) missing; aborting (use --no-strict to continue)",
-                count = missing.len()
-            );
+            bail!(sysa::l10n::fmt(sysa::l10n::t_("{count} required executable(s) missing; aborting (use --no-strict to continue)"), &[("count", &(missing.len()).to_string())]));
         }
     }
 

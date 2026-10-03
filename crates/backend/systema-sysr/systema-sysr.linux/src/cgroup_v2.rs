@@ -432,7 +432,7 @@ impl ResourceController for CgroupV2Controller {
     fn ensure(&self, path: &str, cfg: &ResourceConfig) -> Result<(), ResourceError> {
         let rel = self.rel(path).ok_or_else(|| ResourceError::Invalid {
             path: path.to_string(),
-            message: "path is outside the cgroup v2 hierarchy".to_string(),
+            message: sysa::l10n::t_("path is outside the cgroup v2 hierarchy").to_string(),
         })?;
 
         let mut cur = self.root.clone();
@@ -462,7 +462,7 @@ impl ResourceController for CgroupV2Controller {
     fn attach(&self, path: &str, pid: u32) -> Result<(), ResourceError> {
         let rel = self.rel(path).ok_or_else(|| ResourceError::Invalid {
             path: path.to_string(),
-            message: "path is outside the cgroup v2 hierarchy".to_string(),
+            message: sysa::l10n::t_("path is outside the cgroup v2 hierarchy").to_string(),
         })?;
         if rel.as_os_str().is_empty() {
             // The root cgroup already contains every process; nothing to do.
@@ -509,7 +509,7 @@ impl ResourceController for CgroupV2Controller {
     fn remove(&self, path: &str) -> Result<(), ResourceError> {
         let rel = self.rel(path).ok_or_else(|| ResourceError::Invalid {
             path: path.to_string(),
-            message: "path is outside the cgroup v2 hierarchy".to_string(),
+            message: sysa::l10n::t_("path is outside the cgroup v2 hierarchy").to_string(),
         })?;
         if rel.as_os_str().is_empty() {
             // Never remove the root cgroup.

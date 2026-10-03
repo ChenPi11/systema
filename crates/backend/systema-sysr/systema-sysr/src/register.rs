@@ -43,11 +43,16 @@ fn staging_lock() -> &'static Mutex<()> {
 
 /// Description of the static user container (systemd: "User and Session
 /// Slice").
-pub const USER_SLICE_DESCRIPTION: &str = "User and Session Slice";
+pub fn static_user_slice_description() -> String {
+    sysa::l10n::t_("User and Session Slice")
+}
 
 /// The description systemd uses for a per-user slice.
 pub fn user_slice_description(uid: u32) -> String {
-    format!("User Slice of UID {uid}")
+    sysa::l10n::fmt(
+        sysa::l10n::t_("User Slice of UID {uid}"),
+        &[("uid", &uid.to_string())],
+    )
 }
 
 /// Build the minimal `UnitIR` of a slice unit definition.
@@ -91,21 +96,28 @@ pub async fn commit_slice(unit_name: &str, description: &str) -> Result<()> {
 async fn commit_slice_with(client: &UnitFinder, unit_name: &str, description: &str) -> Result<()> {
     let _serial = staging_lock().lock().await;
     let units = HashMap::from([(unit_name.to_string(), user_slice_ir(unit_name, description))]);
-    let json = serde_json::to_vec(&units).context("Cannot serialise slice units")?;
+    let json =
+        serde_json::to_vec(&units).context(sysa::l10n::t_("Cannot serialise slice units"))?;
 
     let reg = client
         .register_units(STAGING_NAME, json)
         .await
-        .context("Cannot register slice units with System A")?;
+        .context(sysa::l10n::t_("Cannot register slice units with System A"))?;
     if !reg.success {
-        anyhow::bail!("System A refused the registration: {}", reg.message);
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("System A refused the registration: {message}"),
+            &[("message", &(reg.message).to_string())]
+        ));
     }
     let commit = client
         .commit_units(STAGING_NAME)
         .await
-        .context("Cannot commit slice units with System A")?;
+        .context(sysa::l10n::t_("Cannot commit slice units with System A"))?;
     if !commit.success {
-        anyhow::bail!("System A refused the commit: {}", commit.message);
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("System A refused the commit: {message}"),
+            &[("message", &(commit.message).to_string())]
+        ));
     }
     Ok(())
 }
@@ -165,7 +177,7 @@ pub fn synthesize_slice_chain(unit_name: &str) -> Option<Vec<UnitIR>> {
 /// The description systemd uses for a synthesized slice (best effort).
 fn slice_description(name: &str) -> Option<String> {
     if name == "user.slice" {
-        return Some(USER_SLICE_DESCRIPTION.to_string());
+        return Some(static_user_slice_description());
     }
     sysa::unit_name::parse_user_slice_uid(name).map(user_slice_description)
 }
@@ -252,7 +264,8 @@ mod tests {
 
         let container = &chain[1];
         assert_eq!(container.slice.as_deref(), Some("-.slice"));
-        assert_eq!(container.description.as_deref(), Some(USER_SLICE_DESCRIPTION));
+        let static_desc = static_user_slice_description();
+        assert_eq!(container.description.as_deref(), Some(static_desc.as_str()));
     }
 
     #[test]

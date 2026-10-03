@@ -728,7 +728,7 @@ impl WorkerIpc {
                                 .unwrap_or_else(|_| UnitStateUpdateAck {
                                     accepted: false,
                                     ignored_units: vec![],
-                                    message: "failed to decode ack".to_string(),
+                                    message: crate::l10n::t_("failed to decode ack").to_string(),
                                 });
                             let _ = ack_tx.send(ack);
                         } else {
@@ -812,7 +812,10 @@ async fn run_method<C: UnitController>(controller: &C, call: &MethodCall) -> Met
             .reload(&call.unit_name, &call.args)
             .await
             .map(|()| vec![]),
-        other => Err(anyhow::anyhow!("unknown method: {other}")),
+        other => Err(anyhow::anyhow!(crate::l10n::fmt(
+            crate::l10n::t_("unknown method: {other}"),
+            &[("other", &other.to_string())]
+        ))),
     };
     match result {
         Ok(payload) => {

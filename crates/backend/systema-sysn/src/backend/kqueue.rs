@@ -61,7 +61,10 @@ impl KqueueBackend {
         // SAFETY: kqueue() returns a new descriptor we own.
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
-            anyhow::bail!("kqueue() failed: {}", std::io::Error::last_os_error());
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("kqueue() failed: {error}"),
+                &[("error", &(std::io::Error::last_os_error()).to_string())]
+            ));
         }
         Ok(KqueueBackend {
             kq: unsafe { OwnedFd::from_raw_fd(kq) },

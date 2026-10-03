@@ -64,7 +64,12 @@ impl StagingAdmin {
     async fn send_op(&self, op: &str, uid: u32, name: &str) -> Result<AdminStagingResult> {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(crate::l10n::fmt(
+                    crate::l10n::t_("Failed to connect to System A: {e}"),
+                    &[("e", &e.to_string())]
+                ))
+            })?;
         let mut framed = frame_stream(stream);
 
         let query = AdminStagingOp {
@@ -75,19 +80,21 @@ impl StagingAdmin {
         let query_env = make_envelope(1, "", "system-a", "admin.staging", query)?;
         send_envelope(&mut framed, &query_env).await?;
 
-        let result_env = recv_envelope(&mut framed)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("System A disconnected before admin result."))?;
+        let result_env = recv_envelope(&mut framed).await?.ok_or_else(|| {
+            anyhow::anyhow!(crate::l10n::t_(
+                "System A disconnected before admin result."
+            ))
+        })?;
 
         if result_env.method != "admin.staging.result" {
-            anyhow::bail!(
-                "Expected 'admin.staging.result', got '{}'",
-                result_env.method
-            );
+            anyhow::bail!(crate::l10n::fmt(
+                crate::l10n::t_("Expected 'admin.staging.result', got '{method}'"),
+                &[("method", &(result_env.method).to_string())]
+            ));
         }
 
         let result = AdminStagingResult::decode(result_env.payload.as_slice())
-            .context("Failed to decode AdminStagingResult")?;
+            .context(crate::l10n::t_("Failed to decode AdminStagingResult"))?;
         Ok(result)
     }
 }

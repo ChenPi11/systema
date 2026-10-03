@@ -151,7 +151,7 @@ pub async fn start_service(
         let group = svc.group.clone();
         tokio::task::spawn_blocking(move || resolve_credentials(&user, &group))
             .await
-            .context("Credential lookup task failed")?
+            .context(sysa::l10n::t_("Credential lookup task failed"))?
             .with_context(|| {
                 sysa::l10n::fmt(
                     sysa::l10n::t_("Failed to resolve credentials for {unit_name}."),
@@ -572,26 +572,50 @@ fn resolve_credentials(user: &str, group: &str) -> Result<Option<Creds>> {
     let mut gid: Option<Gid> = None;
     if let Some(g) = &group {
         let gr = Group::from_name(g)
-            .with_context(|| format!("lookup of group '{g}' failed"))?
-            .ok_or_else(|| anyhow::anyhow!("group '{g}' not found"))?;
+            .with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("lookup of group '{g}' failed"),
+                    &[("g", &g.to_string())],
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("group '{g}' not found"),
+                    &[("g", &g.to_string())]
+                ))
+            })?;
         gid = Some(gr.gid);
     }
 
     let mut uid: Option<Uid> = None;
     let mut resolved_user: Option<String> = None;
     if let Some(u) = &username {
-        let found =
-            match User::from_name(u).with_context(|| format!("lookup of user '{u}' failed"))? {
-                Some(usr) => Some(usr),
-                // Numeric UID (systemd resolves `User=1000` via getpwuid).
-                None => u.parse::<u32>().ok().and_then(|n| {
-                    User::from_uid(Uid::from_raw(n))
-                        .with_context(|| format!("lookup of uid '{n}' failed"))
-                        .ok()
-                        .flatten()
-                }),
-            };
-        let usr = found.ok_or_else(|| anyhow::anyhow!("user '{u}' not found"))?;
+        let found = match User::from_name(u).with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("lookup of user '{u}' failed"),
+                &[("u", &u.to_string())],
+            )
+        })? {
+            Some(usr) => Some(usr),
+            // Numeric UID (systemd resolves `User=1000` via getpwuid).
+            None => u.parse::<u32>().ok().and_then(|n| {
+                User::from_uid(Uid::from_raw(n))
+                    .with_context(|| {
+                        sysa::l10n::fmt(
+                            sysa::l10n::t_("lookup of uid '{n}' failed"),
+                            &[("n", &n.to_string())],
+                        )
+                    })
+                    .ok()
+                    .flatten()
+            }),
+        };
+        let usr = found.ok_or_else(|| {
+            anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("user '{u}' not found"),
+                &[("u", &u.to_string())]
+            ))
+        })?;
         uid = Some(usr.uid);
         resolved_user = Some(usr.name);
         if gid.is_none() {
@@ -669,17 +693,26 @@ fn build_pre_exec(
         }
         if !fds.is_empty() {
             let pid_key = CString::new("LISTEN_PID").map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_PID")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    sysa::l10n::t_("NUL in LISTEN_PID"),
+                )
             })?;
             let pid = unsafe { libc::getpid() };
             let pid_val = CString::new(pid.to_string()).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in pid string")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    sysa::l10n::t_("NUL in pid string"),
+                )
             })?;
             unsafe {
                 libc::setenv(pid_key.as_ptr(), pid_val.as_ptr(), 1);
             }
             let n_fds = CString::new(fds.len().to_string()).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in LISTEN_FDS")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    sysa::l10n::t_("NUL in LISTEN_FDS"),
+                )
             })?;
             unsafe {
                 libc::setenv(c"LISTEN_FDS".as_ptr(), n_fds.as_ptr(), 1);
@@ -693,7 +726,10 @@ fn build_pre_exec(
                     // only Group= was set.
                     Some(username) => {
                         let uname = CString::new(username.as_str()).map_err(|_| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in username")
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                sysa::l10n::t_("NUL in username"),
+                            )
                         })?;
                         if libc::initgroups(uname.as_ptr(), creds.gid) < 0 {
                             return Err(std::io::Error::last_os_error());

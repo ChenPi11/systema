@@ -147,12 +147,23 @@ pub enum PlanError {
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlanError::Cyclic => write!(f, "Transaction order is cyclic"),
+            PlanError::Cyclic => write!(f, "{}", sysa::l10n::t_("Transaction order is cyclic")),
             PlanError::Conflicting => {
-                write!(f, "Transaction contains conflicting jobs")
+                write!(
+                    f,
+                    "{}",
+                    sysa::l10n::t_("Transaction contains conflicting jobs")
+                )
             }
-            PlanError::Destructive => write!(f, "Transaction is destructive"),
-            PlanError::UnitNotFound(u) => write!(f, "Unit {u} is not loaded"),
+            PlanError::Destructive => write!(f, "{}", sysa::l10n::t_("Transaction is destructive")),
+            PlanError::UnitNotFound(u) => write!(
+                f,
+                "{}",
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("Unit {u} is not loaded"),
+                    &[("u", &u.to_string())]
+                )
+            ),
         }
     }
 }

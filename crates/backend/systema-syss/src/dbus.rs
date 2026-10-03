@@ -48,9 +48,7 @@ impl DbusWaiter {
             // reaps it, so fail the start immediately (systemd fails the
             // start job as soon as the process exits in SERVICE_START).
             if !is_alive(pid) || pid_is_zombie(pid) {
-                return Err(anyhow!(
-                    "Service process (PID {pid}) exited before acquiring D-Bus name '{bus_name}'."
-                ));
+                return Err(anyhow!(sysa::l10n::fmt(sysa::l10n::t_("Service process (PID {pid}) exited before acquiring D-Bus name '{bus_name}'."), &[("pid", &pid.to_string()), ("bus_name", &bus_name.to_string())])));
             }
 
             let conn = match self.connection().await {
@@ -84,9 +82,10 @@ impl DbusWaiter {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Err(anyhow!(
-            "TimeoutStartSec exceeded waiting for D-Bus name '{bus_name}'."
-        ))
+        Err(anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("TimeoutStartSec exceeded waiting for D-Bus name '{bus_name}'."),
+            &[("bus_name", &bus_name.to_string())]
+        )))
     }
 
     /// The cached connection, connecting to the system bus on first use.

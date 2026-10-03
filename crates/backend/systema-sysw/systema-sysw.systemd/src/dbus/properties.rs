@@ -148,7 +148,10 @@ impl Properties {
         let (iface_name,): (String,) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}."));
+                let err = fdo::Error::InvalidArgs(sysa::l10n::fmt(
+                    sysa::l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -165,8 +168,9 @@ impl Properties {
                     connection.reply_dbus_error(&msg.header(), e).await?;
                 }
                 None => {
-                    let err = fdo::Error::UnknownInterface(format!(
-                        "Unknown interface '{iface_name}'."
+                    let err = fdo::Error::UnknownInterface(sysa::l10n::fmt(
+                        sysa::l10n::t_("Unknown interface '{iface_name}'."),
+                        &[("iface_name", &iface_name.to_string())],
                     ));
                     connection.reply_dbus_error(&msg.header(), err).await?;
                 }
@@ -184,7 +188,10 @@ impl Properties {
         let (iface_name, prop_name): (String, String) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}."));
+                let err = fdo::Error::InvalidArgs(sysa::l10n::fmt(
+                    sysa::l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -237,7 +244,10 @@ impl Properties {
             | "org.freedesktop.DBus.Introspectable"
             | "org.freedesktop.DBus.ObjectManager" => None,
             _ => {
-                let err = fdo::Error::UnknownInterface(format!("Unknown interface '{iface_name}'."));
+                let err = fdo::Error::UnknownInterface(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown interface '{iface_name}'."),
+                    &[("iface_name", &iface_name.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -252,7 +262,10 @@ impl Properties {
                 connection.reply_dbus_error(&msg.header(), e).await?;
             }
             None => {
-                let err = fdo::Error::UnknownProperty(format!("Unknown property '{prop_name}'."));
+                let err = fdo::Error::UnknownProperty(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown property '{prop_name}'."),
+                    &[("prop_name", &prop_name.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
             }
         }
@@ -264,7 +277,8 @@ impl Properties {
         connection: &Connection,
         msg: &zbus::message::Message,
     ) -> zbus::Result<()> {
-        let err = fdo::Error::PropertyReadOnly("Properties are read-only".to_string());
+        let err =
+            fdo::Error::PropertyReadOnly(sysa::l10n::t_("Properties are read-only").to_string());
         connection.reply_dbus_error(&msg.header(), err).await?;
         Ok(())
     }
@@ -352,7 +366,10 @@ impl ManagerProperties {
         let (iface_name,): (String,) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}."));
+                let err = fdo::Error::InvalidArgs(sysa::l10n::fmt(
+                    sysa::l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
@@ -374,7 +391,10 @@ impl ManagerProperties {
                 connection.reply(msg, &empty).await?;
             }
             _ => {
-                let err = fdo::Error::UnknownInterface(format!("Unknown interface '{iface_name}'."));
+                let err = fdo::Error::UnknownInterface(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown interface '{iface_name}'."),
+                    &[("iface_name", &iface_name.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
             }
         }
@@ -390,13 +410,19 @@ impl ManagerProperties {
         let (iface_name, prop_name): (String, String) = match body.deserialize() {
             Ok(r) => r,
             Err(e) => {
-                let err = fdo::Error::InvalidArgs(format!("Bad arguments: {e}."));
+                let err = fdo::Error::InvalidArgs(sysa::l10n::fmt(
+                    sysa::l10n::t_("Bad arguments: {e}."),
+                    &[("e", &e.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
                 return Ok(());
             }
         };
         if iface_name != "org.freedesktop.systemd1.Manager" {
-            let err = fdo::Error::UnknownInterface(format!("Unknown interface '{iface_name}'."));
+            let err = fdo::Error::UnknownInterface(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown interface '{iface_name}'."),
+                &[("iface_name", &iface_name.to_string())],
+            ));
             connection.reply_dbus_error(&msg.header(), err).await?;
             return Ok(());
         }
@@ -410,7 +436,10 @@ impl ManagerProperties {
                 connection.reply_dbus_error(&msg.header(), e).await?;
             }
             None => {
-                let err = fdo::Error::UnknownProperty(format!("Unknown property '{prop_name}'."));
+                let err = fdo::Error::UnknownProperty(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown property '{prop_name}'."),
+                    &[("prop_name", &prop_name.to_string())],
+                ));
                 connection.reply_dbus_error(&msg.header(), err).await?;
             }
         }
@@ -422,7 +451,8 @@ impl ManagerProperties {
         connection: &Connection,
         msg: &zbus::message::Message,
     ) -> zbus::Result<()> {
-        let err = fdo::Error::PropertyReadOnly("Properties are read-only".to_string());
+        let err =
+            fdo::Error::PropertyReadOnly(sysa::l10n::t_("Properties are read-only").to_string());
         connection.reply_dbus_error(&msg.header(), err).await?;
         Ok(())
     }

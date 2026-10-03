@@ -33,7 +33,20 @@ async fn main() -> Result<()> {
     sysa::paths::init();
     sysa::l10n::init();
 
-    let args = Args::parse();
+    let args = {
+        use clap::{CommandFactory, FromArgMatches};
+        let cmd = Args::command()
+            .about(sysa::l10n::t_("System Wrapper — systemd D-Bus bridge"))
+            .mut_arg("debug", |a| {
+                a.help(sysa::l10n::t_("Enable debug-level logging."))
+            })
+            .mut_arg("log_level", |a| {
+                a.help(sysa::l10n::t_(
+                    "Log level (trace, debug, info, warn, error).",
+                ))
+            });
+        Args::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
+    };
     let log_level = if args.debug { "debug" } else { &args.log_level };
     tracing_subscriber::fmt()
         .with_env_filter(log_level.parse::<EnvFilter>()?)

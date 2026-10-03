@@ -198,7 +198,7 @@ pub async fn run() -> Result<()> {
     // holds — before the reconnect loop claims the bus name again.
     activation.abort();
     let _ = activation.await;
-    anyhow::bail!("control session ended — reconnect required")
+    anyhow::bail!(sysa::l10n::t_("control session ended — reconnect required"))
 }
 
 #[cfg(test)]

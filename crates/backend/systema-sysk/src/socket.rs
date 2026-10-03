@@ -291,8 +291,8 @@ fn bind_stream(address: &str, backlog: u32, socket_mode: u32, directory_mode: u3
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     sysa::l10n::fmt(
-                        sysa::l10n::t_("Cannot create directory '{}' for socket '{address}'."),
-                        &[("address", address)],
+                        sysa::l10n::t_("Cannot create directory '{dir}' for socket '{address}'."),
+                        &[("dir", &parent.display().to_string()), ("address", address)],
                     )
                 })?;
                 // Set directory permissions (systemd uses DirectoryMode=, default 0755).
@@ -550,8 +550,8 @@ fn bind_unix_datagram(address: &str, socket_mode: u32, directory_mode: u32) -> R
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     sysa::l10n::fmt(
-                        sysa::l10n::t_("Cannot create directory '{}' for socket '{address}'."),
-                        &[("address", address)],
+                        sysa::l10n::t_("Cannot create directory '{dir}' for socket '{address}'."),
+                        &[("dir", &parent.display().to_string()), ("address", address)],
                     )
                 })?;
                 // Set directory permissions (systemd uses DirectoryMode=, default 0755).
@@ -721,8 +721,8 @@ fn create_fifo(path: &str, mode: &str) -> Result<()> {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
                 sysa::l10n::fmt(
-                    sysa::l10n::t_("Cannot create directory '{}' for FIFO '{path}'."),
-                    &[("path", path)],
+                    sysa::l10n::t_("Cannot create directory '{dir}' for FIFO '{path}'."),
+                    &[("dir", &parent.display().to_string()), ("path", path)],
                 )
             })?;
         }

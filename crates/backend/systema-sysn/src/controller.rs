@@ -31,21 +31,29 @@ impl PathController {
 impl UnitController for PathController {
     async fn status(&self, unit_name: &str) -> Result<UnitStatus> {
         let reg = self.shared.registry.read();
-        let inst = reg
-            .get(unit_name)
-            .ok_or_else(|| anyhow!("Unknown path unit '{unit_name}'"))?;
+        let inst = reg.get(unit_name).ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown path unit '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
         Ok(status_of(unit_name, inst))
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
         if !unit_name.ends_with(".path") {
-            anyhow::bail!("'{unit_name}' is not a .path unit");
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("'{unit_name}' is not a .path unit"),
+                &[("unit_name", &unit_name.to_string())]
+            ));
         }
         let cfg = decode_unit_config(config)?;
-        let path_cfg = cfg
-            .path
-            .clone()
-            .ok_or_else(|| anyhow!("No PathConfig for '{unit_name}'"))?;
+        let path_cfg = cfg.path.clone().ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No PathConfig for '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
 
         let specs = build_specs(&path_cfg);
         let target_unit = if path_cfg.unit.is_empty() {
@@ -87,8 +95,10 @@ impl UnitController for PathController {
                 None
             } else {
                 Some(
-                    "Path unit has no PathExists=/PathChanged=/DirectoryNotEmpty= condition"
-                        .to_string(),
+                    sysa::l10n::t_(
+                        "Path unit has no PathExists=/PathChanged=/DirectoryNotEmpty= condition",
+                    )
+                    .to_string(),
                 )
             },
             invocation_id: if invocation_id.is_empty() {
@@ -116,7 +126,10 @@ impl UnitController for PathController {
                     }
                     Err(e) => {
                         inst.state = PathState::Failed;
-                        inst.last_error = Some(format!("Failed to arm watches: {e}"));
+                        inst.last_error = Some(sysa::l10n::fmt(
+                            sysa::l10n::t_("Failed to arm watches: {e}"),
+                            &[("e", &e.to_string())],
+                        ));
                     }
                 }
             }
@@ -138,7 +151,13 @@ impl UnitController for PathController {
                         .and_then(|i| i.last_error.clone())
                         .unwrap_or_default()
                 };
-                anyhow::bail!("Cannot arm path unit '{unit_name}': {err}");
+                anyhow::bail!(sysa::l10n::fmt(
+                    sysa::l10n::t_("Cannot arm path unit '{unit_name}': {err}"),
+                    &[
+                        ("unit_name", &unit_name.to_string()),
+                        ("err", &err.to_string())
+                    ]
+                ));
             }
             recheck_level(&self.shared, unit_name);
         }
@@ -150,9 +169,12 @@ impl UnitController for PathController {
         self.shared.backend.disarm(unit_name);
         {
             let mut reg = self.shared.registry.write();
-            let inst = reg
-                .get_mut(unit_name)
-                .ok_or_else(|| anyhow!("Unknown path unit '{unit_name}'"))?;
+            let inst = reg.get_mut(unit_name).ok_or_else(|| {
+                anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown path unit '{unit_name}'"),
+                    &[("unit_name", &unit_name.to_string())]
+                ))
+            })?;
             inst.state = PathState::Dead;
             inst.last_error = None;
             inst.trigger_times.clear();
@@ -168,18 +190,23 @@ impl UnitController for PathController {
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let path_cfg = cfg
-            .path
-            .clone()
-            .ok_or_else(|| anyhow!("No PathConfig for '{unit_name}'"))?;
+        let path_cfg = cfg.path.clone().ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No PathConfig for '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
 
         let specs = build_specs(&path_cfg);
         let specs_empty = specs.is_empty();
         let rearm = {
             let mut reg = self.shared.registry.write();
-            let inst = reg
-                .get_mut(unit_name)
-                .ok_or_else(|| anyhow!("Unknown path unit '{unit_name}'"))?;
+            let inst = reg.get_mut(unit_name).ok_or_else(|| {
+                anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown path unit '{unit_name}'"),
+                    &[("unit_name", &unit_name.to_string())]
+                ))
+            })?;
             inst.config = path_cfg.clone();
             inst.specs = specs;
             if !path_cfg.unit.is_empty() {
@@ -188,8 +215,10 @@ impl UnitController for PathController {
             if specs_empty {
                 inst.state = PathState::Failed;
                 inst.last_error = Some(
-                    "Path unit has no PathExists=/PathChanged=/DirectoryNotEmpty= condition"
-                        .to_string(),
+                    sysa::l10n::t_(
+                        "Path unit has no PathExists=/PathChanged=/DirectoryNotEmpty= condition",
+                    )
+                    .to_string(),
                 );
                 false
             } else {
@@ -205,7 +234,10 @@ impl UnitController for PathController {
                     let mut reg = self.shared.registry.write();
                     if let Some(inst) = reg.get_mut(unit_name) {
                         inst.state = PathState::Failed;
-                        inst.last_error = Some(format!("Failed to arm watches: {e}"));
+                        inst.last_error = Some(sysa::l10n::fmt(
+                            sysa::l10n::t_("Failed to arm watches: {e}"),
+                            &[("e", &e.to_string())],
+                        ));
                     }
                 }
             }

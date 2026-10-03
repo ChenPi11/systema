@@ -179,14 +179,28 @@ fn mount_table_entry(
         return Ok(());
     }
 
-    fs::create_dir_all(path)
-        .with_context(|| format!("Cannot create mount point {path}"))?;
+    fs::create_dir_all(path).with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Cannot create mount point {path}"),
+            &[("path", &path.to_string())],
+        )
+    })?;
 
     imp::do_mount(fstype, path, options, flags).map_err(|e| {
         if imp::is_busy(&e) {
-            anyhow!("{path} is already occupied by another filesystem")
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("{path} is already occupied by another filesystem"),
+                &[("path", &path.to_string())]
+            ))
         } else {
-            anyhow!("Cannot mount {fstype} at {path}: {e}")
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot mount {fstype} at {path}: {e}"),
+                &[
+                    ("fstype", &fstype.to_string()),
+                    ("path", &path.to_string()),
+                    ("e", &e.to_string())
+                ]
+            ))
         }
     })?;
 
@@ -198,7 +212,14 @@ fn mount_table_entry(
         let err = std::io::Error::last_os_error();
         let _ = imp::do_unmount(path);
         let _ = fs::remove_dir(path);
-        return Err(anyhow!("{fstype} mount at {path} is not writable, undoing: {err}"));
+        return Err(anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("{fstype} mount at {path} is not writable, undoing: {err}"),
+            &[
+                ("fstype", &fstype.to_string()),
+                ("path", &path.to_string()),
+                ("err", &err.to_string())
+            ]
+        )));
     }
 
     info!("Mounted {fstype} at {path} ({options})");
@@ -223,14 +244,18 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(&path)
-        .with_context(|| format!("Cannot create cgroup mount point {path}"))?;
+    fs::create_dir_all(&path).with_context(|| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("Cannot create cgroup mount point {path}"),
+            &[("path", &path.to_string())],
+        )
+    })?;
 
     imp::do_mount("cgroup2", &path, CGROUP_OPTIONS, imp::cgroup_flags()).map_err(|e| {
         if imp::is_busy(&e) {
-            anyhow!("{path} is already occupied by another filesystem (cgroup v1?); hybrid cgroup hierarchy is not supported")
+            anyhow!(sysa::l10n::fmt(sysa::l10n::t_("{path} is already occupied by another filesystem (cgroup v1?); hybrid cgroup hierarchy is not supported"), &[("path", &path.to_string())]))
         } else {
-            anyhow!("Cannot mount cgroup2 at {path}: {e}")
+            anyhow!(sysa::l10n::fmt(sysa::l10n::t_("Cannot mount cgroup2 at {path}: {e}"), &[("path", &path.to_string()), ("e", &e.to_string())]))
         }
     })?;
 
@@ -242,9 +267,10 @@ pub fn mount_cgroup2() -> anyhow::Result<()> {
         let err = std::io::Error::last_os_error();
         let _ = imp::do_unmount(&path);
         let _ = fs::remove_dir(&path);
-        return Err(anyhow!(
-            "cgroup2 mount at {path} is not writable, undoing: {err}"
-        ));
+        return Err(anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("cgroup2 mount at {path} is not writable, undoing: {err}"),
+            &[("path", &path.to_string()), ("err", &err.to_string())]
+        )));
     }
 
     info!("Mounted cgroup2 at {path} ({CGROUP_OPTIONS})");

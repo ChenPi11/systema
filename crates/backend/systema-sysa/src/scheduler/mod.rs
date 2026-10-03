@@ -379,9 +379,7 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
                             names
                         );
                     } else {
-                        bail!(
-                            "No worker available for unit type '{unit_type}' (units: {names:?}); unit.define attempt failed. Is the corresponding System Worker running?"
-                        )
+                        bail!(sysa::l10n::fmt(sysa::l10n::t_("No worker available for unit type '{unit_type}' (units: {names}); unit.define attempt failed. Is the corresponding System Worker running?"), &[("unit_type", &unit_type.to_string()), ("names", &format!("{:?}", names))]))
                     }
                 }
             }
@@ -415,12 +413,28 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
             // The worker disconnected between grouping and send.
             let mut state = allocator.write();
             state.unit_define_txs.remove(&request_id);
-            bail!("Worker '{worker_id}' disconnected during unit.define (units: {names:?})");
+            bail!(sysa::l10n::fmt(
+                sysa::l10n::t_(
+                    "Worker '{worker_id}' disconnected during unit.define (units: {names})"
+                ),
+                &[
+                    ("worker_id", &worker_id.to_string()),
+                    ("names", &format!("{:?}", names))
+                ]
+            ));
         };
         if worker_tx.send(buf.freeze()).await.is_err() {
             let mut state = allocator.write();
             state.unit_define_txs.remove(&request_id);
-            bail!("Worker '{worker_id}' disconnected during unit.define (units: {names:?})");
+            bail!(sysa::l10n::fmt(
+                sysa::l10n::t_(
+                    "Worker '{worker_id}' disconnected during unit.define (units: {names})"
+                ),
+                &[
+                    ("worker_id", &worker_id.to_string()),
+                    ("names", &format!("{:?}", names))
+                ]
+            ));
         }
 
         let result = match tokio::time::timeout(UNIT_DEFINE_TIMEOUT, rx).await {
@@ -428,28 +442,45 @@ pub async fn request_unit_definition(allocator: AllocatorHandle, missing: &[Stri
             Ok(Err(_)) => {
                 let mut state = allocator.write();
                 state.unit_define_txs.remove(&request_id);
-                bail!("unit.define reply channel closed for '{worker_id}' (units: {names:?})");
+                bail!(sysa::l10n::fmt(
+                    sysa::l10n::t_(
+                        "unit.define reply channel closed for '{worker_id}' (units: {names})"
+                    ),
+                    &[
+                        ("worker_id", &worker_id.to_string()),
+                        ("names", &format!("{:?}", names))
+                    ]
+                ));
             }
             Err(_) => {
                 let mut state = allocator.write();
                 state.unit_define_txs.remove(&request_id);
-                bail!(
-                    "unit.define timed out for '{worker_id}' after {UNIT_DEFINE_TIMEOUT:?} (units: {names:?})"
-                );
+                bail!(sysa::l10n::fmt(sysa::l10n::t_("unit.define timed out for '{worker_id}' after {UNIT_DEFINE_TIMEOUT} (units: {names})"), &[("worker_id", &worker_id.to_string()), ("UNIT_DEFINE_TIMEOUT", &format!("{:?}", UNIT_DEFINE_TIMEOUT)), ("names", &format!("{:?}", names))]));
             }
         };
         if !result.success {
-            bail!(
-                "Worker '{worker_id}' refused unit.define (units: {names:?}): {}",
-                result.error
-            );
+            bail!(sysa::l10n::fmt(
+                sysa::l10n::t_(
+                    "Worker '{worker_id}' refused unit.define (units: {names}): {error}"
+                ),
+                &[
+                    ("worker_id", &worker_id.to_string()),
+                    ("names", &format!("{:?}", names)),
+                    ("error", &(result.error).to_string())
+                ]
+            ));
         }
 
         // Commit the synthesized definitions through the same idempotent
         // merge as the finder path (`state.merge_units`).
         let units: HashMap<String, systema_sysf::ir::UnitIR> =
             serde_json::from_slice(&result.units_json).map_err(|e| {
-                anyhow::anyhow!("Failed to deserialize unit.define result from '{worker_id}': {e}")
+                anyhow::anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_(
+                        "Failed to deserialize unit.define result from '{worker_id}': {e}"
+                    ),
+                    &[("worker_id", &worker_id.to_string()), ("e", &e.to_string())]
+                ))
             })?;
         let (created, updated) = {
             let mut state = allocator.write();
@@ -736,7 +767,7 @@ pub async fn enqueue_job(
                 .values()
                 .any(|w| w.unit_types.contains(&unit_type));
         if !has_worker {
-            bail!("{}", l10n::fmt(l10n::t_("No worker available for unit type '{unit_type}' (unit: {unit_name}). Cannot execute {kind:?} operation. Is the corresponding System Worker running?"), &[
+            bail!("{}", l10n::fmt(l10n::t_("No worker available for unit type '{unit_type}' (unit: {unit_name}). Cannot execute {kind} operation. Is the corresponding System Worker running?"), &[
                 ("unit_type", &unit_type),
                 ("unit_name", unit_name),
                 ("kind", &format!("{:?}", kind)),
@@ -889,7 +920,7 @@ pub async fn enqueue_job(
         if let Some((existing_id, _)) = existing {
             match mode {
                 JobMode::Fail => {
-                    bail!("{}", l10n::fmt(l10n::t_("Job already exists for unit {unit_name} (kind={kind:?}, id={existing_id})."), &[
+                    bail!("{}", l10n::fmt(l10n::t_("Job already exists for unit {unit_name} (kind={kind}, id={existing_id})."), &[
                         ("unit_name", unit_name),
                         ("kind", &format!("{:?}", kind)),
                         ("existing_id", &existing_id.to_string()),
@@ -1409,7 +1440,7 @@ pub async fn enqueue_job(
             warn!("Worker channel closed for unit {}", name);
             let mut state = allocator.write();
             if let Some(job) = state.jobs.get_mut(&job_id) {
-                job.status = JobStatus::Failed("Worker disconnected".to_string());
+                job.status = JobStatus::Failed(sysa::l10n::t_("Worker disconnected").to_string());
             }
             if is_root {
                 if let Some(ref tx) = state.job_completion_tx {
@@ -1847,7 +1878,10 @@ fn fail_dependents(state: &mut AllocatorState, failed: &str, kind: JobKind) {
                     if let Some(abort) = job.timeout_abort.take() {
                         abort.abort();
                     }
-                    job.status = JobStatus::Failed(format!("dependency failed: {name}"));
+                    job.status = JobStatus::Failed(sysa::l10n::fmt(
+                        sysa::l10n::t_("dependency failed: {name}"),
+                        &[("name", &name.to_string())],
+                    ));
                 }
                 // Revert cached state to inactive: the dependent's Start job
                 // just failed, so the unit is not actually active.  This
@@ -2133,7 +2167,9 @@ fn spawn_job_timeout(
                 let mut state = alloc.write();
                 if let Some(job) = state.jobs.get_mut(&job_id) {
                     if matches!(job.status, JobStatus::Running) {
-                        job.status = JobStatus::Failed("TimeoutStartSec exceeded".to_string());
+                        job.status = JobStatus::Failed(
+                            sysa::l10n::t_("TimeoutStartSec exceeded").to_string(),
+                        );
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,
@@ -2170,7 +2206,9 @@ fn spawn_job_timeout(
                 let mut state = alloc.write();
                 if let Some(job) = state.jobs.get_mut(&job_id) {
                     if matches!(job.status, JobStatus::Running) {
-                        job.status = JobStatus::Failed("TimeoutStopSec exceeded".to_string());
+                        job.status = JobStatus::Failed(
+                            sysa::l10n::t_("TimeoutStopSec exceeded").to_string(),
+                        );
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,
@@ -2199,7 +2237,9 @@ fn spawn_job_timeout(
                 let mut state = alloc.write();
                 if let Some(job) = state.jobs.get_mut(&job_id) {
                     if matches!(job.status, JobStatus::Running) {
-                        job.status = JobStatus::Failed("Reload timeout exceeded".to_string());
+                        job.status = JobStatus::Failed(
+                            sysa::l10n::t_("Reload timeout exceeded").to_string(),
+                        );
                         if let Some(ref tx) = state.job_completion_tx {
                             let _ = tx.send(JobCompletion {
                                 job_id,

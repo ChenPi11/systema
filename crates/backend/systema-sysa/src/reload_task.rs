@@ -105,13 +105,24 @@ impl ReloadTask {
             .arg("systema-sysf/reload")
             .status()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", sysf_path.display()))?;
+            .map_err(|e| {
+                anyhow::anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("failed to spawn {program}: {e}"),
+                    &[
+                        ("program", &(sysf_path.display()).to_string()),
+                        ("e", &e.to_string())
+                    ]
+                ))
+            })?;
 
         if status.success() {
             info!("ReloadTask: System F completed successfully");
             Ok(())
         } else {
-            anyhow::bail!("System F exited with status: {}", status);
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("System F exited with status: {status}"),
+                &[("status", &status.to_string())]
+            ));
         }
     }
 
@@ -123,10 +134,13 @@ impl ReloadTask {
                 return Ok(path);
             }
         }
-        anyhow::bail!(
-            "systema-sysf binary not found in search paths: {:?}",
-            sysa::paths::instance().systema_bin_search_paths
-        )
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("systema-sysf binary not found in search paths: {paths}"),
+            &[(
+                "paths",
+                &format!("{:?}", sysa::paths::instance().systema_bin_search_paths)
+            )]
+        ))
     }
 }
 

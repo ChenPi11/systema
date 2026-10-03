@@ -159,20 +159,27 @@ impl UnitController for MountController {
         let cfg = decode_unit_config(config)?;
         match resolve_unit_type(&self.registry, &self.automount_registry, unit_name) {
             "mount" => {
-                let mount_cfg = cfg
-                    .mount
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
+                let mount_cfg = cfg.mount.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("No MountConfig for {unit_name}"),
+                        &[("unit_name", &unit_name.to_string())]
+                    ))
+                })?;
                 do_mount(self.registry.clone(), unit_name, mount_cfg).await?;
                 self.publish_state(unit_name);
             }
             "automount" => {
-                let auto_cfg = cfg
-                    .automount
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No AutomountConfig for {}", unit_name))?;
+                let auto_cfg = cfg.automount.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("No AutomountConfig for {unit_name}"),
+                        &[("unit_name", &unit_name.to_string())]
+                    ))
+                })?;
                 let mount_cfg = cfg.mount.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("No companion MountConfig for {}", unit_name)
+                    anyhow::anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("No companion MountConfig for {unit_name}"),
+                        &[("unit_name", &unit_name.to_string())]
+                    ))
                 })?;
                 let companion = companion_mount_unit(unit_name);
                 // Eager-mount semantics (no autofs on Unix): mount the
@@ -206,7 +213,10 @@ impl UnitController for MountController {
                 self.publish_state(&companion);
                 self.publish_automount_state(unit_name);
             }
-            _ => anyhow::bail!("Unknown unit type for {}", unit_name),
+            _ => anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown unit type for {unit_name}"),
+                &[("unit_name", &unit_name.to_string())]
+            )),
         }
         Ok(())
     }
@@ -247,7 +257,10 @@ impl UnitController for MountController {
                 }
                 self.publish_automount_state(unit_name);
             }
-            _ => anyhow::bail!("Unknown unit type for {}", unit_name),
+            _ => anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown unit type for {unit_name}"),
+                &[("unit_name", &unit_name.to_string())]
+            )),
         }
         Ok(())
     }
@@ -260,10 +273,12 @@ impl UnitController for MountController {
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let mount_cfg = cfg
-            .mount
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
+        let mount_cfg = cfg.mount.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No MountConfig for {unit_name}"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
         do_remount(self.registry.clone(), unit_name, mount_cfg).await?;
         self.publish_state(unit_name);
         Ok(())

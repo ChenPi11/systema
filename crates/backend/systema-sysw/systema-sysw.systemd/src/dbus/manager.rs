@@ -62,8 +62,9 @@ fn parse_job_mode(mode: &str) -> zbus::fdo::Result<()> {
     if valid.contains(&mode) {
         Ok(())
     } else {
-        Err(zbus::fdo::Error::InvalidArgs(format!(
-            "Job mode {mode} invalid"
+        Err(zbus::fdo::Error::InvalidArgs(sysa::l10n::fmt(
+            sysa::l10n::t_("Job mode {mode} invalid"),
+            &[("mode", &mode.to_string())],
         )))
     }
 }
@@ -82,8 +83,9 @@ fn parse_job_type(s: &str) -> zbus::fdo::Result<(&'static str, bool)> {
         "nop" => Ok(("nop", false)),
         "reload-or-restart" => Ok(("restart", true)),
         "reload-or-try-restart" => Ok(("try-restart", true)),
-        other => Err(zbus::fdo::Error::InvalidArgs(format!(
-            "Job type {other} invalid"
+        other => Err(zbus::fdo::Error::InvalidArgs(sysa::l10n::fmt(
+            sysa::l10n::t_("Job type {other} invalid"),
+            &[("other", &other.to_string())],
         ))),
     }
 }
@@ -400,9 +402,9 @@ impl ManagerInterface {
         if self.ctx.mirror.read().get(&name).is_some() {
             Ok(unit_object_path(&name))
         } else {
-            Err(zbus::fdo::Error::UnknownObject(format!(
-                "Unit {} is not loaded.",
-                name
+            Err(zbus::fdo::Error::UnknownObject(sysa::l10n::fmt(
+                sysa::l10n::t_("Unit {name} is not loaded."),
+                &[("name", &name.to_string())],
             )))
         }
     }
@@ -411,8 +413,9 @@ impl ManagerInterface {
         debug!("D-Bus GetUnitByPID: pid={}", pid);
         match self.ctx.mirror.read().find_by_pid(pid) {
             Some(name) => Ok(unit_object_path(&name)),
-            None => Err(zbus::fdo::Error::UnknownObject(format!(
-                "No unit found for PID {pid}."
+            None => Err(zbus::fdo::Error::UnknownObject(sysa::l10n::fmt(
+                sysa::l10n::t_("No unit found for PID {pid}."),
+                &[("pid", &pid.to_string())],
             ))),
         }
     }
@@ -423,13 +426,15 @@ impl ManagerInterface {
         let pid = match pid_from_pidfd(raw) {
             Ok(Some(pid)) => pid,
             Ok(None) => {
-                return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "fd {raw} is not a pidfd (no Pid: entry in fdinfo)"
+                return Err(zbus::fdo::Error::InvalidArgs(sysa::l10n::fmt(
+                    sysa::l10n::t_("fd {raw} is not a pidfd (no Pid: entry in fdinfo)"),
+                    &[("raw", &raw.to_string())],
                 )));
             }
             Err(e) => {
-                return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "cannot read fdinfo for fd {raw}: {e}"
+                return Err(zbus::fdo::Error::InvalidArgs(sysa::l10n::fmt(
+                    sysa::l10n::t_("cannot read fdinfo for fd {raw}: {e}"),
+                    &[("raw", &raw.to_string()), ("e", &e.to_string())],
                 )));
             }
         };
@@ -587,12 +592,12 @@ impl ManagerInterface {
         );
         if units.is_empty() {
             return Err(zbus::fdo::Error::InvalidArgs(
-                "At least one unit name is required.".to_string(),
+                sysa::l10n::t_("At least one unit name is required.").to_string(),
             ));
         }
         if flags != 0 {
             return Err(zbus::fdo::Error::InvalidArgs(
-                "Flags are not supported yet and must be 0.".to_string(),
+                sysa::l10n::t_("Flags are not supported yet and must be 0.").to_string(),
             ));
         }
         let (kind, reload_if_possible) = parse_job_type(job_type)?;
@@ -703,8 +708,9 @@ impl ManagerInterface {
     ) -> zbus::fdo::Result<()> {
         info!("D-Bus SetUnitProperties: {} (mode={})", name, mode);
         if mode != "replace" {
-            return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "SetUnitProperties only supports job mode 'replace' (got {mode})"
+            return Err(zbus::fdo::Error::InvalidArgs(sysa::l10n::fmt(
+                sysa::l10n::t_("SetUnitProperties only supports job mode 'replace' (got {mode})"),
+                &[("mode", &mode.to_string())],
             )));
         }
         let req = sysa::proto::SetUnitPropertiesRequest {
@@ -885,8 +891,9 @@ impl ManagerInterface {
                 return Ok("static".to_string());
             }
         }
-        Err(zbus::fdo::Error::Failed(format!(
-            "Unit file {base} not found."
+        Err(zbus::fdo::Error::Failed(sysa::l10n::fmt(
+            sysa::l10n::t_("Unit file {base} not found."),
+            &[("base", &base.to_string())],
         )))
     }
 
@@ -1050,8 +1057,9 @@ impl ManagerInterface {
         debug!("D-Bus GetUnitByInvocationID: id={}", invocation_id);
         match self.ctx.mirror.read().find_by_invocation(invocation_id) {
             Some(name) => Ok(unit_object_path(&name)),
-            None => Err(zbus::fdo::Error::UnknownObject(format!(
-                "No unit with invocation ID {invocation_id}."
+            None => Err(zbus::fdo::Error::UnknownObject(sysa::l10n::fmt(
+                sysa::l10n::t_("No unit with invocation ID {invocation_id}."),
+                &[("invocation_id", &invocation_id.to_string())],
             ))),
         }
     }

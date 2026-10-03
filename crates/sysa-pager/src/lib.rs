@@ -73,9 +73,10 @@ pub fn open(config: PagerConfig) -> io::Result<PagerGuard> {
     }
 
     let mut child = cmd.spawn().map_err(|e| {
-        io::Error::other(
-            format!("failed to spawn pager '{pager}': {e}"),
-        )
+        io::Error::other(sysa::l10n::fmt(
+            sysa::l10n::t_("failed to spawn pager '{pager}': {error}"),
+            &[("pager", &pager), ("error", &e.to_string())],
+        ))
     })?;
 
     let child_stdin = child.stdin.take().expect("stdin configured as piped");

@@ -183,12 +183,16 @@ where
     sysa::ipc::send_envelope(&mut framed, &hello_env).await?;
     let hello_reply = sysa::ipc::recv_envelope(&mut framed)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("System A closed the connection during hello"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(sysa::l10n::t_(
+                "System A closed the connection during hello"
+            ))
+        })?;
     if hello_reply.method != "manager.hello.result" {
-        anyhow::bail!(
-            "unexpected reply '{}' to manager.hello",
-            hello_reply.method
-        );
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("unexpected reply '{method}' to manager.hello"),
+            &[("method", &(hello_reply.method).to_string())]
+        ));
     }
 
     let req = sysa::ipc::make_envelope(
@@ -202,7 +206,7 @@ where
     loop {
         let reply = sysa::ipc::recv_envelope(&mut framed)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("System A closed the connection"))?;
+            .ok_or_else(|| anyhow::anyhow!(sysa::l10n::t_("System A closed the connection")))?;
         if reply.method == format!("{method}.result") {
             return Ok(Res::decode(reply.payload.as_slice())?);
         }
@@ -243,7 +247,13 @@ fn spawn_reaper(tx: mpsc::UnboundedSender<ReaperEvent>) -> thread::JoinHandle<()
             Ok(_) => thread::sleep(Duration::from_millis(50)),
             Err(Errno::ECHILD) => thread::sleep(Duration::from_millis(100)),
             Err(e) => {
-                eprintln!("SysAInit reaper error: {e}");
+                eprintln!(
+                    "{}",
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("SysAInit reaper error: {e}"),
+                        &[("e", &e.to_string())]
+                    )
+                );
                 thread::sleep(Duration::from_millis(100));
             }
         }
@@ -343,8 +353,12 @@ extern "C" fn handle_sighup(_sig: i32) {
 fn install_sighup_handler() -> Result<()> {
     // SAFETY: `handle_sighup` is a plain `extern "C"` function calling only
     // async-signal-safe `write(2)`.
-    unsafe { signal(Signal::SIGHUP, SigHandler::Handler(handle_sighup)) }
-        .map_err(|e| anyhow::anyhow!("cannot install SIGHUP handler: {e}"))?;
+    unsafe { signal(Signal::SIGHUP, SigHandler::Handler(handle_sighup)) }.map_err(|e| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("cannot install SIGHUP handler: {e}"),
+            &[("e", &e.to_string())]
+        ))
+    })?;
     Ok(())
 }
 
@@ -422,7 +436,10 @@ async fn power_down(
     notify: &mut NotifyListener,
 ) -> Result<i32> {
     let power_action = power::PowerAction::from_unit_name(action).ok_or_else(|| {
-        anyhow::anyhow!("System Init received an unknown power action: {action:?}")
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("System Init received an unknown power action: {action}"),
+            &[("action", &format!("{:?}", action))]
+        ))
     })?;
 
     // Phase 1: stop every supervised worker (everything except System A) and
@@ -713,7 +730,10 @@ async fn control_phase(
         )
         .await?;
         if !reload.success {
-            anyhow::bail!("manager.daemon_reload failed: {}", reload.message);
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("manager.daemon_reload failed: {message}"),
+                &[("message", &(reload.message).to_string())]
+            ));
         }
         info!("Control phase: daemon-reload complete");
 
@@ -733,10 +753,10 @@ async fn control_phase(
                 )
                 .await?;
             if !register.success {
-                anyhow::bail!(
-                    "manager.register_power_units failed: {}",
-                    register.message
-                );
+                anyhow::bail!(sysa::l10n::fmt(
+                    sysa::l10n::t_("manager.register_power_units failed: {message}"),
+                    &[("message", &(register.message).to_string())]
+                ));
             }
             info!(
                 "Control phase: registered {created} new, {updated} updated .power unit(s)",
@@ -756,7 +776,10 @@ async fn control_phase(
         )
         .await?;
         if !list.success {
-            anyhow::bail!("manager.list_units failed: {}", list.message);
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("manager.list_units failed: {message}"),
+                &[("message", &(list.message).to_string())]
+            ));
         }
 
         let mut names: Vec<String> = list.units.into_iter().map(|u| u.name).collect();
@@ -777,7 +800,7 @@ async fn control_phase(
         )
         .await?;
         if !start.success {
-            anyhow::bail!("manager.start_units failed");
+            anyhow::bail!(sysa::l10n::t_("manager.start_units failed"));
         }
         Ok(start)
     });
@@ -888,6 +911,8 @@ pub async fn run(
                 &mut bootlog,
                 grace,
                 ready_timeout,
+                // `what` is interpolated only into `info!`/`error!` templates,
+                // which are not translated — keep it as a plain label.
                 "System Allocator",
                 |kv| kv.get("MANAGER_READY").is_some(),
             )

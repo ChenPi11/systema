@@ -66,7 +66,10 @@ impl FromStr for PowerCtl {
             "auto" => Ok(PowerCtl::Auto),
             "always" => Ok(PowerCtl::Always),
             "never" => Ok(PowerCtl::Never),
-            _ => anyhow::bail!("unknown powerctl policy: {s:?} (expected auto, always, never)"),
+            _ => anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("unknown powerctl policy: {s} (expected auto, always, never)"),
+                &[("s", &format!("{:?}", s))]
+            )),
         }
     }
 }
@@ -123,20 +126,24 @@ impl FromStr for PowerAction {
     /// Parse an action from its short ("reboot") or unit-name
     /// ("reboot.power") form.  Unknown names are an error.
     fn from_str(s: &str) -> Result<Self> {
-        Self::from_unit_name(s)
-            .ok_or_else(|| anyhow::anyhow!("unknown power action: {s:?}"))
+        Self::from_unit_name(s).ok_or_else(|| {
+            anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("unknown power action: {s}"),
+                &[("s", &format!("{:?}", s))]
+            ))
+        })
     }
 }
 
 /// The description used for the given power action (best effort).
 fn power_description(action: PowerAction) -> String {
     match action {
-        PowerAction::Poweroff => "System Power Off".to_string(),
-        PowerAction::Reboot => "System Reboot".to_string(),
-        PowerAction::Halt => "System Halt".to_string(),
-        PowerAction::Kexec => "Reboot via kexec".to_string(),
-        PowerAction::Suspend => "System Suspend".to_string(),
-        PowerAction::Hibernate => "System Hibernate".to_string(),
+        PowerAction::Poweroff => sysa::l10n::t_("System Power Off").to_string(),
+        PowerAction::Reboot => sysa::l10n::t_("System Reboot").to_string(),
+        PowerAction::Halt => sysa::l10n::t_("System Halt").to_string(),
+        PowerAction::Kexec => sysa::l10n::t_("Reboot via kexec").to_string(),
+        PowerAction::Suspend => sysa::l10n::t_("System Suspend").to_string(),
+        PowerAction::Hibernate => sysa::l10n::t_("System Hibernate").to_string(),
     }
 }
 
@@ -213,10 +220,16 @@ pub fn all_power_definitions() -> HashMap<String, UnitIR> {
 pub fn execute_action(action: PowerAction, policy: PowerCtl) -> Result<()> {
     let is_pid_one = std::process::id() == 1;
     if !policy.enabled(is_pid_one) {
-        anyhow::bail!(
-            "power transition '{action}' refused by --powerctl={policy} (pid {})",
-            std::process::id()
-        );
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_(
+                "power transition '{action}' refused by --powerctl={policy} (pid {pid})"
+            ),
+            &[
+                ("action", &action.to_string()),
+                ("policy", &policy.to_string()),
+                ("pid", &(std::process::id()).to_string())
+            ]
+        ));
     }
     #[cfg(target_os = "linux")]
     {
@@ -271,9 +284,7 @@ impl PowerController for LinuxPowerController {
         let ret = unsafe { libc::reboot(cmd) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(anyhow::anyhow!(
-                "reboot(2) for power action '{action}' failed: {err} (are we running as root/CAP_SYS_BOOT?)"
-            ));
+            return Err(anyhow::anyhow!(sysa::l10n::fmt(sysa::l10n::t_("reboot(2) for power action '{action}' failed: {err} (are we running as root/CAP_SYS_BOOT?)"), &[("action", &action.to_string()), ("err", &err.to_string())])));
         }
         Ok(())
     }
@@ -290,7 +301,10 @@ pub struct NoopController;
 
 impl PowerController for NoopController {
     fn execute(&self, action: PowerAction) -> Result<()> {
-        anyhow::bail!("power action '{action}' not supported: no power backend available")
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("power action '{action}' not supported: no power backend available"),
+            &[("action", &action.to_string())]
+        ))
     }
 }
 

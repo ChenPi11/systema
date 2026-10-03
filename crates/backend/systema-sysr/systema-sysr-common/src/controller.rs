@@ -51,13 +51,44 @@ pub enum ResourceError {
 impl fmt::Display for ResourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ResourceError::Unavailable(m) => write!(f, "resource control unavailable: {m}"),
+            ResourceError::Unavailable(m) => write!(
+                f,
+                "{}",
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("resource control unavailable: {m}"),
+                    &[("m", &m.to_string())]
+                )
+            ),
             ResourceError::Io { path, source } => {
-                write!(f, "cgroup operation on {path} failed: {source}")
+                write!(
+                    f,
+                    "{}",
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("cgroup operation on {path} failed: {source}"),
+                        &[("path", &path.to_string()), ("source", &source.to_string())]
+                    )
+                )
             }
-            ResourceError::NotEmpty(path) => write!(f, "cgroup {path} is not empty"),
+            ResourceError::NotEmpty(path) => write!(
+                f,
+                "{}",
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("cgroup {path} is not empty"),
+                    &[("path", &path.to_string())]
+                )
+            ),
             ResourceError::Invalid { path, message } => {
-                write!(f, "cannot apply resource-control value to {path}: {message}")
+                write!(
+                    f,
+                    "{}",
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("cannot apply resource-control value to {path}: {message}"),
+                        &[
+                            ("path", &path.to_string()),
+                            ("message", &message.to_string())
+                        ]
+                    )
+                )
             }
         }
     }

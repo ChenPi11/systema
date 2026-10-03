@@ -157,8 +157,11 @@ fn dlopen_pam() -> Result<Arc<PamLib>, String> {
     }
 
     Err(match last_err {
-        Some(e) => format!("cannot load libpam: {e}"),
-        None => "cannot load libpam".to_string(),
+        Some(e) => sysa::l10n::fmt(
+            sysa::l10n::t_("cannot load libpam: {e}"),
+            &[("e", &e.to_string())],
+        ),
+        None => sysa::l10n::t_("cannot load libpam").to_string(),
     })
 }
 
@@ -221,10 +224,18 @@ pub fn pam_setup(
 ) -> Result<(Vec<(String, String)>, PamSession), String> {
     let pam = dlopen_pam()?;
 
-    let service = CString::new(pam_name)
-        .map_err(|_| format!("PAM service name '{pam_name}' contains a NUL byte"))?;
-    let user =
-        CString::new(username).map_err(|_| format!("PAM user '{username}' contains a NUL byte"))?;
+    let service = CString::new(pam_name).map_err(|_| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("PAM service name '{pam_name}' contains a NUL byte"),
+            &[("pam_name", &pam_name.to_string())],
+        )
+    })?;
+    let user = CString::new(username).map_err(|_| {
+        sysa::l10n::fmt(
+            sysa::l10n::t_("PAM user '{username}' contains a NUL byte"),
+            &[("username", &username.to_string())],
+        )
+    })?;
 
     let conv = PamConv {
         conv: Some(pam_conv_stub),
@@ -234,12 +245,19 @@ pub fn pam_setup(
 
     let r = unsafe { (pam.start)(service.as_ptr(), user.as_ptr(), &conv, &mut handle) };
     if r != PAM_SUCCESS {
-        return Err(format!("pam_start('{pam_name}') failed: {r}"));
+        return Err(sysa::l10n::fmt(
+            sysa::l10n::t_("pam_start('{pam_name}') failed: {r}"),
+            &[("pam_name", &pam_name.to_string()), ("r", &r.to_string())],
+        ));
     }
 
     if let Some(tty) = tty {
-        let tty_c =
-            CString::new(tty).map_err(|_| format!("PAM tty '{tty}' contains a NUL byte"))?;
+        let tty_c = CString::new(tty).map_err(|_| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("PAM tty '{tty}' contains a NUL byte"),
+                &[("tty", &tty.to_string())],
+            )
+        })?;
         let r = unsafe { (pam.set_item)(handle, PAM_TTY, tty_c.as_ptr().cast()) };
         if r != PAM_SUCCESS {
             debug!("pam_set_item(PAM_TTY, '{tty}') failed: {r}");
@@ -258,7 +276,10 @@ pub fn pam_setup(
         unsafe {
             (pam.end)(handle, r);
         }
-        return Err(format!("pam_open_session('{pam_name}') failed: {r}"));
+        return Err(sysa::l10n::fmt(
+            sysa::l10n::t_("pam_open_session('{pam_name}') failed: {r}"),
+            &[("pam_name", &pam_name.to_string()), ("r", &r.to_string())],
+        ));
     }
 
     // Capture the PAM environment (malloc'd by libpam; free() each entry

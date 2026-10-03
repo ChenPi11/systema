@@ -225,7 +225,10 @@ pub(crate) fn peer_cred(stream: &UnixStream) -> Result<(u32, u32)> {
             );
             if ret < 0 {
                 let e = std::io::Error::last_os_error();
-                anyhow::bail!("SO_PEERCRED failed: {e}");
+                anyhow::bail!(sysa::l10n::fmt(
+                    sysa::l10n::t_("SO_PEERCRED failed: {e}"),
+                    &[("e", &e.to_string())]
+                ));
             }
             Ok((cred.pid as u32, cred.uid as u32))
         }
@@ -245,7 +248,10 @@ pub(crate) fn peer_cred(stream: &UnixStream) -> Result<(u32, u32)> {
         let ret = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
         if ret < 0 {
             let e = std::io::Error::last_os_error();
-            anyhow::bail!("getpeereid failed: {e}");
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("getpeereid failed: {e}"),
+                &[("e", &e.to_string())]
+            ));
         }
         Ok((0, euid as u32))
     }
@@ -261,7 +267,8 @@ async fn handle_worker(
     allocator: AllocatorHandle,
     pending_fd: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<()> {
-    let (_client_pid, client_uid) = peer_cred(&stream).context("failed to get peer credentials")?;
+    let (_client_pid, client_uid) =
+        peer_cred(&stream).context(sysa::l10n::t_("failed to get peer credentials"))?;
     let mut framed = frame_stream(stream);
 
     let env = recv_envelope(&mut framed).await?.ok_or_else(|| {
@@ -545,7 +552,10 @@ async fn handle_worker_session(
                             Ok(r) => r,
                             Err(e) => UnitDefineResult {
                                 success: false,
-                                error: format!("decode failed: {e}"),
+                                error: sysa::l10n::fmt(
+                                    sysa::l10n::t_("decode failed: {e}"),
+                                    &[("e", &e.to_string())],
+                                ),
                                 units_json: vec![],
                             },
                         };
@@ -1187,8 +1197,11 @@ async fn try_finder_commit(
     if client_uid != 0 && target_uid != client_uid {
         return Ok(UnitRegistrationAck {
             success: false,
-            message: format!(
-                "permission denied (UID {client_uid}): may only commit own staging areas"
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_(
+                    "permission denied (UID {client_uid}): may only commit own staging areas",
+                ),
+                &[("client_uid", &client_uid.to_string())],
             ),
             unit_count: 0,
         });
@@ -1279,8 +1292,11 @@ async fn try_finder_query(
     if client_uid != 0 && target_uid != client_uid {
         return Ok(StagingQueryResult {
             success: false,
-            message: format!(
-                "permission denied (UID {client_uid}): may only query own staging areas"
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_(
+                    "permission denied (UID {client_uid}): may only query own staging areas",
+                ),
+                &[("client_uid", &client_uid.to_string())],
             ),
             units_json: vec![],
             unit_count: 0,
@@ -1290,8 +1306,12 @@ async fn try_finder_query(
     match state.get_staging_area(target_uid, name) {
         Some(area) => {
             let count = area.units.len() as u32;
-            let json = serde_json::to_vec(&area.units)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize staging units: {e}"))?;
+            let json = serde_json::to_vec(&area.units).map_err(|e| {
+                anyhow::anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("Failed to serialize staging units: {e}"),
+                    &[("e", &e.to_string())]
+                ))
+            })?;
             Ok(StagingQueryResult {
                 success: true,
                 message: String::new(),
@@ -1300,7 +1320,13 @@ async fn try_finder_query(
             })
         }
         None => {
-            let msg = format!("no staging area for UID {target_uid} with name '{name}'");
+            let msg = sysa::l10n::fmt(
+                sysa::l10n::t_("no staging area for UID {target_uid} with name '{name}'"),
+                &[
+                    ("target_uid", &target_uid.to_string()),
+                    ("name", &name.to_string()),
+                ],
+            );
             warn!("{msg}");
             Ok(StagingQueryResult {
                 success: false,
@@ -1349,7 +1375,10 @@ pub(crate) fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandl
             if areas.is_empty() {
                 AdminStagingResult {
                     success: false,
-                    message: format!("no staging area for UID {}", op.uid),
+                    message: sysa::l10n::fmt(
+                        sysa::l10n::t_("no staging area for UID {uid}"),
+                        &[("uid", &(op.uid).to_string())],
+                    ),
                     entries: vec![],
                 }
             } else {
@@ -1388,7 +1417,13 @@ pub(crate) fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandl
             }
             None => AdminStagingResult {
                 success: false,
-                message: format!("no staging area for UID {} with name '{}'", op.uid, op.name),
+                message: sysa::l10n::fmt(
+                    sysa::l10n::t_("no staging area for UID {uid} with name '{name}'"),
+                    &[
+                        ("uid", &(op.uid).to_string()),
+                        ("name", &(op.name).to_string()),
+                    ],
+                ),
                 entries: vec![],
             },
         },
@@ -1397,7 +1432,10 @@ pub(crate) fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandl
             if areas.is_empty() {
                 AdminStagingResult {
                     success: false,
-                    message: format!("no staging area with name '{}'", op.name),
+                    message: sysa::l10n::fmt(
+                        sysa::l10n::t_("no staging area with name '{name}'"),
+                        &[("name", &(op.name).to_string())],
+                    ),
                     entries: vec![],
                 }
             } else {
@@ -1442,7 +1480,10 @@ pub(crate) fn build_admin_result(op: &AdminStagingOp, allocator: &AllocatorHandl
         }
         other => AdminStagingResult {
             success: false,
-            message: format!("unknown admin staging op '{other}'"),
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_("unknown admin staging op '{other}'"),
+                &[("other", &other.to_string())],
+            ),
             entries: vec![],
         },
     }

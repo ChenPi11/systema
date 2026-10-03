@@ -107,7 +107,7 @@ fn read_getmntinfo_statfs() -> Result<Vec<MountTableEntry>> {
     let mut mntbuf: *mut libc::statfs = std::ptr::null_mut();
     let count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT_FLAG) };
     if count < 0 {
-        anyhow::bail!("getmntinfo failed");
+        anyhow::bail!(sysa::l10n::t_("getmntinfo failed"));
     }
     let mut entries = Vec::new();
     for i in 0..count {
@@ -138,7 +138,7 @@ fn read_getmntinfo_statvfs() -> Result<Vec<MountTableEntry>> {
     let mut mntbuf: *mut libc::statvfs = std::ptr::null_mut();
     let count = unsafe { libc::getmntinfo(&mut mntbuf, MNT_NOWAIT_FLAG) };
     if count < 0 {
-        anyhow::bail!("getmntinfo failed");
+        anyhow::bail!(sysa::l10n::t_("getmntinfo failed"));
     }
     let mut entries = Vec::new();
     for i in 0..count {
@@ -253,7 +253,7 @@ fn read_mnttab() -> Result<Vec<MountTableEntry>> {
     let mode = CString::new("r").unwrap();
     let f = unsafe { libc::fopen(path.as_ptr(), mode.as_ptr()) };
     if f.is_null() {
-        anyhow::bail!("failed to open /etc/mnttab");
+        anyhow::bail!(sysa::l10n::t_("failed to open /etc/mnttab"));
     }
     let mut entries = Vec::new();
     loop {
@@ -303,9 +303,17 @@ fn read_mount_p() -> Result<Vec<MountTableEntry>> {
     let output = std::process::Command::new("mount")
         .arg("-p")
         .output()
-        .map_err(|e| anyhow::anyhow!("mount -p failed: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("mount -p failed: {e}"),
+                &[("e", &e.to_string())]
+            ))
+        })?;
     if !output.status.success() {
-        anyhow::bail!("mount -p exited with {}", output.status);
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("mount -p exited with {status}"),
+            &[("status", &(output.status).to_string())]
+        ));
     }
     Ok(parse_mount_p_output(&String::from_utf8_lossy(&output.stdout)))
 }

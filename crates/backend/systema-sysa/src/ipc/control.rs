@@ -145,8 +145,13 @@ async fn handle_control_session(stream: UnixStream, allocator: AllocatorHandle) 
             );
             return Ok(());
         }
-        Some(Err(e)) => anyhow::bail!("control frame error: {e}"),
-        Some(Ok(bytes)) => Envelope::decode(bytes.as_ref()).context("bad first envelope")?,
+        Some(Err(e)) => anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("control frame error: {e}"),
+            &[("e", &e.to_string())]
+        )),
+        Some(Ok(bytes)) => {
+            Envelope::decode(bytes.as_ref()).context(sysa::l10n::t_("bad first envelope"))?
+        }
     };
     let first_method = first_env.method.clone();
     if matches!(first_method.as_str(), "admin.staging" | "admin.unitstate") {
@@ -163,12 +168,15 @@ async fn handle_control_session(stream: UnixStream, allocator: AllocatorHandle) 
         return Ok(());
     }
     if first_env.method != "manager.hello" {
-        anyhow::bail!(
-            "expected 'manager.hello' or 'admin.*' as first envelope, got '{first_method}'"
-        );
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_(
+                "expected 'manager.hello' or 'admin.*' as first envelope, got '{first_method}'"
+            ),
+            &[("first_method", &first_method.to_string())]
+        ));
     }
     let hello = ManagerHelloRequest::decode(first_env.payload.as_slice())
-        .context("bad manager.hello payload")?;
+        .context(sysa::l10n::t_("bad manager.hello payload"))?;
     info!(
         "Control session from PID {client_pid} (UID {client_uid}): bridge '{}' version '{}'",
         hello.flavor, hello.version
@@ -187,7 +195,10 @@ async fn handle_control_session(stream: UnixStream, allocator: AllocatorHandle) 
         "manager.hello.result",
         ManagerHelloResult {
             success: true,
-            message: format!("welcome, bridge '{}'", hello.flavor),
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_("welcome, bridge '{flavor}'"),
+                &[("flavor", &(hello.flavor).to_string())],
+            ),
         },
     )?;
     reply.request_id = first_env.request_id;
@@ -385,7 +396,10 @@ fn admin_replies(
             )?);
             Ok(replies)
         }
-        other => anyhow::bail!("unknown admin method '{other}'"),
+        other => anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("unknown admin method '{other}'"),
+            &[("other", &other.to_string())]
+        )),
     }
 }
 
@@ -407,7 +421,10 @@ fn admin_staging_commit(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Adm
         if areas.is_empty() {
             return AdminStagingResult {
                 success: false,
-                message: format!("no staging area for UID {}", op.uid),
+                message: sysa::l10n::fmt(
+                    sysa::l10n::t_("no staging area for UID {uid}"),
+                    &[("uid", &(op.uid).to_string())],
+                ),
                 entries: vec![],
             };
         }
@@ -419,7 +436,10 @@ fn admin_staging_commit(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Adm
                     drop(state);
                     return AdminStagingResult {
                         success: false,
-                        message: format!("commit of '{name}' failed: {msg}"),
+                        message: sysa::l10n::fmt(
+                            sysa::l10n::t_("commit of '{name}' failed: {msg}"),
+                            &[("name", &name.to_string()), ("msg", &msg.to_string())],
+                        ),
                         entries: vec![],
                     };
                 }
@@ -429,7 +449,13 @@ fn admin_staging_commit(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Adm
         notify_commit(allocator);
         AdminStagingResult {
             success: true,
-            message: format!("committed {committed} unit(s) for UID {}", op.uid),
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_("committed {committed} unit(s) for UID {uid}"),
+                &[
+                    ("committed", &committed.to_string()),
+                    ("uid", &(op.uid).to_string()),
+                ],
+            ),
             entries: vec![],
         }
     } else {
@@ -441,7 +467,10 @@ fn admin_staging_commit(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Adm
                     drop(state);
                     return AdminStagingResult {
                         success: false,
-                        message: format!("commit of '{}' failed: {msg}", op.name),
+                        message: sysa::l10n::fmt(
+                            sysa::l10n::t_("commit of '{name}' failed: {msg}"),
+                            &[("name", &(op.name).to_string()), ("msg", &msg.to_string())],
+                        ),
                         entries: vec![],
                     };
                 }
@@ -450,9 +479,13 @@ fn admin_staging_commit(op: &AdminStagingOp, allocator: &AllocatorHandle) -> Adm
         notify_commit(allocator);
         AdminStagingResult {
             success: true,
-            message: format!(
-                "committed {count} unit(s) from staging area '{}' (UID {})",
-                op.name, op.uid
+            message: sysa::l10n::fmt(
+                sysa::l10n::t_("committed {count} unit(s) from staging area '{name}' (UID {uid})"),
+                &[
+                    ("count", &count.to_string()),
+                    ("name", &(op.name).to_string()),
+                    ("uid", &(op.uid).to_string()),
+                ],
             ),
             entries: vec![],
         }
@@ -494,7 +527,10 @@ async fn dispatch(
         "manager.stop_units" => manager_stop_units(allocator, env).await?,
         "manager.daemon_reload" => manager_daemon_reload(allocator).await?,
         "manager.register_power_units" => manager_register_power_units(allocator, env).await?,
-        other => anyhow::bail!("unknown control method '{other}'"),
+        other => anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("unknown control method '{other}'"),
+            &[("other", &other.to_string())]
+        )),
     };
     Ok(Some(reply))
 }
@@ -506,11 +542,20 @@ async fn dispatch(
 /// `manager.enqueue` — enqueue a job by job-type string (systemd
 /// `EnqueueUnitJob` semantics, including the "reload-or-*" collapse).
 async fn manager_enqueue(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
-    let req = EnqueueJobRequest::decode(env.payload.as_slice()).context("bad manager.enqueue")?;
-    let (kind, ty_reload) = parse_job_type(&req.job_type)
-        .ok_or_else(|| anyhow::anyhow!("job type '{}' invalid", req.job_type))?;
-    let mode = JobMode::from_str(&req.mode)
-        .ok_or_else(|| anyhow::anyhow!("job mode '{}' invalid", req.mode))?;
+    let req = EnqueueJobRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.enqueue"))?;
+    let (kind, ty_reload) = parse_job_type(&req.job_type).ok_or_else(|| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("job type '{job_type}' invalid"),
+            &[("job_type", &(req.job_type).to_string())]
+        ))
+    })?;
+    let mode = JobMode::from_str(&req.mode).ok_or_else(|| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("job mode '{mode}' invalid"),
+            &[("mode", &(req.mode).to_string())]
+        ))
+    })?;
     let reload_if_possible = ty_reload || req.reload_if_possible;
 
     let canonical = allocator.read().resolve_unit_name(&req.name);
@@ -519,8 +564,8 @@ async fn manager_enqueue(allocator: &AllocatorHandle, env: Envelope) -> Result<E
         let name = canonical.clone();
         tokio::task::spawn_blocking(move || events::load_unit_sync(&alloc, &name))
             .await
-            .context("load_unit task panicked")?
-            .context("failed to load unit")?;
+            .context(sysa::l10n::t_("load_unit task panicked"))?
+            .context(sysa::l10n::t_("failed to load unit"))?;
     }
 
     let (job_id, collapsed) = crate::scheduler::enqueue_job_type(
@@ -531,7 +576,12 @@ async fn manager_enqueue(allocator: &AllocatorHandle, env: Envelope) -> Result<E
         mode,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("enqueue failed: {e}"))?;
+    .map_err(|e| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("enqueue failed: {e}"),
+            &[("e", &e.to_string())]
+        ))
+    })?;
     set_desired_state(allocator, &canonical, collapsed);
 
     make_envelope(
@@ -550,13 +600,14 @@ async fn manager_enqueue(allocator: &AllocatorHandle, env: Envelope) -> Result<E
 
 /// `manager.load_unit` — load a unit file from disk into the registry.
 async fn manager_load_unit(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
-    let req = LoadUnitRequest::decode(env.payload.as_slice()).context("bad manager.load_unit")?;
+    let req = LoadUnitRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.load_unit"))?;
     let canonical = allocator.read().resolve_unit_name(&req.name);
     let alloc = allocator.clone();
     let name = canonical.clone();
     let result = tokio::task::spawn_blocking(move || events::load_unit_sync(&alloc, &name))
         .await
-        .context("load_unit task panicked")?;
+        .context(sysa::l10n::t_("load_unit task panicked"))?;
     match result {
         Ok(()) => make_envelope(
             next_request_id(),
@@ -587,15 +638,16 @@ async fn manager_load_unit(allocator: &AllocatorHandle, env: Envelope) -> Result
 /// start it.  The call does not block for job completion: the bridge waits on
 /// the `job.completed` event, so one transient-creation request may serve a
 /// long session-scope lifecycle without tying up System A.
-async fn manager_start_transient(
-    allocator: &AllocatorHandle,
-    env: Envelope,
-) -> Result<Envelope> {
-    let req =
-        TransientUnitRequest::decode(env.payload.as_slice()).context("bad manager.start_transient")?;
+async fn manager_start_transient(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
+    let req = TransientUnitRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.start_transient"))?;
     let canonical = allocator.read().resolve_unit_name(&req.name);
-    let mode = JobMode::from_str(&req.mode)
-        .ok_or_else(|| anyhow::anyhow!("job mode '{}' invalid", req.mode))?;
+    let mode = JobMode::from_str(&req.mode).ok_or_else(|| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("job mode '{mode}' invalid"),
+            &[("mode", &(req.mode).to_string())]
+        ))
+    })?;
 
     let sender_pid = if req.sender_pid != 0 {
         Some(req.sender_pid)
@@ -635,7 +687,12 @@ async fn manager_start_transient(
         mode,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("cannot start transient unit: {e}"))?;
+    .map_err(|e| {
+        anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("cannot start transient unit: {e}"),
+            &[("e", &e.to_string())]
+        ))
+    })?;
     set_desired_state(allocator, &canonical, collapsed);
 
     make_envelope(
@@ -659,16 +716,21 @@ async fn manager_set_unit_properties(
     allocator: &AllocatorHandle,
     env: Envelope,
 ) -> Result<Envelope> {
-    let req =
-        SetUnitPropertiesRequest::decode(env.payload.as_slice()).context("bad manager.set_unit_properties")?;
+    let req = SetUnitPropertiesRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.set_unit_properties"))?;
     if req.mode != "replace" {
-        anyhow::bail!("SetUnitProperties only supports job mode 'replace'");
+        anyhow::bail!(sysa::l10n::t_(
+            "SetUnitProperties only supports job mode 'replace'"
+        ));
     }
     let name = allocator.read().resolve_unit_name(&req.name);
     {
         let mut state = allocator.write();
         let Some(rc) = rc_of_unit_mut(&mut state, &name) else {
-            anyhow::bail!("unit '{}' has no resource-control section", name);
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("unit '{name}' has no resource-control section"),
+                &[("name", &name.to_string())]
+            ));
         };
         for prop in req
             .properties
@@ -716,12 +778,12 @@ async fn manager_reset_failed(allocator: &AllocatorHandle) -> Result<Envelope> {
 async fn manager_reload(allocator: &AllocatorHandle) -> Result<Envelope> {
     let tx = allocator.read().reload_tx.clone();
     let Some(tx) = tx else {
-        anyhow::bail!("ReloadTask not yet running");
+        anyhow::bail!(sysa::l10n::t_("ReloadTask not yet running"));
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(crate::reload_task::ReloadRequest::ByTrigger(reply_tx))
         .await
-        .context("ReloadTask channel closed")?;
+        .context(sysa::l10n::t_("ReloadTask channel closed"))?;
     let _ = reply_rx.await;
     make_envelope(
         next_request_id(),
@@ -736,12 +798,9 @@ async fn manager_reload(allocator: &AllocatorHandle) -> Result<Envelope> {
 }
 
 /// `manager.reset_failed_unit` — clear one unit's start-limit failure state.
-async fn manager_reset_failed_unit(
-    allocator: &AllocatorHandle,
-    env: Envelope,
-) -> Result<Envelope> {
-    let req =
-        ResetFailedUnitRequest::decode(env.payload.as_slice()).context("bad manager.reset_failed_unit")?;
+async fn manager_reset_failed_unit(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
+    let req = ResetFailedUnitRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.reset_failed_unit"))?;
     let name = allocator.read().resolve_unit_name(&req.name);
     allocator.write().start_limit_state.remove(&name);
     ok_result("manager.reset_failed_unit.result")
@@ -753,12 +812,16 @@ async fn manager_ref_unit(
     env: Envelope,
     is_ref: bool,
 ) -> Result<Envelope> {
-    let req = RefUnitRequest::decode(env.payload.as_slice()).context("bad manager.ref_unit")?;
+    let req = RefUnitRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.ref_unit"))?;
     let name = allocator.read().resolve_unit_name(&req.name);
     {
         let mut state = allocator.write();
         if !state.units.contains_key(&name) {
-            anyhow::bail!("unit '{name}' is not loaded");
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("unit '{name}' is not loaded"),
+                &[("name", &name.to_string())]
+            ));
         }
         let count = state.n_refs.entry(name.clone()).or_insert(0);
         if is_ref {
@@ -782,12 +845,9 @@ async fn manager_ref_unit(
 }
 
 /// `manager.abandon_scope` — abandon a scope (controller gave up on it).
-async fn manager_abandon_scope(
-    allocator: &AllocatorHandle,
-    env: Envelope,
-) -> Result<Envelope> {
-    let req =
-        AbandonScopeRequest::decode(env.payload.as_slice()).context("bad manager.abandon_scope")?;
+async fn manager_abandon_scope(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
+    let req = AbandonScopeRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.abandon_scope"))?;
     let name = allocator.read().resolve_unit_name(&req.name);
 
     let (worker_tx, active_state) = {
@@ -813,7 +873,10 @@ async fn manager_abandon_scope(
         (worker_tx, active_state)
     };
     if !matches!(active_state.as_str(), "active" | "activating") {
-        anyhow::bail!("scope {name} is not running, cannot abandon");
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("scope {name} is not running, cannot abandon"),
+            &[("name", &name.to_string())]
+        ));
     }
 
     // Notify the scope worker (best effort) and mark the cached state.
@@ -845,8 +908,8 @@ async fn manager_abandon_scope(
 
 /// `manager.unit_snapshot` — fetch one unit's full snapshot.
 async fn manager_unit_snapshot(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
-    let req =
-        UnitSnapshotRequest::decode(env.payload.as_slice()).context("bad manager.unit_snapshot")?;
+    let req = UnitSnapshotRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.unit_snapshot"))?;
     let snap = snapshot::unit_snapshot(&allocator.read(), &req.name);
     make_envelope(
         next_request_id(),
@@ -892,8 +955,8 @@ async fn manager_list_jobs(allocator: &AllocatorHandle) -> Result<Envelope> {
 
 /// `manager.get_unit_by_pid` — resolve which unit owns a PID.
 async fn manager_get_unit_by_pid(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
-    let req =
-        GetUnitByPidRequest::decode(env.payload.as_slice()).context("bad manager.get_unit_by_pid")?;
+    let req = GetUnitByPidRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.get_unit_by_pid"))?;
     let name = allocator
         .read()
         .unit_states
@@ -922,7 +985,7 @@ async fn manager_get_unit_by_invocation(
     env: Envelope,
 ) -> Result<Envelope> {
     let req = GetUnitByInvocationRequest::decode(env.payload.as_slice())
-        .context("bad manager.get_unit_by_invocation")?;
+        .context(sysa::l10n::t_("bad manager.get_unit_by_invocation"))?;
     let name = allocator
         .read()
         .invocation_ids
@@ -952,7 +1015,8 @@ async fn manager_get_unit_by_invocation(
 /// `manager.list_units` — list the units System A has loaded, optionally
 /// filtered to enabled ones (the boot set).
 async fn manager_list_units(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
-    let req = ListUnitsRequest::decode(env.payload.as_slice()).context("bad manager.list_units")?;
+    let req = ListUnitsRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.list_units"))?;
     let enabled =
         crate::unit::enable::scan_enabled_units(&sysa::paths::instance().unit_search_paths);
     let result = {
@@ -1022,11 +1086,9 @@ fn build_list_result(
 /// `manager.start_units` — enqueue a start job for every listed unit
 /// (mirrors `systemctl start a b c`).
 async fn manager_start_units(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
-    let req = StartUnitsRequest::decode(env.payload.as_slice()).context("bad manager.start_units")?;
-    info!(
-        "manager.start_units: {} unit(s)",
-        req.names.len()
-    );
+    let req = StartUnitsRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.start_units"))?;
+    info!("manager.start_units: {} unit(s)", req.names.len());
 
     let mut results = Vec::with_capacity(req.names.len());
     for name in &req.names {
@@ -1046,7 +1108,10 @@ async fn manager_start_units(allocator: &AllocatorHandle, env: Envelope) -> Resu
                 results.push(UnitStartResult {
                     name: name.clone(),
                     success: true,
-                    message: format!("job {job_id}"),
+                    message: sysa::l10n::fmt(
+                        sysa::l10n::t_("job {job_id}"),
+                        &[("job_id", &job_id.to_string())],
+                    ),
                 });
             }
             Ok(Err(e)) => {
@@ -1062,7 +1127,7 @@ async fn manager_start_units(allocator: &AllocatorHandle, env: Envelope) -> Resu
                 results.push(UnitStartResult {
                     name: name.clone(),
                     success: false,
-                    message: "start timed out".to_string(),
+                    message: sysa::l10n::t_("start timed out").to_string(),
                 });
             }
         }
@@ -1080,7 +1145,8 @@ async fn manager_start_units(allocator: &AllocatorHandle, env: Envelope) -> Resu
 
 /// `manager.stop_units` — enqueue a stop job for one unit.
 async fn manager_stop_units(allocator: &AllocatorHandle, env: Envelope) -> Result<Envelope> {
-    let req = StopUnitsRequest::decode(env.payload.as_slice()).context("bad manager.stop_units")?;
+    let req = StopUnitsRequest::decode(env.payload.as_slice())
+        .context(sysa::l10n::t_("bad manager.stop_units"))?;
     info!("manager.stop_units: '{}'", req.name);
 
     let result = match crate::scheduler::enqueue_job(
@@ -1098,7 +1164,10 @@ async fn manager_stop_units(allocator: &AllocatorHandle, env: Envelope) -> Resul
             );
             StopUnitsResult {
                 success: true,
-                message: format!("job {job_id}"),
+                message: sysa::l10n::fmt(
+                    sysa::l10n::t_("job {job_id}"),
+                    &[("job_id", &job_id.to_string())],
+                ),
             }
         }
         Err(e) => {
@@ -1125,12 +1194,12 @@ async fn manager_daemon_reload(allocator: &AllocatorHandle) -> Result<Envelope> 
     info!("manager.daemon_reload");
     let tx = allocator.read().reload_tx.clone();
     let Some(tx) = tx else {
-        anyhow::bail!("ReloadTask not yet running");
+        anyhow::bail!(sysa::l10n::t_("ReloadTask not yet running"));
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send(crate::reload_task::ReloadRequest::ByTrigger(reply_tx))
         .await
-        .context("ReloadTask channel closed")?;
+        .context(sysa::l10n::t_("ReloadTask channel closed"))?;
     let _ = reply_rx.await;
     make_envelope(
         next_request_id(),
@@ -1158,9 +1227,10 @@ async fn manager_register_power_units(
     env: Envelope,
 ) -> Result<Envelope> {
     let req = RegisterPowerUnitsRequest::decode(env.payload.as_slice())
-        .context("bad manager.register_power_units")?;
+        .context(sysa::l10n::t_("bad manager.register_power_units"))?;
     let units: std::collections::HashMap<String, systema_sysf::ir::UnitIR> =
-        serde_json::from_slice(&req.units_json).context("bad power units JSON payload")?;
+        serde_json::from_slice(&req.units_json)
+            .context(sysa::l10n::t_("bad power units JSON payload"))?;
     info!(
         "manager.register_power_units: {} unit definition(s)",
         units.len()
@@ -1172,8 +1242,12 @@ async fn manager_register_power_units(
     // Newly materialized units must also receive DefaultDependencies=
     // (After=sysinit.target & co.).
     crate::unit::loader::inject_default_dependencies(allocator.clone());
-    let message = format!(
-        "registered {created} new, {updated} updated .power unit(s)"
+    let message = sysa::l10n::fmt(
+        sysa::l10n::t_("registered {created} new, {updated} updated .power unit(s)"),
+        &[
+            ("created", &created.to_string()),
+            ("updated", &updated.to_string()),
+        ],
     );
     info!("{}", message);
     make_envelope(

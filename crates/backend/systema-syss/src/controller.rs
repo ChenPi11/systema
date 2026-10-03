@@ -175,11 +175,13 @@ impl ServiceController {
                 }
                 self.publish_state(unit_name);
                 if !status.success() {
-                    return Err(anyhow!(
-                        "oneshot service {} exited with code {:?}",
-                        unit_name,
-                        status.code()
-                    ));
+                    return Err(anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("oneshot service {unit_name} exited with code {code}"),
+                        &[
+                            ("unit_name", &unit_name.to_string()),
+                            ("code", &format!("{:?}", status.code()))
+                        ]
+                    )));
                 }
                 Ok(())
             }
@@ -194,7 +196,10 @@ impl ServiceController {
                     }
                 }
                 self.publish_state(unit_name);
-                Err(anyhow!("oneshot service {} error: {}", unit_name, e))
+                Err(anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("oneshot service {unit_name} error: {e}"),
+                    &[("unit_name", &unit_name.to_string()), ("e", &e.to_string())]
+                )))
             }
             Err(_) => {
                 warn!(
@@ -203,11 +208,13 @@ impl ServiceController {
                 );
                 let _ = stop_service(self.registry.clone(), unit_name, 10).await;
                 self.publish_state(unit_name);
-                Err(anyhow!(
-                    "oneshot service {} timed out after {}s",
-                    unit_name,
-                    timeout
-                ))
+                Err(anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("oneshot service {unit_name} timed out after {timeout}s"),
+                    &[
+                        ("unit_name", &unit_name.to_string()),
+                        ("timeout", &timeout.to_string())
+                    ]
+                )))
             }
         }
     }
@@ -526,7 +533,7 @@ impl UnitController for ServiceController {
             use nix::sys::signal;
             use nix::unistd::Pid;
             signal::kill(Pid::from_raw(pid as i32), signal::Signal::SIGHUP)
-                .context("Failed to send SIGHUP")?;
+                .context(sysa::l10n::t_("Failed to send SIGHUP"))?;
         }
         if wait_reload {
             let timeout = cfg

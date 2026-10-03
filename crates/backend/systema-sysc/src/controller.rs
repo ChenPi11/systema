@@ -24,21 +24,29 @@ impl TimerController {
 impl UnitController for TimerController {
     async fn status(&self, unit_name: &str) -> Result<UnitStatus> {
         let reg = self.shared.registry.read();
-        let inst = reg
-            .get(unit_name)
-            .ok_or_else(|| anyhow!("Unknown timer unit '{unit_name}'"))?;
+        let inst = reg.get(unit_name).ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown timer unit '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
         Ok(status_of(unit_name, inst))
     }
 
     async fn start(&self, unit_name: &str, config: &[u8], invocation_id: &str) -> Result<()> {
         if !unit_name.ends_with(".timer") {
-            anyhow::bail!("'{unit_name}' is not a .timer unit");
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("'{unit_name}' is not a .timer unit"),
+                &[("unit_name", &unit_name.to_string())]
+            ));
         }
         let cfg = decode_unit_config(config)?;
-        let timer_cfg = cfg
-            .timer
-            .clone()
-            .ok_or_else(|| anyhow!("No TimerConfig for '{unit_name}'"))?;
+        let timer_cfg = cfg.timer.clone().ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No TimerConfig for '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
 
         let target_unit = if timer_cfg.unit.is_empty() {
             default_target_unit(unit_name)
@@ -75,8 +83,10 @@ impl UnitController for TimerController {
                 None
             } else {
                 Some(
-                    "Timer unit has no OnCalendar=/On*Sec= trigger — nothing to schedule"
-                        .to_string(),
+                    sysa::l10n::t_(
+                        "Timer unit has no OnCalendar=/On*Sec= trigger — nothing to schedule",
+                    )
+                    .to_string(),
                 )
             },
             invocation_id: if invocation_id.is_empty() {
@@ -124,9 +134,12 @@ impl UnitController for TimerController {
     async fn stop(&self, unit_name: &str) -> Result<()> {
         {
             let mut reg = self.shared.registry.write();
-            let inst = reg
-                .get_mut(unit_name)
-                .ok_or_else(|| anyhow!("Unknown timer unit '{unit_name}'"))?;
+            let inst = reg.get_mut(unit_name).ok_or_else(|| {
+                anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown timer unit '{unit_name}'"),
+                    &[("unit_name", &unit_name.to_string())]
+                ))
+            })?;
             inst.state = TimerState::Dead;
             inst.next_elapse = None;
         }
@@ -141,15 +154,20 @@ impl UnitController for TimerController {
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let timer_cfg = cfg
-            .timer
-            .clone()
-            .ok_or_else(|| anyhow!("No TimerConfig for '{unit_name}'"))?;
+        let timer_cfg = cfg.timer.clone().ok_or_else(|| {
+            anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No TimerConfig for '{unit_name}'"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
         {
             let mut reg = self.shared.registry.write();
-            let inst = reg
-                .get_mut(unit_name)
-                .ok_or_else(|| anyhow!("Unknown timer unit '{unit_name}'"))?;
+            let inst = reg.get_mut(unit_name).ok_or_else(|| {
+                anyhow!(sysa::l10n::fmt(
+                    sysa::l10n::t_("Unknown timer unit '{unit_name}'"),
+                    &[("unit_name", &unit_name.to_string())]
+                ))
+            })?;
             inst.config = timer_cfg.clone();
             if !timer_cfg.unit.is_empty() {
                 inst.target_unit = timer_cfg.unit.clone();

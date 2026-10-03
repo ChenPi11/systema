@@ -127,7 +127,7 @@ fn spawn_user_slice_registration(worker: &ResourceWorker) {
     tokio::spawn(async move {
         if let Err(e) = crate::register::commit_slice(
             "user.slice",
-            crate::register::USER_SLICE_DESCRIPTION,
+            &crate::register::static_user_slice_description(),
         )
         .await
         {
@@ -228,8 +228,9 @@ fn handle_unit_define_envelope(env: &Envelope, event_pub: &EventPublisher) {
             "unit.define_result",
             UnitDefineResult {
                 success: false,
-                error: format!(
-                    "cannot synthesize definitions for non-slice units: {invalid:?}"
+                error: sysa::l10n::fmt(
+                    sysa::l10n::t_("cannot synthesize definitions for non-slice units: {invalid}"),
+                    &[("invalid", &format!("{:?}", invalid))],
                 ),
                 units_json: vec![],
             },
@@ -246,7 +247,10 @@ fn handle_unit_define_envelope(env: &Envelope, event_pub: &EventPublisher) {
                 "unit.define_result",
                 UnitDefineResult {
                     success: false,
-                    error: format!("cannot serialise synthesized definitions: {e}"),
+                    error: sysa::l10n::fmt(
+                        sysa::l10n::t_("cannot serialise synthesized definitions: {e}"),
+                        &[("e", &e.to_string())],
+                    ),
                     units_json: vec![],
                 },
             );

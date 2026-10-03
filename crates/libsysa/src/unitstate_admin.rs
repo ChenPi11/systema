@@ -39,7 +39,12 @@ impl UnitStateAdmin {
     {
         let stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to System A: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(crate::l10n::fmt(
+                    crate::l10n::t_("Failed to connect to System A: {e}"),
+                    &[("e", &e.to_string())]
+                ))
+            })?;
         let mut framed = frame_stream(stream);
 
         let query_env = make_envelope(
@@ -52,30 +57,35 @@ impl UnitStateAdmin {
         send_envelope(&mut framed, &query_env).await?;
 
         loop {
-            let env = recv_envelope(&mut framed)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("System A disconnected before unit-state EOF."))?;
+            let env = recv_envelope(&mut framed).await?.ok_or_else(|| {
+                anyhow::anyhow!(crate::l10n::t_(
+                    "System A disconnected before unit-state EOF."
+                ))
+            })?;
 
             match env.method.as_str() {
                 "admin.unitstate.entry" => {
                     let entry = UnitStateEntry::decode(env.payload.as_slice())
-                        .context("Failed to decode UnitStateEntry")?;
+                        .context(crate::l10n::t_("Failed to decode UnitStateEntry"))?;
                     if !entry.json.is_empty() {
                         on_unit(&entry.name, &entry.json)?;
                     }
                 }
                 "admin.unitstate.eof" => {
                     let eof = UnitStateEof::decode(env.payload.as_slice())
-                        .context("Failed to decode UnitStateEof")?;
+                        .context(crate::l10n::t_("Failed to decode UnitStateEof"))?;
                     return Ok(UnitStateResult {
                         total: eof.total,
                         message: eof.message,
                     });
                 }
                 other => {
-                    anyhow::bail!(
-                        "Expected 'admin.unitstate.entry'/'admin.unitstate.eof', got '{other}'"
-                    );
+                    anyhow::bail!(crate::l10n::fmt(
+                        crate::l10n::t_(
+                            "Expected 'admin.unitstate.entry'/'admin.unitstate.eof', got '{other}'"
+                        ),
+                        &[("other", &other.to_string())]
+                    ));
                 }
             }
         }

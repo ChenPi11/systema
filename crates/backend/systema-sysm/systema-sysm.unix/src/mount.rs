@@ -55,10 +55,11 @@ pub async fn do_mount(
         &config.directory_mode
     };
     if !mount_point_path.exists() {
-        fs::create_dir_all(&mount_point).context("create_dir_all for mount point failed")?;
+        fs::create_dir_all(&mount_point)
+            .context(sysa::l10n::t_("create_dir_all for mount point failed"))?;
         let mode = u32::from_str_radix(dir_mode.trim_start_matches('0'), 8).unwrap_or(0o755);
         fs::set_permissions(&mount_point, fs::Permissions::from_mode(mode))
-            .context("set_permissions for mount point failed")?;
+            .context(sysa::l10n::t_("set_permissions for mount point failed"))?;
     }
 
     // Idempotency: skip if already mounted (matches systemd behavior).
@@ -109,12 +110,15 @@ pub async fn do_mount(
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .context("mount timed out")?
-        .context("mount command failed to start")?;
+        .context(sysa::l10n::t_("mount timed out"))?
+        .context(sysa::l10n::t_("mount command failed to start"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let err = anyhow::anyhow!("mount failed: {}", stderr.trim());
+        let err = anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("mount failed: {stderr}"),
+            &[("stderr", &(stderr.trim()).to_string())]
+        ));
         {
             let mut reg = registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
@@ -167,7 +171,10 @@ pub async fn do_umount(
     };
 
     if mount_point.is_empty() {
-        anyhow::bail!("No mount point recorded for unit {}", unit_name);
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("No mount point recorded for unit {unit_name}"),
+            &[("unit_name", &unit_name.to_string())]
+        ));
     }
 
     // Mark as unmounting.
@@ -211,12 +218,15 @@ pub async fn do_umount(
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .context("umount timed out")?
-        .context("umount command failed to start")?;
+        .context(sysa::l10n::t_("umount timed out"))?
+        .context(sysa::l10n::t_("umount command failed to start"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let err = anyhow::anyhow!("umount failed: {}", stderr.trim());
+        let err = anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("umount failed: {stderr}"),
+            &[("stderr", &(stderr.trim()).to_string())]
+        ));
         {
             let mut reg = registry.lock();
             if let Some(inst) = reg.get_mut(unit_name) {
@@ -251,7 +261,10 @@ pub async fn do_remount(
     let mount_point = match mount_point {
         Some(p) => p,
         None => {
-            anyhow::bail!("Cannot remount {}: not currently mounted", unit_name);
+            anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Cannot remount {unit_name}: not currently mounted"),
+                &[("unit_name", &unit_name.to_string())]
+            ));
         }
     };
 
@@ -281,12 +294,15 @@ pub async fn do_remount(
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .context("remount timed out")?
-        .context("remount command failed to start")?;
+        .context(sysa::l10n::t_("remount timed out"))?
+        .context(sysa::l10n::t_("remount command failed to start"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("remount failed: {}", stderr.trim());
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("remount failed: {stderr}"),
+            &[("stderr", &(stderr.trim()).to_string())]
+        ));
     }
 
     info!("Remount succeeded: {}", mount_point);

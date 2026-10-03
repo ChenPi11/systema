@@ -6,5 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+sysa = { path = "../../../libsysa" }
 systema-sysr-common = { path = "../systema-sysr-common" }
 tracing.workspace = true

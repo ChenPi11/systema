@@ -67,10 +67,12 @@ impl ControlClient {
     /// `WORKER_READY` on the notify channel for SysAInit.
     pub async fn connect(flavor: &str, worker_id: Option<&str>) -> Result<ControlClient> {
         let path = sysa::paths::instance().control_socket_path;
-        let stream = UnixStream::connect(path)
-            .await
-            .with_context(|| format!("connecting to control socket {path}"))?
-        ;
+        let stream = UnixStream::connect(path).await.with_context(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("connecting to control socket {path}"),
+                &[("path", &path.to_string())],
+            )
+        })?;
         debug!("Connected to control socket {path}");
         Self::connect_on(stream, flavor, worker_id).await
     }
@@ -175,9 +177,12 @@ impl ControlClient {
         let reply: ManagerHelloResult = client
             .call("manager.hello", &hello)
             .await
-            .context("manager.hello handshake")?;
+            .context(sysa::l10n::t_("manager.hello handshake"))?;
         if !reply.success {
-            bail!("control bus rejected us: {}", reply.message);
+            bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("control bus rejected us: {message}"),
+                &[("message", &(reply.message).to_string())]
+            ));
         }
         debug!("Control handshake OK: {}", reply.message);
 
@@ -198,22 +203,27 @@ impl ControlClient {
         self.pending.lock().await.insert(id, tx);
 
         let env = make_envelope(id, self.flavor.clone(), "system-a", method, request.clone())
-            .with_context(|| format!("encoding {method} request"))?;
+            .with_context(|| {
+                sysa::l10n::fmt(
+                    sysa::l10n::t_("encoding {method} request"),
+                    &[("method", &method.to_string())],
+                )
+            })?;
         if self.writer.send(env).is_err() {
             self.pending.lock().await.remove(&id);
-            bail!("control session closed (writer task gone)");
+            bail!(sysa::l10n::t_("control session closed (writer task gone)"));
         }
 
         let mut closed = self.closed_rx.clone();
         let received = select! {
-            r = rx => r.map_err(|_| anyhow::anyhow!("control session closed"))?,
-            _ = closed.changed() => bail!("control session closed (disconnected)"),
+            r = rx => r.map_err(|_| anyhow::anyhow!(sysa::l10n::t_("control session closed")))?,
+            _ = closed.changed() => bail!(sysa::l10n::t_("control session closed (disconnected)")),
         };
 
         match received.method.as_str() {
             "manager.error" => {
                 let err = SimpleManagerResult::decode(received.payload.as_slice())
-                    .context("decoding manager.error payload")?;
+                    .context(sysa::l10n::t_("decoding manager.error payload"))?;
                 bail!("{}: {}", method, err.message);
             }
             expected => {
@@ -223,8 +233,12 @@ impl ControlClient {
                         self.flavor, expected
                     );
                 }
-                R::decode(received.payload.as_slice())
-                    .with_context(|| format!("decoding {method} reply"))
+                R::decode(received.payload.as_slice()).with_context(|| {
+                    sysa::l10n::fmt(
+                        sysa::l10n::t_("decoding {method} reply"),
+                        &[("method", &method.to_string())],
+                    )
+                })
             }
         }
     }

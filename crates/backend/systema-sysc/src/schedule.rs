@@ -179,15 +179,26 @@ fn parse_comp(tok: &str, min: u32, max: u32) -> Result<BTreeSet<u32>, String> {
             Some((a, b)) => (a.trim(), b.trim()),
             None => (part, part),
         };
-        let lo: u32 = lo
-            .parse()
-            .map_err(|_| format!("invalid value '{part}' in component"))?;
-        let hi: u32 = hi
-            .parse()
-            .map_err(|_| format!("invalid value '{part}' in component"))?;
+        let lo: u32 = lo.parse().map_err(|_| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("invalid value '{part}' in component"),
+                &[("part", &part.to_string())],
+            )
+        })?;
+        let hi: u32 = hi.parse().map_err(|_| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("invalid value '{part}' in component"),
+                &[("part", &part.to_string())],
+            )
+        })?;
         if lo < min || hi > max || lo > hi {
-            return Err(format!(
-                "component '{part}' out of range ({min}..{max})"
+            return Err(sysa::l10n::fmt(
+                sysa::l10n::t_("component '{part}' out of range ({min}..{max})"),
+                &[
+                    ("part", &part.to_string()),
+                    ("min", &min.to_string()),
+                    ("max", &max.to_string()),
+                ],
             ));
         }
         for v in lo..=hi {
@@ -218,8 +229,18 @@ fn parse_weekdays(tok: &str) -> Result<Option<BTreeSet<u32>>, String> {
             Some((a, b)) => (a.trim(), b.trim()),
             None => (part, part),
         };
-        let lo = idx(a).ok_or_else(|| format!("invalid weekday '{a}'"))?;
-        let hi = idx(b).ok_or_else(|| format!("invalid weekday '{b}'"))?;
+        let lo = idx(a).ok_or_else(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("invalid weekday '{a}'"),
+                &[("a", &a.to_string())],
+            )
+        })?;
+        let hi = idx(b).ok_or_else(|| {
+            sysa::l10n::fmt(
+                sysa::l10n::t_("invalid weekday '{b}'"),
+                &[("b", &b.to_string())],
+            )
+        })?;
         if lo > hi {
             // Wrapping range (e.g. Fri..Mon): insert lo..=7 and 1..=hi.
             for v in lo..=7 {
@@ -273,7 +294,7 @@ impl CalendarSpec {
     pub fn parse(input: &str) -> Result<CalendarSpec, String> {
         let s = input.trim();
         if s.is_empty() {
-            return Err("empty calendar spec".to_string());
+            return Err(sysa::l10n::t_("empty calendar spec").to_string());
         }
         if let Some(spec) = parse_shorthand(s) {
             return Ok(spec);
@@ -290,7 +311,10 @@ impl CalendarSpec {
                 } else if is_date_tok(tok) {
                     (None, Some(tok), None)
                 } else {
-                    return Err(format!("unrecognised timer token '{tok}'"));
+                    return Err(sysa::l10n::fmt(
+                        sysa::l10n::t_("unrecognised timer token '{tok}'"),
+                        &[("tok", &tok.to_string())],
+                    ));
                 }
             }
             2 => {
@@ -302,7 +326,12 @@ impl CalendarSpec {
                 }
             }
             3 => (parse_weekdays(tokens[0])?, Some(tokens[1]), Some(tokens[2])),
-            _ => return Err(format!("too many fields in OnCalendar spec '{s}'")),
+            _ => {
+                return Err(sysa::l10n::fmt(
+                    sysa::l10n::t_("too many fields in OnCalendar spec '{s}'"),
+                    &[("s", &s.to_string())],
+                ))
+            }
         };
 
         let (year, month, day) = match date_tok {
@@ -507,7 +536,10 @@ fn parse_shorthand(s: &str) -> Option<CalendarSpec> {
 fn parse_date(tok: &str) -> Result<(CalendarPart, CalendarPart, CalendarPart), String> {
     let parts: Vec<&str> = tok.split('-').collect();
     if parts.len() < 2 || parts.len() > 3 {
-        return Err(format!("invalid date '{tok}'"));
+        return Err(sysa::l10n::fmt(
+            sysa::l10n::t_("invalid date '{tok}'"),
+            &[("tok", &tok.to_string())],
+        ));
     }
     if parts.len() == 2 {
         let month = parse_comp(parts[0], 1, 12)?;
@@ -527,7 +559,10 @@ fn parse_date(tok: &str) -> Result<(CalendarPart, CalendarPart, CalendarPart), S
 fn parse_time(tok: &str) -> Result<(CalendarPart, CalendarPart, CalendarPart), String> {
     let parts: Vec<&str> = tok.split(':').collect();
     if parts.len() > 3 {
-        return Err(format!("invalid time '{tok}'"));
+        return Err(sysa::l10n::fmt(
+            sysa::l10n::t_("invalid time '{tok}'"),
+            &[("tok", &tok.to_string())],
+        ));
     }
     let hour = parse_comp(parts[0], 0, 23)?;
     let minute = if parts.len() >= 2 {

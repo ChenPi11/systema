@@ -165,7 +165,9 @@ pub async fn run_dbus(ctx: &Arc<BridgeContext>) -> zbus::Result<zbus::Connection
         let probe = tokio::time::timeout(BUS_CONNECT_TIMEOUT, zbus::Connection::system())
             .await
             .map_err(|_| {
-                zbus::Error::Handshake("timed out connecting to the system bus".to_string())
+                zbus::Error::Handshake(
+                    sysa::l10n::t_("timed out connecting to the system bus").to_string(),
+                )
             })??;
         let has_owner: bool = probe
             .call_method(
@@ -188,14 +190,17 @@ pub async fn run_dbus(ctx: &Arc<BridgeContext>) -> zbus::Result<zbus::Connection
 
     let manager = manager::ManagerInterface::new(ctx.clone());
 
-    let conn = tokio::time::timeout(BUS_CONNECT_TIMEOUT, Builder::system()?
-        .name(BUS_NAME)?
-        .serve_at("/org/freedesktop/systemd1", manager)?
-        .build())
-        .await
-        .map_err(|_| {
-            zbus::Error::Handshake("timed out connecting to the system bus".to_string())
-        })??;
+    let conn = tokio::time::timeout(
+        BUS_CONNECT_TIMEOUT,
+        Builder::system()?
+            .name(BUS_NAME)?
+            .serve_at("/org/freedesktop/systemd1", manager)?
+            .build(),
+    )
+    .await
+    .map_err(|_| {
+        zbus::Error::Handshake(sysa::l10n::t_("timed out connecting to the system bus").to_string())
+    })??;
 
     // Replace zbus's built-in org.freedesktop.DBus.Properties on the manager
     // with our systemd-flavoured custom implementation.

@@ -29,13 +29,13 @@ pub async fn do_mount(
             .arg(&mount_point)
             .status()
             .await
-            .context("mkdir -p for mount point failed")?;
+            .context(sysa::l10n::t_("mkdir -p for mount point failed"))?;
         Command::new("chmod")
             .arg(dir_mode)
             .arg(&mount_point)
             .status()
             .await
-            .context("chmod for mount point failed")?;
+            .context(sysa::l10n::t_("chmod for mount point failed"))?;
     }
 
     {
@@ -93,13 +93,16 @@ pub async fn do_mount(
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .context("mount timed out")?
-        .context("mount command failed to start")?;
+        .context(sysa::l10n::t_("mount timed out"))?
+        .context(sysa::l10n::t_("mount command failed to start"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         error!("mount {} failed: {}", mount_point, stderr.trim());
-        let err = anyhow::anyhow!("mount failed: {}", stderr.trim());
+        let err = anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("mount failed: {stderr}"),
+            &[("stderr", &(stderr.trim()).to_string())]
+        ));
         return Err(err);
     }
 
@@ -147,7 +150,10 @@ pub async fn do_umount(
     };
 
     if mount_point.is_empty() {
-        anyhow::bail!("No mount point recorded for unit {}", unit_name);
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("No mount point recorded for unit {unit_name}"),
+            &[("unit_name", &unit_name.to_string())]
+        ));
     }
 
     // Mark as unmounting.
@@ -187,8 +193,8 @@ pub async fn do_umount(
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .context("umount timed out")?
-        .context("umount command failed to start")?;
+        .context(sysa::l10n::t_("umount timed out"))?
+        .context(sysa::l10n::t_("umount command failed to start"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -208,7 +214,10 @@ pub async fn do_umount(
                 }
             }
         }
-        let err = anyhow::anyhow!("umount failed: {}", stderr.trim());
+        let err = anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("umount failed: {stderr}"),
+            &[("stderr", &(stderr.trim()).to_string())]
+        ));
         return Err(err);
     }
 
@@ -260,7 +269,10 @@ pub async fn do_remount(
 
     let mount_point = match mount_point {
         Some(p) => p,
-        None => anyhow::bail!("Cannot remount {}: not currently mounted", unit_name),
+        None => anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("Cannot remount {unit_name}: not currently mounted"),
+            &[("unit_name", &unit_name.to_string())]
+        )),
     };
 
     let mut cmd = Command::new("mount");
@@ -278,13 +290,16 @@ pub async fn do_remount(
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .context("remount timed out")?
-        .context("remount command failed to start")?;
+        .context(sysa::l10n::t_("remount timed out"))?
+        .context(sysa::l10n::t_("remount command failed to start"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         error!("remount {} failed: {}", mount_point, stderr.trim());
-        anyhow::bail!("remount failed: {}", stderr.trim());
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("remount failed: {stderr}"),
+            &[("stderr", &(stderr.trim()).to_string())]
+        ));
     }
 
     // Verify the mount point still exists after remount.

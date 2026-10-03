@@ -153,7 +153,10 @@ fn job_json(j: &Job) -> Value {
     let status = match &j.status {
         JobStatus::Running => json!("running"),
         JobStatus::Done => json!("done"),
-        JobStatus::Failed(msg) => Value::String(format!("failed: {msg}")),
+        JobStatus::Failed(msg) => Value::String(sysa::l10n::fmt(
+            sysa::l10n::t_("failed: {msg}"),
+            &[("msg", &msg.to_string())],
+        )),
         JobStatus::Cancelled => json!("cancelled"),
     };
     json!({

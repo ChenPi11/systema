@@ -144,10 +144,10 @@ async fn handle_mount_request(
 
     let result = match &trigger.mount_config {
         Some(cfg) => do_mount(mount_registry.clone(), &trigger.mount_unit, cfg).await,
-        None => Err(anyhow::anyhow!(
-            "No preloaded MountConfig for companion {}",
-            trigger.mount_unit
-        )),
+        None => Err(anyhow::anyhow!(sysa::l10n::fmt(
+            sysa::l10n::t_("No preloaded MountConfig for companion {mount_unit}"),
+            &[("mount_unit", &(trigger.mount_unit).to_string())]
+        ))),
     };
 
     // Re-check liveness before replying: the automount may have been
@@ -469,20 +469,27 @@ impl UnitController for MountController {
         let cfg = decode_unit_config(config)?;
         match resolve_unit_type(&self.mount_registry, &self.automount_registry, unit_name) {
             "mount" => {
-                let mount_cfg = cfg
-                    .mount
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
+                let mount_cfg = cfg.mount.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("No MountConfig for {unit_name}"),
+                        &[("unit_name", &unit_name.to_string())]
+                    ))
+                })?;
                 do_mount(self.mount_registry.clone(), unit_name, mount_cfg).await?;
                 self.publish_mount_state(unit_name);
             }
             "automount" => {
-                let auto_cfg = cfg
-                    .automount
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No AutomountConfig for {}", unit_name))?;
+                let auto_cfg = cfg.automount.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("No AutomountConfig for {unit_name}"),
+                        &[("unit_name", &unit_name.to_string())]
+                    ))
+                })?;
                 if path_is_mount_point(&auto_cfg.r#where) {
-                    anyhow::bail!("Path {} is already a mount point", auto_cfg.r#where);
+                    anyhow::bail!(sysa::l10n::fmt(
+                        sysa::l10n::t_("Path {path} is already a mount point"),
+                        &[("path", &(auto_cfg.r#where).to_string())]
+                    ));
                 }
                 // The companion mount config is preloaded by SysA (scheme A):
                 // the worker mounts the real fs on kernel trigger with no
@@ -497,7 +504,10 @@ impl UnitController for MountController {
                 .await?;
                 self.publish_automount_state(unit_name);
             }
-            _ => anyhow::bail!("Unknown unit type for {}", unit_name),
+            _ => anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown unit type for {unit_name}"),
+                &[("unit_name", &unit_name.to_string())]
+            )),
         }
         Ok(())
     }
@@ -534,7 +544,10 @@ impl UnitController for MountController {
                 automount_enter_dead(self.automount_registry.clone(), unit_name).await?;
                 self.publish_automount_state(unit_name);
             }
-            _ => anyhow::bail!("Unknown unit type for {}", unit_name),
+            _ => anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown unit type for {unit_name}"),
+                &[("unit_name", &unit_name.to_string())]
+            )),
         }
         Ok(())
     }
@@ -543,20 +556,24 @@ impl UnitController for MountController {
         let cfg = decode_unit_config(config)?;
         match resolve_unit_type(&self.mount_registry, &self.automount_registry, unit_name) {
             "mount" => {
-                let mount_cfg = cfg
-                    .mount
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
+                let mount_cfg = cfg.mount.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("No MountConfig for {unit_name}"),
+                        &[("unit_name", &unit_name.to_string())]
+                    ))
+                })?;
                 do_umount(self.mount_registry.clone(), unit_name, Some(mount_cfg)).await?;
                 do_mount(self.mount_registry.clone(), unit_name, mount_cfg).await?;
                 self.publish_mount_state(unit_name);
             }
             "automount" => {
                 automount_enter_dead(self.automount_registry.clone(), unit_name).await?;
-                let auto_cfg = cfg
-                    .automount
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No AutomountConfig for {}", unit_name))?;
+                let auto_cfg = cfg.automount.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(sysa::l10n::fmt(
+                        sysa::l10n::t_("No AutomountConfig for {unit_name}"),
+                        &[("unit_name", &unit_name.to_string())]
+                    ))
+                })?;
                 automount_enter_waiting(
                     self.automount_registry.clone(),
                     unit_name,
@@ -567,17 +584,22 @@ impl UnitController for MountController {
                 .await?;
                 self.publish_automount_state(unit_name);
             }
-            _ => anyhow::bail!("Unknown unit type for {}", unit_name),
+            _ => anyhow::bail!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown unit type for {unit_name}"),
+                &[("unit_name", &unit_name.to_string())]
+            )),
         }
         Ok(())
     }
 
     async fn reload(&self, unit_name: &str, config: &[u8]) -> Result<()> {
         let cfg = decode_unit_config(config)?;
-        let mount_cfg = cfg
-            .mount
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No MountConfig for {}", unit_name))?;
+        let mount_cfg = cfg.mount.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("No MountConfig for {unit_name}"),
+                &[("unit_name", &unit_name.to_string())]
+            ))
+        })?;
         do_remount(self.mount_registry.clone(), unit_name, mount_cfg).await?;
         self.publish_mount_state(unit_name);
         Ok(())

@@ -1387,6 +1387,7 @@ name = "sysa-pager"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sysa",
 ]
 
 [[package]]
@@ -1660,6 +1661,7 @@ dependencies = [
 name = "systema-sysr-linux"
 version = "0.1.0"
 dependencies = [
+ "sysa",
  "systema-sysr-common",
  "tracing",
 ]

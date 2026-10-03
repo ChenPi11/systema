@@ -199,12 +199,14 @@ pub fn build_worker_set_for(
         retained.push(spec);
     }
 
-    if let Some(unknown) = skip.iter().find(|s| {
-        !default_workers()
-            .iter()
-            .any(|spec| spec.matches_name(s))
-    }) {
-        anyhow::bail!("unknown worker name '{unknown}'");
+    if let Some(unknown) = skip
+        .iter()
+        .find(|s| !default_workers().iter().any(|spec| spec.matches_name(s)))
+    {
+        anyhow::bail!(sysa::l10n::fmt(
+            sysa::l10n::t_("unknown worker name '{unknown}'"),
+            &[("unknown", &unknown.to_string())]
+        ));
     }
 
     Ok(retained)

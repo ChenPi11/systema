@@ -101,7 +101,10 @@ pub fn on_target_inactive(shared: &Arc<EngineShared>, path_unit: &str) {
             let mut reg = shared.registry.write();
             if let Some(inst) = reg.get_mut(path_unit) {
                 inst.state = PathState::Failed;
-                inst.last_error = Some(format!("Failed to re-arm: {e}"));
+                inst.last_error = Some(sysa::l10n::fmt(
+                    sysa::l10n::t_("Failed to re-arm: {e}"),
+                    &[("e", &e.to_string())],
+                ));
             }
             publish_path(shared, path_unit);
         }
@@ -123,10 +126,7 @@ pub fn trigger(shared: &Arc<EngineShared>, unit: &str) {
         let now = epoch_now();
         if rate_limited(inst, now) {
             inst.state = PathState::Failed;
-            inst.last_error = Some(format!(
-                "Trigger rate limit exceeded (interval={}s burst={})",
-                inst.config.trigger_limit_interval_sec, inst.config.trigger_limit_burst
-            ));
+            inst.last_error = Some(sysa::l10n::fmt(sysa::l10n::t_("Trigger rate limit exceeded (interval={trigger_limit_interval_sec}s burst={trigger_limit_burst})"), &[("trigger_limit_interval_sec", &(inst.config.trigger_limit_interval_sec).to_string()), ("trigger_limit_burst", &(inst.config.trigger_limit_burst).to_string())]));
             (String::new(), false)
         } else {
             inst.state = PathState::Running;
@@ -154,9 +154,12 @@ pub fn trigger(shared: &Arc<EngineShared>, unit: &str) {
 pub(crate) fn arm_unit(shared: &Arc<EngineShared>, unit: &str) -> anyhow::Result<()> {
     let specs = {
         let reg = shared.registry.read();
-        reg.get(unit)
-            .map(|i| i.specs.clone())
-            .ok_or_else(|| anyhow::anyhow!("Unknown path unit '{unit}'"))?
+        reg.get(unit).map(|i| i.specs.clone()).ok_or_else(|| {
+            anyhow::anyhow!(sysa::l10n::fmt(
+                sysa::l10n::t_("Unknown path unit '{unit}'"),
+                &[("unit", &unit.to_string())]
+            ))
+        })?
     };
     shared.backend.arm(unit, &specs)?;
 
